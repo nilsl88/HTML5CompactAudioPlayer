@@ -22,6 +22,10 @@ This repo is **vanilla HTML/CSS/JS** (no build step).
 - **Reset player** link (clears saved settings + cached availability)
 - **Optional audiobook library** (`media/library.json`) for a built-in episode/book selector
 
+<p align="center">
+  <img src="preview.webp" width="500">
+</p>
+
 ## What it does *not* do
 
 - No adaptive streaming (HLS/DASH) and no automatic bitrate switching while playing
@@ -30,7 +34,6 @@ This repo is **vanilla HTML/CSS/JS** (no build step).
 
 ## Quick start
 
-1. Copy these files to your site root:
 
    - `index.html`
    - `player.js`
