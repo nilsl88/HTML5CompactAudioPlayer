@@ -1,0 +1,951 @@
+/* Compact Mobile player with light/dark mode via prefers-color-scheme. */
+:root {
+  /* Typography scale (controlled by the Text size setting) */
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #111111;
+  --muted: #5c5c5c;
+  --card: #f3f4f6;
+  --border: rgba(0,0,0,0.12);
+  --shadow: rgba(0,0,0,0.10);
+  --btn: #111111;
+  --btnFg: #ffffff;
+  --chip: rgba(0,0,0,0.06);
+
+  /* Accent and aliases */
+  --accent: #2563eb;
+  --danger: #b91c1c;
+  --text: var(--fg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0f14;
+    --fg: #e7eaf0;
+    --muted: #a5a9b3;
+    --card: #121826;
+    --border: rgba(255,255,255,0.14);
+    --shadow: rgba(0,0,0,0.35);
+    --btn: #e7eaf0;
+    --btnFg: #0b0f14;
+    --chip: rgba(255,255,255,0.08);
+
+    --accent: #60a5fa;
+    --danger: #f87171;
+    --text: var(--fg);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+
+/* Appearance: Text size */
+html[data-font="s"] { --fs-12: 11px; --fs-13: 12px; --fs-14: 13px; --fs-16: 14px; --fs-18: 16px; }
+html[data-font="l"] { --fs-12: 13px; --fs-13: 14px; --fs-14: 15px; --fs-16: 18px; --fs-18: 20px; }
+
+
+body {
+  margin: 0;
+
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.page { max-width: 560px; margin: 0 auto; padding: 16px; }
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.titleBlock { min-width: 0; }
+.title { font-weight: 650; font-size: var(--fs-18); line-height: 1.2; margin: 0; }
+.meta { margin-top: 4px; color: var(--muted); font-size: var(--fs-13); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta.isError { color: var(--danger); }
+
+.playerCard {
+  position: relative;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 16px;
+  box-shadow: 0 10px 22px var(--shadow);
+  padding: 12px;
+}
+
+.playerBar {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.miniBtnRow {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Expanded ("Focus") mode: keep the same player card, just reflow controls */
+.playerCard.isExpanded .playerBar {
+  grid-template-columns: 44px 1fr;
+}
+.playerCard.isExpanded #chaptersBtn,
+.playerCard.isExpanded #optionsBtn,
+.playerCard.isExpanded #focusBtn {
+  display: none;
+}
+.playerCard.isExpanded .miniBtnRow {
+  display: none;
+}
+
+
+.coverWrap {
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 14px;
+  background: var(--chip);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.coverImg {
+  display: block;
+  max-width: 100%;
+  /* Bigger cover on both mobile and desktop, while keeping some breathing room */
+  /* +20% vs v157 sizing */
+  max-height: clamp(288px, 58vh, 605px);
+  object-fit: contain;
+  border-radius: 10px;
+}
+
+
+.coverWrap.isClickable {
+  cursor: zoom-in;
+}
+
+.coverLightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0,0,0,0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+}
+
+.coverLightboxBox {
+  max-width: calc(100vw - 28px);
+  max-height: calc(100vh - 28px);
+}
+
+.coverLightboxImg {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 28px);
+  object-fit: contain;
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.45);
+}
+
+body.isCoverLightboxOpen {
+  overflow: hidden;
+}
+.focusRow {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.focusSkipBtn {
+  min-width: 64px;
+  height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--fs-14);
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.iconBtn:hover,
+.focusSkipBtn:hover {
+  background: var(--chip);
+}
+
+.iconBtn:focus-visible,
+.focusSkipBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Simple tooltip (for desktop hover) */
+@media (hover: hover) and (pointer: fine) {
+  [data-tooltip] { position: relative; }
+  [data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 10px);
+    transform: translateX(-50%);
+    background: var(--fg);
+    color: var(--bg);
+    padding: 6px 8px;
+    border-radius: 10px;
+    font-size: var(--fs-12);
+    font-weight: 600;
+    white-space: nowrap;
+    box-shadow: 0 10px 22px var(--shadow);
+    z-index: 10;
+    pointer-events: none;
+  }
+  [data-tooltip]:hover::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 4px);
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: var(--fg);
+    z-index: 10;
+    pointer-events: none;
+  }
+}
+
+
+.playBtn {
+  width: 44px; height: 44px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--btn);
+  color: var(--btnFg);
+  font-size: var(--fs-18);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.iconBtn {
+  width: 40px; height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--fs-18);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.iconBtn.isActive {
+  background: var(--chip);
+}
+
+
+.progressBlock { display: grid; gap: 6px; }
+
+.seek { width: 100%; accent-color: currentColor; }
+.seek:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.timeRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: var(--fs-12);
+}
+
+.drawer {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 10px;
+}
+
+.drawerRow {
+  display: grid;
+  /* Slightly wider label column to prevent word-splitting (e.g. “Audio language”). */
+  grid-template-columns: 125px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Labels should wrap at spaces, not split words with hyphenation. */
+.label {
+  font-size: var(--fs-13);
+  color: var(--muted);
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: none;
+}
+
+.select {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  padding: 10px 12px;
+  font-size: var(--fs-14);
+}
+
+.menu {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 60px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 12px 26px var(--shadow);
+  overflow: hidden;
+  z-index: 20;
+
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 140px);
+  max-height: calc(100vh - 140px);
+}
+
+
+.menuHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.menuTitle { font-weight: 650; }
+.menuList { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+.chapterItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+
+.chapterItem:last-child { border-bottom: none; }
+
+.chapterTitle {
+  font-size: var(--fs-14);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapterTime {
+  font-size: var(--fs-12);
+  color: var(--muted);
+  flex: 0 0 auto;
+  background: var(--chip);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+.chapterItem[aria-current="true"] .chapterTitle { font-weight: 650; }
+
+/* Sleep timer menu */
+.sleepItem {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  padding: 12px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-14);
+}
+.sleepItem:last-child { border-bottom: none; }
+.sleepItem:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.sleepItem[aria-checked="true"] .sleepLabel { font-weight: 650; }
+.sleepPill {
+  font-size: var(--fs-12);
+  color: var(--muted);
+  flex: 0 0 auto;
+  background: var(--chip);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+
+
+
+
+/* Theme override: user selection (stored in localStorage).
+   Default is system (prefers-color-scheme). */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --fg: #111111;
+  --muted: #5c5c5c;
+  --card: #f3f4f6;
+  --border: rgba(0,0,0,0.12);
+  --shadow: rgba(0,0,0,0.10);
+  --btn: #111111;
+  --btnFg: #ffffff;
+  --chip: rgba(0,0,0,0.06);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --fg: #e7eaf0;
+  --muted: #a5a9b3;
+  --card: #121826;
+  --border: rgba(255,255,255,0.14);
+  --shadow: rgba(0,0,0,0.35);
+  --btn: #e7eaf0;
+  --btnFg: #0b0f14;
+  --chip: rgba(255,255,255,0.08);
+}
+
+
+/* Ensure [hidden] always hides elements, even if class styles define display. */
+[hidden] { display: none !important; }
+
+.drawer[hidden] { display: none !important; }
+.menu[hidden] { display: none !important; }
+
+
+.player {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+/* Chrome/Firefox interaction tuning */
+button, .iconBtn, .chaptersToggle, .optionsBtn, .chapterItem {
+  -webkit-tap-highlight-color: transparent;
+}
+
+input[type="range"] {
+  touch-action: none;
+}
+
+/* First-visit help modal */
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  z-index: 80;
+}
+
+.modal {
+  width: min(560px, 100%);
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 18px 40px var(--shadow);
+  overflow: hidden;
+}
+
+.modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modalTitle {
+  margin: 0;
+  font-size: var(--fs-16);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.modalClose {
+  width: 40px;
+  height: 40px;
+}
+
+.modalBody {
+  padding: 14px 16px 6px 16px;
+  font-size: var(--fs-14);
+  line-height: 1.45;
+}
+
+.modalBody p {
+  margin: 0 0 10px 0;
+}
+
+.modalBody ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.modalFooter {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 16px 16px 16px;
+}
+
+.primaryBtn {
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--fg);
+  color: var(--bg);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primaryBtn:active {
+  transform: translateY(1px);
+}
+
+
+/* Ensure hidden attribute actually hides the modal in all browsers */
+.modalBackdrop[hidden] { display: none !important; }
+
+.onboardControls {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 12px;
+}
+
+.onboardRow {
+  display: grid;
+  gap: 6px;
+}
+
+.onboardControls p {
+  margin: 0 0 2px 0;
+}
+
+/* Onboarding list grouping */
+.onboardGap { height: 10px; }
+.modalBody ul ul {
+  margin-top: 8px;
+}
+.modalBody ul ul li {
+  margin-top: 6px;
+}
+
+/* Disable interactions during iOS-sensitive transitions */
+.uiLocked button,
+.uiLocked select {
+  opacity: 0.85;
+}
+
+
+/* iOS smoothing: lock interactions briefly during seek/switch */
+.capBusy #chaptersBtn,
+.capBusy #optionsBtn,
+.capBusy #langSelect,
+.capBusy #qualitySelect,
+.capBusy #themeSelect {
+  opacity: 0.85;
+}
+.capBusy .chapterItem {
+  opacity: 0.7;
+}
+
+
+
+/* Reset link under settings */
+.textLinkBtn{
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: var(--text);
+  opacity: 0.75;
+  font: inherit;
+  font-size: var(--fs-14);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.textLinkBtn:hover{
+  color: var(--accent);
+  opacity: 1;
+}
+.drawerRowLink{
+  padding-top: 0;
+  margin-top: -6px;
+}
+
+.drawerRowRange{
+  /* Match standard drawer rows: fixed label column + flexible control column */
+  /* Allow long translated labels to wrap without colliding with the slider. */
+  grid-template-columns: minmax(90px, 42%) minmax(0, 1fr);
+  align-items: start;
+}
+
+.drawerRowRange .label{
+  align-self: start;
+  line-height: 1.25;
+  padding-top: 2px;
+}
+
+.rangeWrap{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+}
+
+.range{
+  flex: 1 1 0;
+  min-width: 0;
+  width: 100%;
+}
+
+.rangeValue{
+  min-width: 3.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Mobile layout: stack label above control to prevent overlap for long translations. */
+@media (max-width: 420px) {
+  .drawerRow {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    align-items: start;
+  }
+  .drawerRow.drawerRowLink {
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+    align-items: center;
+  }
+  .drawerRowRange{
+    grid-template-columns: 1fr;
+  }
+  .rangeWrap{
+    gap: 8px;
+  }
+  .rangeValue{
+    min-width: 3.2em;
+  }
+}
+
+
+.drawerGroupHeader{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 6px;
+  color: var(--muted);
+  font-weight: 650;
+  font-size: var(--fs-14);
+}
+
+.drawerDivider{
+  height: 1px;
+  background: var(--border);
+  margin: 10px 0 6px;
+}
+
+.textLinkBtn .linkIcon{
+  margin-right: 8px;
+  font-size: var(--fs-16);
+  line-height: 1;
+}
+
+
+/* Reset link row: align to the far right edge of the drawer */
+.drawerRow.drawerRowLink{
+  grid-template-columns: 1fr auto;
+}
+.drawerRow.drawerRowLink .label{
+  display: none;
+}
+
+.modalFooterSplit{
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  align-items: center;
+}
+.secondaryBtn{
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 10px 16px;
+  border-radius: 14px;
+  cursor: pointer;
+  color: var(--text);
+}
+.secondaryBtn:hover{
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* (v132) Focus Mode is an expanded state within the player card; no overlay or sheets. */
+
+
+
+/* Mobile layout tweaks (iPhone / narrow screens) */
+@media (max-width: 420px) {
+  .playerCard {
+    padding: 10px;
+    border-radius: 14px;
+  }
+
+  .playerBar {
+    /* Keep the transport buttons to the right of the seek bar (not under it). */
+    grid-template-columns: 44px 1fr auto;
+    gap: 8px;
+  }
+
+  /* Allow the seek block to shrink properly inside CSS Grid on iOS Safari. */
+  .progressBlock { gap: 4px; min-width: 0; }
+
+  .miniBtnRow {
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  .iconBtn {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    font-size: var(--fs-16);
+  }
+
+  .playBtn {
+    width: 42px;
+    height: 42px;
+  }
+
+  .focusRow {
+    gap: 8px;
+  }
+
+  .focusSkipBtn {
+    min-width: 56px;
+    height: 40px;
+    padding: 0 10px;
+  }
+}
+
+/* v141: toasts + a11y helpers */
+.sr-only {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -999px;
+  top: 8px;
+  z-index: 10000;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  text-decoration: none;
+}
+.skip-link:focus {
+  left: 8px;
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Toasts live close to the player (in-flow under the card). */
+.toastHost {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  z-index: 50;
+  pointer-events: none;
+  margin-top: 10px;
+}
+
+.toast {
+  pointer-events: auto;
+  max-width: 520px;
+  width: 100%;
+  margin: 0 auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 14px;
+  padding: 10px 12px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 150ms ease, transform 150ms ease;
+}
+.toast.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+.toast-success { border-color: var(--ok); }
+.toast-warning { border-color: var(--warn); }
+.toast-error { border-color: var(--danger); }
+
+/* Micro-interactions */
+.playBtn, .iconBtn {
+  transition: transform 150ms ease, background 150ms ease;
+}
+.playBtn:active { transform: scale(0.96); }
+.iconBtn:active { transform: scale(0.92); }
+
+@media (prefers-reduced-motion: reduce) {
+  .toast, .playBtn, .iconBtn { transition: none !important; }
+  .toast { transform: none !important; }
+}
+
+
+/* Skeleton loading state (keeps layout stable on slow networks) */
+@keyframes capShimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+body.isLoading #episodeTitle,
+body.isLoading #episodeMeta {
+  color: transparent;
+  border-radius: 10px;
+  background: linear-gradient(90deg, var(--chip) 0%, rgba(255,255,255,0.10) 50%, var(--chip) 100%);
+  background-size: 200% 100%;
+  animation: capShimmer 1.3s ease-in-out infinite;
+}
+body.isLoading #episodeTitle {
+  width: min(240px, 70vw);
+}
+body.isLoading #episodeMeta {
+  width: min(320px, 90vw);
+}
+
+.playerCard.isLoading {
+  cursor: progress;
+}
+
+.playerCard.isLoading .playerBar,
+.playerCard.isLoading .focusRow,
+.playerCard.isLoading .coverWrap {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.skeletonOverlay {
+  position: absolute;
+  inset: 12px;
+  display: none;
+  gap: 12px;
+  z-index: 5;
+}
+
+.playerCard.isLoading .skeletonOverlay {
+  display: flex;
+  flex-direction: column;
+}
+
+.skeletonOverlay .sk {
+  background: linear-gradient(90deg, var(--chip) 0%, rgba(255,255,255,0.10) 50%, var(--chip) 100%);
+  background-size: 200% 100%;
+  animation: capShimmer 1.3s ease-in-out infinite;
+}
+
+.skeletonOverlay .skBarRow {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.skeletonOverlay .skCircle {
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+}
+
+.skeletonOverlay .skSeek {
+  height: 14px;
+  border-radius: 10px;
+}
+
+.skeletonOverlay .skTimeRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-left: 54px;
+}
+
+.skeletonOverlay .skTime {
+  width: 56px;
+  height: 12px;
+  border-radius: 8px;
+}
+
+.skeletonOverlay .skBtnsRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.skeletonOverlay .skIcon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+}
+
+.skeletonOverlay .skBtn {
+  width: 64px;
+  height: 40px;
+  border-radius: 12px;
+}
