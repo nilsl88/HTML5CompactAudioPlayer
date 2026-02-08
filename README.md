@@ -1,5 +1,7 @@
 # Compact Audio Player
 
+> Vibe-coded: rapid prototype, zero build step.
+
 A static-site friendly audiobook/podcast player (single HTML page) with multi-language audio, chapter navigation, and a quality selector that automatically picks the best codec family for the current browser.
 
 This repo is **vanilla HTML/CSS/JS** (no build step).
