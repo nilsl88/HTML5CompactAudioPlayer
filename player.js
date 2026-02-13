@@ -181,10 +181,7 @@
     coverLightbox: document.getElementById("coverLightbox"),
     coverLightboxBox: document.getElementById("coverLightboxBox"),
     coverLightboxImg: document.getElementById("coverLightboxImg"),
-    optionsBtn: document.getElementById("optionsBtn"),
-    focusBtn: document.getElementById("focusBtn"),
     focusRow: document.getElementById("focusRow"),
-    focusCloseBtn: document.getElementById("focusCloseBtn"),
     focusSkipBack: document.getElementById("focusSkipBack"),
     focusSkipForward: document.getElementById("focusSkipForward"),
     sleepBtn: document.getElementById("sleepBtn"),
@@ -208,7 +205,6 @@
     resetCancel: document.getElementById("resetCancel"),
     resetOk: document.getElementById("resetOk"),
     onboardingCloseX: document.getElementById("onboardingCloseX"),
-    chaptersBtn: document.getElementById("chaptersBtn"),
     closeChaptersBtn: document.getElementById("closeChaptersBtn"),
     chaptersMenu: document.getElementById("chaptersMenu"),
     chaptersList: document.getElementById("chaptersList"),
@@ -640,8 +636,6 @@ function setUiLocked(locked) {
     if (els.themeSelect) els.themeSelect.disabled = disabled;
     if (els.fontSizeSelect) els.fontSizeSelect.disabled = disabled;
     if (els.uiLangSelect) els.uiLangSelect.disabled = disabled;
-    if (els.chaptersBtn) els.chaptersBtn.disabled = disabled;
-    if (els.optionsBtn) els.optionsBtn.disabled = disabled;
   } catch {}
 
   if (els.chaptersList) {
@@ -920,8 +914,8 @@ function updateMetaLineAfterUiLangChange() {
 }
 
 function applyUiStrings() {
-  // Note: We intentionally do not mutate the page's <html lang>. The Player language selector
-  // only affects strings inside the player UI.
+  // Keep <html lang> aligned with the selected player language for better accessibility.
+  try { document.documentElement.lang = UI_LOCALE || "en"; } catch {}
 
   // Header defaults (title often replaced by episode.json later)
   if (els.meta && String(els.meta.textContent || "").trim() === "Loading…") {
@@ -939,21 +933,6 @@ function applyUiStrings() {
   if (els.volumeRange) els.volumeRange.setAttribute("aria-label", t("volumeLabel"));
   if (els.speedRange) els.speedRange.setAttribute("aria-label", t("playbackSpeedLabel"));
 
-  if (els.chaptersBtn) {
-    const label = t("chapters");
-    els.chaptersBtn.setAttribute("aria-label", label);
-    setTooltip(els.chaptersBtn, label);
-  }
-  if (els.optionsBtn) {
-    const label = t("options");
-    els.optionsBtn.setAttribute("aria-label", label);
-    setTooltip(els.optionsBtn, label);
-  }
-  if (els.focusBtn) {
-    const label = (t("expandPlayer") || t("focusMode"));
-    els.focusBtn.setAttribute("aria-label", label);
-    setTooltip(els.focusBtn, label);
-  }
 
   const langLabel = document.querySelector('label[for="langSelect"]');
   if (langLabel) langLabel.textContent = t("languageLabel");
@@ -1023,11 +1002,6 @@ function applyUiStrings() {
     const label = t("options");
     els.focusOptionsBtn.setAttribute("aria-label", label);
     setTooltip(els.focusOptionsBtn, label);
-  }
-  if (els.focusCloseBtn) {
-    const label = (t("collapsePlayer") || t("close"));
-    els.focusCloseBtn.setAttribute("aria-label", label);
-    setTooltip(els.focusCloseBtn, label);
   }
 
   if (els.sleepBtn) {
@@ -2490,8 +2464,6 @@ function setUiBusy(busy, minMs = 350) {
       try { els.qualitySelect.disabled = false; } catch {}
       try { if (els.fontSizeSelect) els.fontSizeSelect.disabled = false; } catch {}
       try { els.themeSelect.disabled = false; } catch {}
-      try { els.chaptersBtn.disabled = false; } catch {}
-      try { els.optionsBtn.disabled = false; } catch {}
       try { if (els.chaptersList) els.chaptersList.setAttribute("aria-disabled", "false"); } catch {}
     }, minMs);
     return;
@@ -2504,8 +2476,6 @@ function setUiBusy(busy, minMs = 350) {
   try { els.qualitySelect.disabled = true; } catch {}
   try { if (els.fontSizeSelect) els.fontSizeSelect.disabled = true; } catch {}
   try { els.themeSelect.disabled = true; } catch {}
-  try { els.chaptersBtn.disabled = true; } catch {}
-  try { els.optionsBtn.disabled = true; } catch {}
   try { if (els.chaptersList) els.chaptersList.setAttribute("aria-disabled", "true"); } catch {}
 }
 
@@ -2748,13 +2718,11 @@ function waitForMediaReady(timeoutMs = 8000) {
 
   function setChaptersExpanded(expanded) {
     const v = expanded ? "true" : "false";
-    try { if (els.chaptersBtn) els.chaptersBtn.setAttribute("aria-expanded", v); } catch {}
     try { if (els.focusChaptersBtn) els.focusChaptersBtn.setAttribute("aria-expanded", v); } catch {}
   }
 
   function setOptionsExpanded(expanded) {
     const v = expanded ? "true" : "false";
-    try { if (els.optionsBtn) els.optionsBtn.setAttribute("aria-expanded", v); } catch {}
     try { if (els.focusOptionsBtn) els.focusOptionsBtn.setAttribute("aria-expanded", v); } catch {}
   }
 
@@ -4218,13 +4186,7 @@ try { if (els.chaptersList) els.chaptersList.innerHTML = ""; } catch {}
   }
 
   /** Events **/
-  if (els.optionsBtn) {
-    els.optionsBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    toggleOptions();
-    });
-  }
-  els.optionsPanel.addEventListener("click", (e) => e.stopPropagation());
+  if (els.optionsPanel) els.optionsPanel.addEventListener("click", (e) => e.stopPropagation());
 
   // Cover: click to open full-size lightbox (audio keeps playing)
   if (els.coverWrap) {
@@ -4378,16 +4340,12 @@ try { if (els.chaptersList) els.chaptersList.innerHTML = ""; } catch {}
       applySkipSeconds(v);
     });
   }
-  if (els.chaptersBtn) {
-    els.chaptersBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    toggleChapters();
+  if (els.closeChaptersBtn) {
+    els.closeChaptersBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeChapters();
     });
   }
-  els.closeChaptersBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    closeChapters();
-  });
   if (els.focusSkipBack) els.focusSkipBack.addEventListener("click", () => { mediaSeekBy(-skipSeconds); });
   if (els.focusSkipForward) els.focusSkipForward.addEventListener("click", () => { mediaSeekBy(skipSeconds); });
   if (els.focusChaptersBtn) {
