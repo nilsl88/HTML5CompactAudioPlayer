@@ -1,0 +1,116 @@
+{
+  "id": "episode-001",
+  "defaultLanguage": "en",
+  "debug": {
+    "showAllQualities": false
+  },
+  "title": {
+    "en": "Episode 001",
+    "da": "Episode 001",
+    "nb": "Episode 001",
+    "sv": "Avsnitt 001"
+  },
+  "cover": "./episode-001.webp",
+  "languages": {
+    "en": {
+      "label": "English",
+      "basePath": "media/episode-001/en/",
+      "chapters": "chapters.vtt",
+      "sources": {
+        "opus": {
+          "64": "audio-64k.webm",
+          "96": "audio-96k.webm",
+          "128": "audio-128k.webm",
+          "256": "audio-256k.webm"
+        },
+        "aac": {
+          "64": "audio-64k.m4a",
+          "96": "audio-96k.m4a",
+          "128": "audio-128k.m4a",
+          "256": "audio-256k.m4a"
+        },
+        "mp3": {
+          "64": "audio-64k.mp3",
+          "96": "audio-96k.mp3",
+          "128": "audio-128k.mp3"
+        }
+      }
+    },
+    "da": {
+      "label": "Dansk",
+      "basePath": "media/episode-001/da/",
+      "chapters": "chapters.vtt",
+      "sources": {
+        "opus": {
+          "96": "audio-96k.webm",
+          "128": "audio-128k.webm",
+          "256": "audio-256k.webm",
+          "64": "audio-64k.webm"
+        },
+        "aac": {
+          "96": "audio-96k.m4a",
+          "128": "audio-128k.m4a",
+          "64": "audio-64k.m4a",
+          "256": "audio-256k.m4a"
+        },
+        "mp3": {
+          "96": "audio-96k.mp3",
+          "128": "audio-128k.mp3",
+          "64": "audio-64k.mp3"
+        }
+      }
+    },
+    "nb": {
+      "label": "Norsk (Bokmål)",
+      "basePath": "media/episode-001/nb/",
+      "chapters": "chapters.vtt",
+      "sources": {
+        "opus": {
+          "96": "audio-96k.webm",
+          "128": "audio-128k.webm",
+          "256": "audio-256k.webm",
+          "64": "audio-64k.webm"
+        },
+        "aac": {
+          "96": "audio-96k.m4a",
+          "128": "audio-128k.m4a",
+          "64": "audio-64k.m4a",
+          "256": "audio-256k.m4a"
+        },
+        "mp3": {
+          "96": "audio-96k.mp3",
+          "128": "audio-128k.mp3",
+          "64": "audio-64k.mp3"
+        }
+      }
+    },
+    "sv": {
+      "label": "Svenska",
+      "basePath": "media/episode-001/sv/",
+      "chapters": "chapters.vtt",
+      "sources": {
+        "opus": {
+          "96": "audio-96k.webm",
+          "128": "audio-128k.webm",
+          "256": "audio-256k.webm",
+          "64": "audio-64k.webm"
+        },
+        "aac": {
+          "96": "audio-96k.m4a",
+          "128": "audio-128k.m4a",
+          "64": "audio-64k.m4a",
+          "256": "audio-256k.m4a"
+        },
+        "mp3": {
+          "96": "audio-96k.mp3",
+          "128": "audio-128k.mp3",
+          "64": "audio-64k.mp3"
+        }
+      }
+    }
+  },
+  "ui": {
+    "onboardingEnabled": true
+  },
+  "cacheVersion": 1 
+}

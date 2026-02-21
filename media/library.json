@@ -1,0 +1,15 @@
+{
+  "default": "episode-001",
+  "audiofiles": [
+    {
+      "id": "episode-001",
+      "folder": "episode-001",
+      "title": {
+        "en": "Audiobook 1",
+        "da": "Lydbog 1",
+        "nb": "Lydbok 1",
+        "sv": "Ljudbok 1"
+      }
+    }
+  ]
+}
