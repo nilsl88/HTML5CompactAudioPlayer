@@ -16,7 +16,7 @@ This repo is **vanilla HTML/CSS/JS** (no build step).
 - **Quality selector** (bitrate options), with **smart codec-family selection**
 - **Lazy audio loading**: no audio file is requested until the user presses **Play**
 - **Playback speed** slider (0.5×–2×)
-- **Sleep timer** (pause after X minutes)
+- **Sleep timer** (pause after X minutes or at the end of the current chapter)
 - **Cover image** (optional) with a built-in lightbox viewer
 - **Appearance controls**: System/Light/Dark + text size
 - **Media Session API** support (lock-screen controls)
