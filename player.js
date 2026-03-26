@@ -2430,6 +2430,9 @@ function filterQualityOptionsForDisplay(allOptions, debugShowAllQualities) {
   let sleepEndAtMs = 0;
   let sleepMinutes = 0;
   let sleepTicker = null;
+  let sleepMode = "off"; // "off" | "minutes" | "endChapter"
+  let sleepChapterTargetSec = null;
+  let sleepCompleting = false;
 
   // Lazy audio loading (A): do not set the audio source until the user presses Play.
   // This keeps initial page load fast and avoids fetching metadata/duration upfront.
@@ -2748,7 +2751,7 @@ function waitForMediaReady(timeoutMs = 8000) {
 
   const SLEEP_DURATIONS_MIN = [5, 10, 15, 30, 45, 60, 90, 120];
 
-  function sleepTimerIsActive() { return !!sleepTimeout; }
+  function sleepTimerIsActive() { return sleepMode !== "off"; }
 
   function sleepRemainingMs() {
     if (!sleepTimerIsActive()) return 0;
@@ -2772,7 +2775,9 @@ function waitForMediaReady(timeoutMs = 8000) {
     if (sleepTimerIsActive()) {
       try { els.sleepBtn.classList.add("isActive"); } catch {}
       const rem = sleepRemainingMinutes();
-      const tip = rem ? `${baseLabel}: ${fmt(t("sleepTimerOption"), { m: rem })}` : baseLabel;
+      const tip = (sleepMode === "minutes" && rem)
+        ? `${baseLabel}: ${fmt(t("sleepTimerOption"), { m: rem })}`
+        : `${baseLabel}: ${t("sleepEndChapterOption")}`;
       try { els.sleepBtn.setAttribute("aria-label", tip); } catch {}
       try { setTooltip(els.sleepBtn, tip); } catch {}
     } else {
@@ -2786,8 +2791,11 @@ function waitForMediaReady(timeoutMs = 8000) {
       if (!els.sleepList) return;
       const items = els.sleepList.querySelectorAll("button.sleepItem");
       items.forEach((btn) => {
+        const mode = String(btn.dataset.mode || "");
         const m = parseInt(btn.dataset.minutes || "0", 10) || 0;
-        const checked = sleepTimerIsActive() ? (m === sleepMinutes) : (m === 0);
+        const checked = sleepTimerIsActive()
+          ? ((sleepMode === "minutes" && mode === "minutes" && m === sleepMinutes) || (sleepMode === "endChapter" && mode === "endChapter"))
+          : (mode === "off");
         btn.setAttribute("aria-checked", checked ? "true" : "false");
       });
     } catch {}
@@ -2797,13 +2805,16 @@ function waitForMediaReady(timeoutMs = 8000) {
     if (!els.sleepList) return;
     const items = els.sleepList.querySelectorAll("button.sleepItem");
     items.forEach((btn) => {
+      const mode = String(btn.dataset.mode || "");
       const m = parseInt(btn.dataset.minutes || "0", 10) || 0;
-      const label = (m <= 0) ? t("sleepTimerOff") : fmt(t("sleepTimerOption"), { m });
+      const label = (mode === "endChapter")
+        ? t("sleepEndChapterOption")
+        : ((m <= 0) ? t("sleepTimerOff") : fmt(t("sleepTimerOption"), { m }));
       const labelEl = btn.querySelector(".sleepLabel");
       const pillEl = btn.querySelector(".sleepPill");
       if (labelEl) labelEl.textContent = label;
       if (pillEl) {
-        if (m <= 0) {
+        if (mode === "endChapter" || m <= 0) {
           pillEl.textContent = "";
           pillEl.hidden = true;
         } else {
@@ -2823,11 +2834,12 @@ function waitForMediaReady(timeoutMs = 8000) {
     }
     els.sleepList.dataset.built = "1";
 
-    const buildItem = (minutes) => {
+    const buildItem = (minutes, mode = "minutes") => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "sleepItem";
       btn.setAttribute("role", "menuitemradio");
+      btn.dataset.mode = mode;
       btn.dataset.minutes = String(minutes);
 
       const labelSpan = document.createElement("span");
@@ -2839,17 +2851,19 @@ function waitForMediaReady(timeoutMs = 8000) {
       btn.appendChild(labelSpan);
       btn.appendChild(pillSpan);
 
-      btn.addEventListener("click", (e) => {
+      btn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        startSleepTimer(minutes);
+        if (mode === "endChapter") await startSleepAtEndOfChapter();
+        else startSleepTimer(minutes);
         closeSleepMenu();
       });
 
       els.sleepList.appendChild(btn);
     };
 
-    SLEEP_DURATIONS_MIN.forEach(buildItem);
-    buildItem(0); // Off
+    buildItem(-1, "endChapter");
+    SLEEP_DURATIONS_MIN.forEach((m) => buildItem(m, "minutes"));
+    buildItem(0, "off"); // Off
 
     refreshSleepMenuLabels();
     updateSleepUi();
@@ -2882,16 +2896,77 @@ function waitForMediaReady(timeoutMs = 8000) {
     try { applyVolume(startVol); } catch {}
   }
 
+  async function completeSleep(reasonKey = "sleepTimerEnded", withFade = true) {
+    if (sleepCompleting) return;
+    sleepCompleting = true;
+    try {
+      try { if (sleepTimeout) window.clearTimeout(sleepTimeout); } catch {}
+      sleepTimeout = null;
+      sleepEndAtMs = 0;
+      sleepMinutes = 0;
+      sleepMode = "off";
+      sleepChapterTargetSec = null;
+      stopSleepTicker();
+      updateSleepUi();
+      try { showToast(t(reasonKey), "info"); } catch {}
+      if (withFade) {
+        try { await fadeOutAndPause(); } catch {}
+      }
+    } finally {
+      sleepCompleting = false;
+    }
+  }
+
+  function chapterSleepTargetForCurrentPosition(curSec) {
+    const cur = (typeof curSec === "number" && isFinite(curSec) && curSec >= 0) ? curSec : 0;
+    const idx = chapterIndexForTime(cur);
+    if (idx < 0 || idx >= cues.length) return null;
+    const cue = cues[idx];
+    if (typeof cue.end === "number" && isFinite(cue.end) && cue.end > cur + 0.1) return cue.end;
+    if (idx + 1 < cues.length) {
+      const nextStart = cues[idx + 1] && cues[idx + 1].start;
+      if (typeof nextStart === "number" && isFinite(nextStart) && nextStart > cur + 0.1) return nextStart;
+    }
+    const dur = getKnownDuration();
+    if (typeof dur === "number" && isFinite(dur) && dur > cur + 0.1) return dur;
+    return null;
+  }
+
   function cancelSleepTimer(silent = false) {
     try { if (sleepTimeout) window.clearTimeout(sleepTimeout); } catch {}
     sleepTimeout = null;
     sleepEndAtMs = 0;
     sleepMinutes = 0;
+    sleepMode = "off";
+    sleepChapterTargetSec = null;
     stopSleepTicker();
     updateSleepUi();
     if (!silent) {
       try { showToast(t("sleepTimerCanceled"), "info"); } catch {}
     }
+  }
+
+  async function startSleepAtEndOfChapter() {
+    cancelSleepTimer(true);
+    if (!chaptersUrlPending) {
+      try { showToast(t("sleepEndChapterUnavailable"), "warning"); } catch {}
+      return;
+    }
+    await ensureChaptersReady();
+    if (!cues.length) {
+      try { showToast(t("sleepEndChapterUnavailable"), chaptersLoadError ? "warning" : "info"); } catch {}
+      return;
+    }
+    const cur = (els.audio && isFinite(els.audio.currentTime)) ? els.audio.currentTime : (lastKnownTime || 0);
+    const target = chapterSleepTargetForCurrentPosition(cur);
+    if (!(typeof target === "number" && isFinite(target) && target > cur + 0.05)) {
+      try { showToast(t("sleepEndChapterUnavailable"), "warning"); } catch {}
+      return;
+    }
+    sleepMode = "endChapter";
+    sleepChapterTargetSec = target;
+    updateSleepUi();
+    try { showToast(t("sleepEndChapterSet"), "success"); } catch {}
   }
 
   function startSleepTimer(minutes) {
@@ -2903,18 +2978,12 @@ function waitForMediaReady(timeoutMs = 8000) {
 
     // Reset and arm
     cancelSleepTimer(true);
+    sleepMode = "minutes";
     sleepMinutes = m;
     sleepEndAtMs = Date.now() + (m * 60 * 1000);
 
     sleepTimeout = window.setTimeout(async () => {
-      // Mark inactive first so UI doesn't show stale remaining time
-      sleepTimeout = null;
-      stopSleepTicker();
-      try { showToast(t("sleepTimerEnded"), "info"); } catch {}
-      try { await fadeOutAndPause(); } catch {}
-      sleepEndAtMs = 0;
-      sleepMinutes = 0;
-      updateSleepUi();
+      await completeSleep("sleepTimerEnded", true);
     }, m * 60 * 1000);
 
     // Update tooltip periodically (remaining minutes)
@@ -4221,6 +4290,7 @@ try { if (els.chaptersList) els.chaptersList.innerHTML = ""; } catch {}
       // Stop playback and persist current progress in the previous episode
       try { saveProgressNow(); } catch {}
       try { els.audio.pause(); } catch {}
+      cancelSleepTimer(true);
       userWantsPlaying = false;
       try { closeChapters(); } catch {}
 
@@ -4435,7 +4505,13 @@ try { if (els.chaptersList) els.chaptersList.innerHTML = ""; } catch {}
   els.playPauseBtn.addEventListener("click", () => { togglePlay().catch(() => {}); });
   els.audio.addEventListener("play", () => { userWantsPlaying = true; clearMetaError(); updatePlayButton(); });
   els.audio.addEventListener("pause", () => { userWantsPlaying = false; updatePlayButton(); saveProgressThrottled(true); });
-  els.audio.addEventListener("ended", () => { updatePlayButton(); saveProgressThrottled(true); });
+  els.audio.addEventListener("ended", () => {
+    if (sleepMode === "endChapter") {
+      completeSleep("sleepEndChapterReached", false).catch(() => {});
+    }
+    updatePlayButton();
+    saveProgressThrottled(true);
+  });
 
   // Flush progress when the page is backgrounded/closed.
   // localStorage writes are throttled (see CONFIG.PROGRESS_SAVE_INTERVAL_MS),
@@ -4458,6 +4534,9 @@ try { if (els.chaptersList) els.chaptersList.innerHTML = ""; } catch {}
   els.audio.addEventListener("timeupdate", () => {
     const t = (isFinite(els.audio.currentTime) && els.audio.currentTime >= 0) ? els.audio.currentTime : 0;
     lastKnownTime = t;
+    if (sleepMode === "endChapter" && typeof sleepChapterTargetSec === "number" && isFinite(sleepChapterTargetSec) && t >= (sleepChapterTargetSec - 0.05)) {
+      completeSleep("sleepEndChapterReached", true).catch(() => {});
+    }
     scheduleProgressUiUpdate();
     saveProgressThrottled(false);
   });
@@ -4506,6 +4585,7 @@ els.seek.addEventListener("touchend", commitSeek, { passive: true });
 els.langSelect.addEventListener("change", async () => {
   try {
     if (!config || !episodeId) return;
+    cancelSleepTimer(true);
 
     const wasPlaying = !els.audio.paused && !els.audio.ended;
     const shouldPlay = wasPlaying || userWantsPlaying;
