@@ -1,89 +1,82 @@
 # Compact Audio Player
 
-> rapid prototype, zero build step.
+A dependency-free audiobook and podcast player for static websites. It supports multiple audio languages, WebVTT chapters, selectable quality, codec fallback, saved progress, and accessible custom controls.
 
-A static-site friendly audiobook/podcast player (single HTML page) with multi-language audio, chapter navigation, and a quality selector that automatically picks the best codec family for the current browser.
-
-This repo is **vanilla HTML/CSS/JS** (no build step).
+Production uses plain HTML, CSS, and JavaScript. There is no build step and no runtime package dependency.
 
 ## Features
 
-- **Play/Pause**
-- **Skip back/forward** with configurable interval (5/10/15/30/60 seconds)
-- **Prev/Next chapter**
-- **WebVTT chapters** (loaded lazily when needed)
-- **Audio language selector** (each language can have its own audio files and chapters)
-- **Quality selector** (bitrate options), with **smart codec-family selection**
-- **Lazy audio loading**: no audio file is requested until the user presses **Play**
-- **Playback speed** slider (0.5×–2×)
-- **Sleep timer** (pause after X minutes or at the end of the current chapter)
-- **Cover image** (optional) with a built-in lightbox viewer
-- **Appearance controls**: System/Light/Dark + text size
-- **Media Session API** support (lock-screen controls)
-- **Persistence** via `localStorage`: playback position per episode+language, selected language/quality, UI settings
-- **Reset player** link (clears saved settings + cached availability)
-- **Optional audiobook library** (`media/library.json`) for a built-in episode/book selector
+- Play and pause with lazy audio loading
+- Seek bar, current time, duration, and configurable skip buttons
+- Previous/next chapter and chapter selection from WebVTT
+- Audio-language and quality selection
+- Opus, AAC/M4A, and MP3 sources
+- Deterministic runtime source fallback
+- Playback speed and supported programmatic volume control
+- Timed sleep and sleep at the end of a chapter
+- Cover image and full-size cover dialog
+- System, light, and dark themes with three text sizes
+- English, Danish, Norwegian Bokmål, and Swedish interface text
+- Optional audiobook selector through `media/library.json`
+- Optional Media Session lock-screen controls
+- Saved progress per episode and audio language
+- Safe preference and availability caching
+- Keyboard controls, focus management, offline feedback, and reduced-motion support
 
-<p align="center">
-  <img src="preview.webp" width="500">
-</p>
+The player does not provide adaptive streaming, a playback queue, or transcript rendering.
 
-## What it does *not* do
+## Run locally
 
-- No adaptive streaming (HLS/DASH) and no automatic bitrate switching while playing
-- No playlists/queue beyond the simple optional library selector
-- No transcript rendering (chapters only)
-
-## Quick start
-
-
-   - `index.html`
-   - `player.js`
-   - `player.css`
-   - `i18n.js`
-
-2. Create your media folder structure:
-
-```
-./media/
-  episode-001/
-    episode.json
-    chapters-en.vtt
-    audio-256k.webm
-    audio-128k.webm
-    audio-256k.m4a
-    audio-128k.m4a
-    audio-128k.mp3
-```
-
-3. Serve the folder via any static server (local testing example):
+ES modules require an HTTP server. Direct `file://` use is not supported.
 
 ```bash
 python3 -m http.server 8080
 ```
 
-Then open `http://localhost:8080/`.
+Open `http://localhost:8080/`.
 
-## Configuration
+The example configuration references audio files that are not committed to this repository. Add the configured files under `media/episode-001/<language>/` to test playback.
 
-### `media/<episode-folder>/episode.json`
+## Project structure
 
-This file describes one audiobook/podcast “episode” (a book, an episode, etc.).
+```text
+index.html              Semantic player markup and dialogs
+player.css              Responsive layout and design tokens
+player.js               Application coordinator and DOM event wiring
+i18n.js                 Interface strings
+js/
+  availability.js       HEAD and Range availability probes
+  config.js             Configuration validation and normalization
+  dialogs.js            Dialog, panel, and focus behavior
+  media-controller.js   Sole owner of audio source, seek, and play transitions
+  source-selection.js   MIME evidence, quality display, and fallback ordering
+  storage.js            Safe persistence and legacy migration
+  utils.js              Shared utilities and abortable fetch retries
+  vtt.js                WebVTT chapter parser
+tests/                  Node built-in tests; no test packages required
+media/                  Library, episode, cover, and chapter data
+```
 
-**Required** keys:
+`player.js` coordinates the modules but does not assign `audio.src`, call `audio.load()`, seek the element, or call `audio.play()` directly. Those operations belong to `media-controller.js` so source changes follow one path.
 
-- `id` (string)
-- `defaultLanguage` (string, e.g. `"en"`)
-- `languages` (object map)
+## Episode configuration
 
-**Common optional** keys:
+Store each episode at `media/<folder>/episode.json`.
 
-- `title` (object map: language → title)
-- `cover` (string: relative path, absolute URL, or data URI)
-- `duration` (number, seconds)
-- `cacheVersion` (number): bump to invalidate cached file availability when you add/remove media files
-- `debug.showAllQualities` (boolean)
-- `ui.onboardingEnabled` (boolean)
+Required fields:
+
+- `id`: stable episode identifier
+- `defaultLanguage`: language code used when no saved or browser match exists
+- `languages`: map of language code to language configuration
+
+Common optional fields:
+
+- `title`: localized title map
+- `cover`: path or HTTP(S) URL; image data URLs are also accepted
+- `duration`: duration hint in seconds
+- `cacheVersion`: change this when audio files are added or removed
+- `debug.showAllQualities`: show all codec families and technical details
+- `ui.onboardingEnabled`: disable the first-visit help dialog when `false`
 
 Example:
 
@@ -91,16 +84,19 @@ Example:
 {
   "id": "episode-001",
   "defaultLanguage": "en",
+  "title": {
+    "en": "Episode 001",
+    "da": "Episode 001"
+  },
+  "cover": "./episode-001.webp",
+  "duration": 3600,
+  "cacheVersion": 1,
   "debug": {
     "showAllQualities": false
   },
-  "title": {
-    "en": "Episode 001",
-    "da": "Episode 001",
-    "nb": "Episode 001",
-    "sv": "Avsnitt 001"
+  "ui": {
+    "onboardingEnabled": true
   },
-  "cover": "./episode-001.webp",
   "languages": {
     "en": {
       "label": "English",
@@ -108,128 +104,44 @@ Example:
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
-          "64": "audio-64k.webm",
           "96": "audio-96k.webm",
-          "128": "audio-128k.webm",
-          "256": "audio-256k.webm"
+          "128": "audio-128k.webm"
         },
         "aac": {
-          "64": "audio-64k.m4a",
           "96": "audio-96k.m4a",
-          "128": "audio-128k.m4a",
-          "256": "audio-256k.m4a"
+          "128": "audio-128k.m4a"
         },
         "mp3": {
-          "64": "audio-64k.mp3",
           "96": "audio-96k.mp3",
           "128": "audio-128k.mp3"
         }
       }
-    },
-    "da": {
-      "label": "Dansk",
-      "basePath": "media/episode-001/da/",
-      "chapters": "chapters.vtt",
-      "sources": {
-        "opus": {
-          "96": "audio-96k.webm",
-          "128": "audio-128k.webm",
-          "256": "audio-256k.webm",
-          "64": "audio-64k.webm"
-        },
-        "aac": {
-          "96": "audio-96k.m4a",
-          "128": "audio-128k.m4a",
-          "64": "audio-64k.m4a",
-          "256": "audio-256k.m4a"
-        },
-        "mp3": {
-          "96": "audio-96k.mp3",
-          "128": "audio-128k.mp3",
-          "64": "audio-64k.mp3"
-        }
-      }
-    },
-    "nb": {
-      "label": "Norsk (Bokmål)",
-      "basePath": "media/episode-001/nb/",
-      "chapters": "chapters.vtt",
-      "sources": {
-        "opus": {
-          "96": "audio-96k.webm",
-          "128": "audio-128k.webm",
-          "256": "audio-256k.webm",
-          "64": "audio-64k.webm"
-        },
-        "aac": {
-          "96": "audio-96k.m4a",
-          "128": "audio-128k.m4a",
-          "64": "audio-64k.m4a",
-          "256": "audio-256k.m4a"
-        },
-        "mp3": {
-          "96": "audio-96k.mp3",
-          "128": "audio-128k.mp3",
-          "64": "audio-64k.mp3"
-        }
-      }
-    },
-    "sv": {
-      "label": "Svenska",
-      "basePath": "media/episode-001/sv/",
-      "chapters": "chapters.vtt",
-      "sources": {
-        "opus": {
-          "96": "audio-96k.webm",
-          "128": "audio-128k.webm",
-          "256": "audio-256k.webm",
-          "64": "audio-64k.webm"
-        },
-        "aac": {
-          "96": "audio-96k.m4a",
-          "128": "audio-128k.m4a",
-          "64": "audio-64k.m4a",
-          "256": "audio-256k.m4a"
-        },
-        "mp3": {
-          "96": "audio-96k.mp3",
-          "128": "audio-128k.mp3",
-          "64": "audio-64k.mp3"
-        }
-      }
     }
-  },
-  "ui": {
-    "onboardingEnabled": true
-  },
-  "cacheVersion": 1 
+  }
 }
 ```
 
-#### Language object fields
+### Language fields
 
-Each `languages.<code>` object supports:
+- `label`: visible language name
+- `basePath`: optional base for source and chapter paths; resolved from the site root
+- `chapters`: WebVTT file name or URL
+- `sources`: map of codec, bitrate, and file path
 
-- `label` (string): label shown in the Audio language selector
-- `chapters` (string): WebVTT file path (relative to the episode folder unless you use `basePath`)
-- `basePath` (string, optional): prefix added to all relative `sources` and `chapters` paths
-- `sources` (object): codec → bitrate → path
+Without `basePath`, source and chapter paths are resolved from the episode folder.
 
-Supported codec keys:
+Supported codec keys are `opus`, `aac`, and `mp3`. MIME types are derived as follows:
 
-- `opus` (typically `.webm` or `.ogg`)
-- `aac` (typically `.m4a` / MP4 container)
-- `mp3`
+- WebM Opus: `audio/webm; codecs="opus"`
+- Ogg Opus: `audio/ogg; codecs="opus"`
+- AAC/M4A: `audio/mp4; codecs="mp4a.40.2"`
+- MP3: `audio/mpeg`
 
-### Optional: `media/library.json` (audiobook selector)
+Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schemes, and empty source maps are rejected during normalization without changing the documented schema.
 
-If you want a built-in episode/book selector, create `media/library.json`.
+## Optional library
 
-- If the library has **0 or 1** valid entry, the selector is hidden.
-- The player remembers the last selected episode.
-- You can also force an episode via `?episode=<id>`.
-
-Example:
+Add `media/library.json` to show an audiobook selector when more than one valid entry exists:
 
 ```json
 {
@@ -240,122 +152,151 @@ Example:
       "folder": "episode-001",
       "title": {
         "en": "Audiobook 1",
-        "da": "Lydbog 1",
-        "nb": "Lydbok 1",
-        "sv": "Ljudbok 1"
-      }
-    },
-    {
-      "id": "episode-002",
-      "folder": "episode-002",
-      "title": {
-        "en": "Audiobook 2",
-        "da": "Lydbog 2",
-        "nb": "Lydbok 2",
-        "sv": "Ljudbok 2"
+        "da": "Lydbog 1"
       }
     }
   ]
 }
 ```
 
-### WebVTT chapters
+The current `audiofiles` field remains the documented format. Older `episodes` and `items` collection names, plus `defaultId`, `path`, `label`, and related aliases, are still accepted.
 
-Chapters are standard WebVTT. Each language can point to a different VTT file.
+Use `?episode=<id>` to select an episode. Query values not present in the library are restricted to safe single-folder identifiers.
 
-Minimal example:
+## WebVTT chapters
+
+Chapters load when the user opens the chapter panel, uses chapter navigation, or selects sleep at chapter end. Chapter loading never blocks audio playback.
 
 ```vtt
 WEBVTT
 
 00:00:00.000 --> 00:05:12.000
-Intro
+Introduction
 
 00:05:12.000 --> 00:18:30.000
 Chapter 1
 ```
 
-Chapters are loaded lazily (when you open Chapters or use Prev/Next chapter).
+The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML.
 
-## Quality selection, codecs, and iOS behavior
+## Source selection and fallback
 
-The player groups qualities by **codec family**. By default it shows **one** codec family (the best match for the current device) and all existing bitrates for that codec.
+`canPlayType()` provides initial evidence, not a guarantee. There are no iOS-version codec rules.
 
-Codec preference is centralized and depends on platform:
+The initial codec preference is:
 
-- **Non‑iOS browsers:** prefer `opus` → `aac` → `mp3`.
-- **iOS/iPadOS Safari:** preference depends on the detected major iOS version:
-  - **iOS 17–25:** prefer `aac` → `mp3` → `opus` (WebM/Opus can be unreliable)
-  - **iOS 26+:** prefer `opus` → `aac` → `mp3`
+1. Opus
+2. AAC
+3. MP3
 
-Runtime fallbacks on iOS:
+The normal quality selector shows one codec family. Set `debug.showAllQualities` to `true` when inspecting every configured source.
 
-- If an **Opus** source fails to load/play, the player automatically falls back to **AAC**, then **MP3**.
-- If an **AAC** source fails to load/play, the player falls back to **MP3**.
+For each source transition, the player creates a finite queue:
 
-Notes:
+1. The selected source
+2. Other bitrates from that codec, ordered by distance from the selected bitrate
+3. Remaining codec families in preference order
 
-- iOS Safari sometimes misreports support via `canPlayType()`; the player applies iOS-specific heuristics so AAC/MP3 aren’t incorrectly hidden.
-- The Quality selector only lists files the player believes **exist** on the server (see next section).
+A confirmed decode or unsupported-source failure skips the rest of that codec family. A network/source failure may try another bitrate before moving to the next codec. Each URL is attempted once per transition.
 
-## File availability detection and caching
+`NotAllowedError` stops automatic attempts and asks the user to press Play again. Old Promise rejections, media events, probes, chapter loads, and episode responses are ignored after a newer generation takes ownership.
 
-To avoid listing 404 media files, the player probes file URLs and only displays options that exist.
+## Lazy loading
 
-- Primary probe: `HEAD` request
-- Fallback probe: small ranged `GET` (`Range: bytes=0-0`)
-- If `fetch()` probing is unreliable (some auth/proxy setups), it falls back to an **audio pipeline** probe and may disable fetch-probing automatically for the session.
+The audio element starts with `preload="none"` and no `src`.
 
-Caching:
+- Page load does not assign an audio source.
+- Language or quality changes before playback only update the pending selection.
+- Seeking or choosing a chapter before metadata updates the pending start time.
+- The first Play action assigns the source and calls `play()` within the same user gesture.
+- Source changes while playing preserve position, playback rate, and playback intent.
 
-- Results are cached in `localStorage` per episode for **7 days**.
-- Bump `cacheVersion` in `episode.json` to invalidate the cache when you add/remove files.
+Browsers control actual buffering and may treat `preload` as a hint after a source is assigned.
 
-Useful query parameters:
+## Availability probing
 
-- `?clearAvailCache=1` — clears the cached availability for the current episode
-- `?resetProbe=1` — re-enables probing if it was auto-disabled in the current session
+Availability is advisory. Each source is `available`, `missing`, or `unknown`.
 
-## Persistence and reset
+1. The player tries an abortable HEAD request.
+2. If HEAD is inconclusive, it sends `Range: bytes=0-0` and cancels the response body after the headers arrive.
 
-The player stores:
+HTTP 200/206 and authenticated 401/403 responses remain playable candidates. HTTP 404/410 from both probe paths marks a source missing. CORS, proxy, timeout, and offline failures stay unknown.
 
-- Playback position per **episode + audio language**
-- Selected language and quality
-- UI settings (theme, text size, player language)
-- Playback speed and skip interval
-- Cached file availability
+The player never creates temporary audio elements to probe files. A successful media load overrides a probe result, and even cached missing sources remain at the end of the runtime fallback queue.
 
-Use **Reset player** in the Options panel to clear everything and reload.
+Only the active audio language is scanned. Changing language cancels stale probe work and starts a scan for the new selection.
 
-## Accessibility and controls
+Results are cached for seven days. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current episode cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
 
-- Buttons and menus include ARIA labels.
-- Media Session API (when available): lock-screen play/pause/seek; next/previous maps to chapter navigation.
+## Storage
 
-Keyboard (desktop):
+All storage access is guarded. Unavailable storage, malformed JSON, obsolete values, and quota errors cannot stop startup.
 
-- `Space` — Play/Pause
-- `ArrowLeft` / `ArrowRight` — seek 5 seconds back/forward (independent of the Skip interval selector)
-- `Esc` — closes open menus/modals
+The player reads and migrates these existing keys:
 
-## Theming and customization
+- `compactPlayer:<episode>`: language, quality, and progress by audio language
+- `compactPlayer:ui`: theme, text size, player language, speed, volume, and skip interval
+- `compactPlayer:lastEpisode`: last library selection
+- `compactAudioPlayer.onboardingShown.v1`: onboarding state
+- `cap_avail_*`: legacy availability cache
 
-Most styling lives in `player.css`. You can adjust CSS variables on `:root` to change accent colors and spacing.
+New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:availability:<episode>:<cacheVersion>`. Reset removes current and legacy player keys.
 
-The player also supports:
+Progress writes are throttled and flushed when the page is hidden or left.
 
-- System / Light / Dark mode
-- Text size: Small / Medium / Large
+## Accessibility and keyboard controls
 
-## Troubleshooting
+Controls use native buttons, labels, fieldsets, outputs, sections, and dialogs. Chapter and sleep panels use ordinary button semantics instead of ARIA menu behavior.
 
-**I only see “—:—” duration and the seek bar is disabled**
+- `Space`: play or pause when focus is outside a control
+- `Arrow Left` / `Arrow Right`: seek five seconds
+- `Escape`: close an open panel or dialog
+- `Tab` / `Shift+Tab`: normal document and modal focus movement
 
-- This is expected until the user presses **Play**. The player avoids loading media metadata on page load.
+Panels place focus inside when opened and restore it to their trigger when closed by Escape or a close action. Dialogs use the native modal API with a focus-trap fallback. Status announcements are deduplicated to avoid repeated screen-reader output.
 
-**A language or quality option is missing**
+The layout supports 320 CSS px viewports, browser zoom, long labels, safe-area insets, reduced motion, and forced-colors mode. Primary controls use 44 CSS pixel targets.
 
-- The player hides options that appear missing on the server.
-- Try `?clearAvailCache=1` after uploading new files.
-- If your server blocks `HEAD` or `Range` requests, ensure it returns 200/206 correctly, or rely on the built-in audio-pipeline probe.
+## Browser behavior and limitations
+
+- Playback always requires a user action. The player does not attempt autoplay.
+- iOS and iPadOS expose `audio.volume` but do not apply programmatic changes. The volume control is hidden there.
+- Media Session is optional. Unsupported actions or metadata failures do not affect normal playback.
+- Lock-screen controls, background playback, interruptions, route changes, and app switching remain controlled by the operating system and browser.
+- Cross-origin configuration, chapter, image, and audio servers must permit the requests they receive. Authentication and CORS policies vary by deployment.
+- Device codec support can differ from `canPlayType()` results. Runtime fallback is the final authority.
+
+## Tests
+
+Run the dependency-free checks with:
+
+```bash
+node --check player.js
+for file in i18n.js js/*.js tests/*.mjs; do node --check "$file"; done
+node --test
+```
+
+The tests cover:
+
+- Configuration and legacy library normalization
+- URL and MIME handling
+- Storage migration, corruption, and availability cache compatibility
+- WebVTT parsing
+- Source selection and fallback order
+- blocked playback and codec rejection
+- stale play Promise rejection after a newer source selection
+- seeking before metadata
+- duplicate HTML IDs and label associations
+- CSS custom-property references
+- production dependency and lazy-preload checks
+
+## Manual device matrix
+
+Automated tests do not prove operating-system media behavior. Before a production release, test with real audio files on:
+
+- iPhone Safari: first Play, source changes, lock screen, background/foreground, interruptions, and volume-control visibility
+- iPad Safari: the same flows in portrait, landscape, split view, and with a hardware keyboard
+- Android Chrome, Firefox, and Samsung Internet: touch ranges, app switching, screen lock, network loss, and Media Session controls
+- macOS Safari, Chrome, Firefox, and Edge: keyboard controls, codec fallback, storage reload, dialogs, zoom, and offline recovery
+
+Also test 320, 360, 390, and 430 CSS pixel widths, tablet layouts, 200% zoom, long translated titles, reduced motion, and high-contrast/forced-colors modes.
