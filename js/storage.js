@@ -1,4 +1,5 @@
 const SCHEMA_VERSION = 2;
+const MAX_CHAPTER_CACHE_LENGTH = 512 * 1024;
 export const STORAGE_KEYS = {
   ui: "compactPlayer:ui",
   lastEpisode: "compactPlayer:lastEpisode",
@@ -12,6 +13,10 @@ function objectOrEmpty(value) {
 function safeNumber(value, fallback, min, max) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
+}
+
+function chapterCacheKey(episodeId, language, cacheVersion) {
+  return `compactPlayer:chapters:${encodeURIComponent(String(episodeId))}:${encodeURIComponent(String(language))}:${encodeURIComponent(String(cacheVersion))}`;
 }
 
 export class PlayerStorage {
@@ -73,6 +78,27 @@ export class PlayerStorage {
   setLastEpisode(id) { try { this.storage?.setItem(STORAGE_KEYS.lastEpisode, String(id)); } catch {} }
   hasSeenOnboarding() { try { return this.storage?.getItem(STORAGE_KEYS.onboarding) === "1"; } catch { return false; } }
   markOnboardingSeen() { try { this.storage?.setItem(STORAGE_KEYS.onboarding, "1"); } catch {} }
+
+  readChapters(episodeId, language, cacheVersion, url) {
+    const raw = this.readJson(chapterCacheKey(episodeId, language, cacheVersion));
+    const text = typeof raw.text === "string" ? raw.text : "";
+    if (raw.url !== String(url || "") || !text || text.length > MAX_CHAPTER_CACHE_LENGTH) return "";
+    return text;
+  }
+
+  writeChapters(episodeId, language, cacheVersion, url, text) {
+    const value = String(text || "");
+    if (!value || value.length > MAX_CHAPTER_CACHE_LENGTH) return false;
+    const key = chapterCacheKey(episodeId, language, cacheVersion);
+    const prefix = `compactPlayer:chapters:${encodeURIComponent(String(episodeId))}:${encodeURIComponent(String(language))}:`;
+    try {
+      for (let index = this.storage.length - 1; index >= 0; index -= 1) {
+        const storedKey = this.storage.key(index);
+        if (storedKey?.startsWith(prefix) && storedKey !== key) this.storage.removeItem(storedKey);
+      }
+    } catch {}
+    return this.writeJson(key, { schemaVersion: SCHEMA_VERSION, timestamp: Date.now(), url: String(url || ""), text: value });
+  }
 
   readAvailability(episodeId, cacheVersion, ttlMs = 7 * 86400000) {
     const key = `compactPlayer:availability:${episodeId}:${cacheVersion}`;

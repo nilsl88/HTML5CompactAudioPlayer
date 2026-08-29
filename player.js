@@ -1,12 +1,12 @@
-import { UI_STRINGS } from "./i18n.js";
+import { UI_STRINGS } from "./i18n.js?v=3";
 import { scanSources } from "./js/availability.js";
+import { loadChapterFile, parseChapterText } from "./js/chapters.js";
 import { localizedValue, normalizeEpisode, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./js/dialogs.js";
 import { MediaController } from "./js/media-controller.js";
 import { buildSources, chooseDefaultSource, visibleSources } from "./js/source-selection.js";
 import { PlayerStorage } from "./js/storage.js";
 import { clearChildren, clamp, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
-import { parseWebVtt } from "./js/vtt.js";
 
 const els = Object.fromEntries([
   "player", "episodeTitle", "episodeMeta", "playPauseBtn", "playPauseIcon", "seek", "seekLabel", "timeCur", "timeDur",
@@ -33,6 +33,7 @@ const documentBaseUrl = new URL(".", location.href).href;
 const uiLanguageNames = { en: "English", da: "Dansk", nb: "Norsk (bokmål)", sv: "Svenska" };
 const sleepDurations = [5, 10, 15, 30, 45, 60, 90, 120];
 const STALL_NOTICE_DELAY_MS = 2000;
+const AVAILABILITY_IDLE_DELAY_MS = 1500;
 
 let uiPrefs = storage.readUi();
 let locale = resolveUiLocale(uiPrefs.uiLanguage);
@@ -49,8 +50,14 @@ let chapterUrl = "";
 let chaptersLoaded = false;
 let chaptersFailed = false;
 let chapterController = null;
+let chapterLoadPromise = null;
+let chapterLoadShouldNotify = false;
 let episodeController = null;
 let probeController = null;
+let probeLanguageCode = "";
+let probeScheduleHandle = null;
+let probeScheduleUsesIdleCallback = false;
+let scannedAvailabilityLanguages = new Set();
 let episodeGeneration = 0;
 let chapterGeneration = 0;
 let durationUnlocked = false;
@@ -151,7 +158,8 @@ function sourceLabel(source, includeDetails = true) {
 function updateMeta() {
   const language = episode?.languages?.[languageCode];
   const source = currentSource || sourcesByLanguage.get(languageCode)?.find((item) => item.id === selectedSourceId);
-  setMeta([language?.label || languageCode, sourceLabel(source, false)].filter(Boolean).join(" • "));
+  const chapterTitle = cues[activeCueIndex]?.title || "";
+  setMeta([language?.label || languageCode, sourceLabel(source, false), chapterTitle].filter(Boolean).join(" • "));
 }
 
 function guessLanguage(codes, fallback) {
@@ -251,15 +259,35 @@ function persistAvailability() {
   storage.writeAvailability(episode.id, episode.cacheVersion, byLanguage);
 }
 
-function startAvailabilityScan(generation, code = languageCode) {
+function cancelScheduledAvailabilityScan() {
+  if (probeScheduleHandle === null) return;
+  if (probeScheduleUsesIdleCallback && typeof globalThis.cancelIdleCallback === "function") globalThis.cancelIdleCallback(probeScheduleHandle);
+  else clearTimeout(probeScheduleHandle);
+  probeScheduleHandle = null;
+  probeScheduleUsesIdleCallback = false;
+}
+
+function cancelAvailabilityWork() {
+  cancelScheduledAvailabilityScan();
   probeController?.abort();
-  probeController = new AbortController();
+  probeController = null;
+  probeLanguageCode = "";
+}
+
+function startAvailabilityScan(generation, code = languageCode) {
+  cancelScheduledAvailabilityScan();
+  if (generation !== episodeGeneration || code !== languageCode || navigator.onLine === false || scannedAvailabilityLanguages.has(code)) return;
+  if (probeController && probeLanguageCode === code && !probeController.signal.aborted) return;
+  probeController?.abort();
+  const controller = new AbortController();
+  probeController = controller;
+  probeLanguageCode = code;
   void (async () => {
-    if (generation !== episodeGeneration || probeController.signal.aborted) return;
+    if (generation !== episodeGeneration || controller.signal.aborted) return;
     const sources = sourcesByLanguage.get(code) || [];
     try {
       await scanSources(sources, {
-        signal: probeController.signal,
+        signal: controller.signal,
         concurrency: 3,
         onResult: () => {
           if (generation !== episodeGeneration) return;
@@ -267,10 +295,37 @@ function startAvailabilityScan(generation, code = languageCode) {
           if (code === languageCode) populateQualitySelect(currentSource);
         },
       });
+      if (generation === episodeGeneration && !controller.signal.aborted) scannedAvailabilityLanguages.add(code);
     } catch (error) {
       if (error?.name !== "AbortError") reportError("availability scan", error);
+    } finally {
+      if (probeController === controller) {
+        probeController = null;
+        probeLanguageCode = "";
+      }
     }
   })();
+}
+
+function scheduleAvailabilityScan(generation, code = languageCode, immediate = false) {
+  cancelScheduledAvailabilityScan();
+  if (generation !== episodeGeneration || code !== languageCode || scannedAvailabilityLanguages.has(code)) return;
+  const run = () => {
+    probeScheduleHandle = null;
+    probeScheduleUsesIdleCallback = false;
+    startAvailabilityScan(generation, code);
+  };
+  if (immediate) { run(); return; }
+  if (typeof globalThis.requestIdleCallback === "function") {
+    probeScheduleUsesIdleCallback = true;
+    probeScheduleHandle = globalThis.requestIdleCallback(run, { timeout: 3000 });
+  } else probeScheduleHandle = setTimeout(run, AVAILABILITY_IDLE_DELAY_MS);
+}
+
+function requestAvailabilityScan(generation, code = languageCode, immediate = false) {
+  const start = () => scheduleAvailabilityScan(generation, code, immediate);
+  if (chapterLoadPromise) void chapterLoadPromise.then(start, start);
+  else start();
 }
 
 async function loadLibrary(signal) {
@@ -292,7 +347,12 @@ async function loadEpisode(id) {
   cancelSleep(true);
   episodeController?.abort();
   chapterController?.abort();
-  probeController?.abort();
+  chapterController = null;
+  chapterLoadPromise = null;
+  chapterLoadShouldNotify = false;
+  chapterGeneration += 1;
+  els.chaptersList.setAttribute("aria-busy", "false");
+  cancelAvailabilityWork();
   if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
   els.chaptersTrack.removeAttribute("src");
   episodeController = new AbortController();
@@ -332,6 +392,9 @@ async function loadEpisode(id) {
     activeCueIndex = -1;
     chaptersLoaded = false;
     chaptersFailed = false;
+    chapterLoadPromise = null;
+    chapterLoadShouldNotify = false;
+    scannedAvailabilityLanguages = new Set();
     chapterUrl = resolveLanguageAsset(episode.languages[languageCode], episode.languages[languageCode].chapters);
     media.setSelection(languageSources, selected.id, storage.getProgress(episodeId, languageCode), false);
     media.setPlaybackRate(uiPrefs.playbackRate);
@@ -341,11 +404,12 @@ async function loadEpisode(id) {
     populateQualitySelect();
     updateTitle();
     updateMeta();
+    const chaptersReady = ensureChapters({ notifyFailure: false, showLoading: false });
     applyCover();
     updateChapterButtons();
     storage.setLastEpisode(id);
     setEpisodeUrl(id);
-    startAvailabilityScan(generation);
+    void chaptersReady.finally(() => requestAvailabilityScan(generation, languageCode));
   } finally {
     if (generation === episodeGeneration) { setLoading(false); setBusy(false); }
   }
@@ -357,7 +421,11 @@ function setEpisodeUrl(id) {
 
 function resetChapters() {
   chapterController?.abort();
+  chapterController = null;
+  chapterLoadPromise = null;
+  chapterLoadShouldNotify = false;
   chapterGeneration += 1;
+  els.chaptersList.setAttribute("aria-busy", "false");
   cues = [];
   activeCueIndex = -1;
   chaptersLoaded = false;
@@ -371,41 +439,87 @@ function resetChapters() {
   updateChapterButtons();
 }
 
-async function ensureChapters() {
-  if (chaptersLoaded) return cues;
-  if (!chapterUrl) { chaptersLoaded = true; renderChapters(); return cues; }
-  chapterController?.abort();
-  chapterController = new AbortController();
-  const generation = ++chapterGeneration;
-  renderPanelMessage(t("loadingChapters"));
+function applyChapterData(text, loaded) {
   try {
-    const response = await fetchWithRetry(chapterUrl, { cache: "no-store", credentials: "same-origin", signal: chapterController.signal });
-    if (!response.ok) throw new Error(`Chapter request failed with HTTP ${response.status}.`);
-    const chapterText = await response.text();
-    const loaded = parseWebVtt(chapterText);
-    if (generation !== chapterGeneration) return cues;
-    try {
-      if (trackObjectUrl) URL.revokeObjectURL(trackObjectUrl);
-      trackObjectUrl = URL.createObjectURL(new Blob([chapterText], { type: "text/vtt" }));
-      els.chaptersTrack.src = trackObjectUrl;
-      els.chaptersTrack.track.mode = "hidden";
-    } catch (error) {
-      reportError("native chapter track", error);
-    }
-    cues = loaded;
-    chaptersLoaded = true;
-    chaptersFailed = false;
+    if (trackObjectUrl) URL.revokeObjectURL(trackObjectUrl);
+    trackObjectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+    els.chaptersTrack.src = trackObjectUrl;
+    els.chaptersTrack.track.mode = "hidden";
   } catch (error) {
-    if (error?.name === "AbortError") return cues;
-    chaptersLoaded = true;
-    chaptersFailed = true;
-    reportError("chapter load", error);
-    showToast(t("chaptersLoadFailed"), "warning", 5000);
+    reportError("native chapter track", error);
   }
+  cues = loaded;
+  chaptersLoaded = true;
+  chaptersFailed = false;
   renderChapters();
   updateChapterButtons();
   markActiveChapter(media.position());
-  return cues;
+}
+
+function ensureChapters({ force = false, notifyFailure = true, showLoading = !els.chaptersPanel.hidden } = {}) {
+  if (chaptersLoaded && !chaptersFailed) return Promise.resolve(cues);
+  if (!chapterUrl) { chaptersLoaded = true; chaptersFailed = false; renderChapters(); return Promise.resolve(cues); }
+  if (chaptersFailed && !force) {
+    if (showLoading) renderChapterFailure();
+    return Promise.resolve(cues);
+  }
+  chapterLoadShouldNotify ||= notifyFailure;
+  if (chapterLoadPromise && !force) {
+    if (showLoading) renderPanelMessage(t("loadingChapters"));
+    return chapterLoadPromise;
+  }
+  if (!force) {
+    const cachedText = storage.readChapters(episode.id, languageCode, episode.cacheVersion, chapterUrl);
+    if (cachedText) {
+      const cached = parseChapterText(cachedText);
+      applyChapterData(cached.text, cached.cues);
+      return Promise.resolve(cues);
+    }
+  }
+  if (force) chapterController?.abort();
+  cancelAvailabilityWork();
+  const controller = new AbortController();
+  chapterController = controller;
+  const generation = ++chapterGeneration;
+  const requestUrl = chapterUrl;
+  chapterLoadShouldNotify = notifyFailure;
+  els.chaptersList.setAttribute("aria-busy", "true");
+  if (showLoading) renderPanelMessage(t("loadingChapters"));
+  const promise = (async () => {
+    try {
+      const { text, cues: loaded } = await loadChapterFile(requestUrl, { signal: controller.signal });
+      if (generation !== chapterGeneration || requestUrl !== chapterUrl) return cues;
+      storage.writeChapters(episode.id, languageCode, episode.cacheVersion, requestUrl, text);
+      applyChapterData(text, loaded);
+    } catch (error) {
+      if (error?.name === "AbortError" || generation !== chapterGeneration) return cues;
+      chaptersLoaded = false;
+      chaptersFailed = true;
+      reportError("chapter load", error);
+      if (chapterLoadShouldNotify) showToast(t("chaptersLoadFailed"), "warning", 5000);
+    } finally {
+      if (generation === chapterGeneration) {
+        chapterController = null;
+        chapterLoadShouldNotify = false;
+        els.chaptersList.setAttribute("aria-busy", "false");
+      }
+    }
+    if (generation === chapterGeneration) {
+      if (chaptersFailed) renderChapterFailure();
+      else if (!chaptersLoaded) renderChapters();
+      if (!chaptersLoaded) {
+        updateChapterButtons();
+        markActiveChapter(media.position());
+      }
+    }
+    return cues;
+  })();
+  chapterLoadPromise = promise;
+  void promise.then(
+    () => { if (chapterLoadPromise === promise) chapterLoadPromise = null; },
+    () => { if (chapterLoadPromise === promise) chapterLoadPromise = null; },
+  );
+  return promise;
 }
 
 function renderPanelMessage(message) {
@@ -414,6 +528,30 @@ function renderPanelMessage(message) {
   item.className = "empty-state";
   item.textContent = message;
   els.chaptersList.appendChild(item);
+}
+
+function renderChapterFailure() {
+  clearChildren(els.chaptersList);
+  const container = document.createElement("div");
+  container.className = "chapter-load-error";
+  const message = document.createElement("p");
+  message.className = "empty-state";
+  message.textContent = t("chaptersLoadFailed");
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "text-button chapter-retry-button";
+  retry.textContent = t("retryChapters");
+  retry.addEventListener("click", async () => {
+    retry.disabled = true;
+    retry.textContent = t("loadingChapters");
+    await ensureChapters({ force: true, notifyFailure: true, showLoading: false });
+    requestAvailabilityScan(episodeGeneration, languageCode);
+    if (els.chaptersPanel.hidden) return;
+    const focusTarget = chaptersFailed ? els.chaptersList.querySelector(".chapter-retry-button") : els.chaptersList.querySelector(".chapter-button");
+    focusTarget?.focus();
+  });
+  container.append(message, retry);
+  els.chaptersList.appendChild(container);
 }
 
 function renderChapters() {
@@ -455,12 +593,13 @@ function markActiveChapter(position) {
   if (index === activeCueIndex) return;
   activeCueIndex = index;
   mediaMetadataChapter = cues[index]?.title || "";
+  updateMeta();
   updateMediaSessionMetadata();
   for (const button of els.chaptersList.querySelectorAll(".chapter-button")) button.setAttribute("aria-current", String(Number(button.dataset.index) === index));
 }
 
 function updateChapterButtons() {
-  const disabled = !chapterUrl || (chaptersLoaded && (!cues.length || chaptersFailed));
+  const disabled = !chapterUrl || chaptersFailed || (chaptersLoaded && !cues.length);
   els.prevChapterBtn.disabled = disabled;
   els.nextChapterBtn.disabled = disabled;
 }
@@ -658,7 +797,14 @@ function applyStrings() {
   applySkipInterval(uiPrefs.skipSeconds);
   renderSleepOptions();
   renderResetBody();
-  if (episode) { populateLibrarySelect(); populateQualitySelect(currentSource); updateMeta(); }
+  if (episode) {
+    populateLibrarySelect();
+    populateQualitySelect(currentSource);
+    updateMeta();
+    if (chaptersFailed) renderChapterFailure();
+    else if (chapterLoadPromise && !els.chaptersPanel.hidden) renderPanelMessage(t("loadingChapters"));
+    else if (chaptersLoaded) renderChapters();
+  }
   updatePlaybackUi(media.state);
 }
 
@@ -822,6 +968,7 @@ async function changeLanguage(nextCode) {
   const position = media.position();
   saveProgress(true);
   cancelSleep(true);
+  cancelAvailabilityWork();
   languageCode = nextCode;
   const all = sourcesByLanguage.get(languageCode);
   let selected = all.find((source) => source.id === selectedSourceId && source.availability !== "missing") || chooseDefaultSource(all);
@@ -838,7 +985,7 @@ async function changeLanguage(nextCode) {
   storage.setProgress(episodeId, languageCode, position);
   storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: selected.id });
   await media.setSelection(all, selected.id, position, shouldPlay);
-  startAvailabilityScan(episodeGeneration, languageCode);
+  void ensureChapters({ notifyFailure: false, showLoading: false }).finally(() => requestAvailabilityScan(episodeGeneration, languageCode));
 }
 
 async function changeQuality(nextId) {
@@ -916,7 +1063,9 @@ els.sleepBtn.addEventListener("click", () => {
 });
 els.optionsBtn.addEventListener("click", () => {
   if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
-  closeAllPanels(els.optionsPanel); openPanel(els.optionsPanel, els.optionsBtn, els.episodeRow.hidden ? els.langSelect : els.episodeSelect);
+  closeAllPanels(els.optionsPanel);
+  openPanel(els.optionsPanel, els.optionsBtn, els.episodeRow.hidden ? els.langSelect : els.episodeSelect);
+  requestAvailabilityScan(episodeGeneration, languageCode, true);
 });
 els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
 els.closeSleepBtn.addEventListener("click", () => closePanel(els.sleepPanel, els.sleepBtn, true));
@@ -984,15 +1133,21 @@ document.addEventListener("keydown", (event) => {
   }
   else if (event.code === "ArrowLeft") { event.preventDefault(); media.seek(media.position() - 5); }
   else if (event.code === "ArrowRight") { event.preventDefault(); media.seek(media.position() + 5); }
+  else if (event.code === "ArrowUp") { event.preventDefault(); media.seek(media.position() + uiPrefs.skipSeconds); }
+  else if (event.code === "ArrowDown") { event.preventDefault(); media.seek(media.position() - uiPrefs.skipSeconds); }
 });
 window.addEventListener("pagehide", () => saveProgress(true), { capture: true });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveProgress(true); });
 window.addEventListener("offline", () => {
+  cancelAvailabilityWork();
   offlinePlaybackIntent = media.playbackIntent;
   showToast(t("connectionLost"), "warning", 7000, "offline");
 });
 window.addEventListener("online", () => {
   showToast(t("connectionRestored"), "success", 4000, "online");
+  if (chaptersFailed && chapterUrl) void ensureChapters({ force: true, notifyFailure: false, showLoading: !els.chaptersPanel.hidden });
+  scannedAvailabilityLanguages.delete(languageCode);
+  requestAvailabilityScan(episodeGeneration, languageCode);
   if (offlinePlaybackIntent) { offlinePlaybackIntent = false; void media.requestPlay(); }
 });
 
