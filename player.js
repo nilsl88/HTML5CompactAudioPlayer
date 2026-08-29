@@ -1,9 +1,10 @@
-import { UI_STRINGS } from "./i18n.js?v=3";
+import { UI_STRINGS } from "./i18n.js?v=4";
 import { scanSources } from "./js/availability.js";
 import { loadChapterFile, parseChapterText } from "./js/chapters.js";
 import { localizedValue, normalizeEpisode, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./js/dialogs.js";
 import { MediaController } from "./js/media-controller.js";
+import { OfflineDownloadError, OfflineManager, manifestMatchesSelection } from "./js/offline.js";
 import { buildSources, chooseDefaultSource, visibleSources } from "./js/source-selection.js";
 import { PlayerStorage } from "./js/storage.js";
 import { clearChildren, clamp, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
@@ -13,7 +14,8 @@ const els = Object.fromEntries([
   "coverButton", "coverImg", "chaptersBtn", "prevChapterBtn", "skipBackBtn", "skipForwardBtn", "nextChapterBtn",
   "sleepBtn", "optionsBtn", "chaptersPanel", "chaptersTitle", "closeChaptersBtn", "chaptersList", "sleepPanel",
   "sleepTitle", "closeSleepBtn", "sleepList", "optionsPanel", "audioSettingsLegend", "appearanceLegend", "episodeRow",
-  "episodeSelect", "langSelect", "qualitySelect", "volumeRow", "volumeRange", "volumeValue", "speedRange", "speedValue",
+  "episodeSelect", "langSelect", "qualitySelect", "offlineRow", "offlineLabel", "offlineStatus", "offlineProgress",
+  "offlineDownloadBtn", "offlineCancelBtn", "offlineRemoveBtn", "volumeRow", "volumeRange", "volumeValue", "speedRange", "speedValue",
   "skipSelect", "themeSelect", "fontSizeSelect", "uiLangSelect", "resetBtn", "audio", "chaptersTrack", "toastHost",
   "statusAnnouncer", "coverDialog", "coverDialogTitle", "closeCoverBtn", "coverDialogImg", "onboardingDialog",
   "onboardingTitle", "onboardingBody", "onboardingCloseX", "onboardingOk", "resetDialog", "resetTitle", "resetBody",
@@ -30,6 +32,7 @@ if (!els.chaptersTrack) {
 
 const storage = new PlayerStorage(globalThis.localStorage);
 const documentBaseUrl = new URL(".", location.href).href;
+const libraryUrl = new URL("media/library.json", documentBaseUrl).href;
 const uiLanguageNames = { en: "English", da: "Dansk", nb: "Norsk (bokmål)", sv: "Svenska" };
 const sleepDurations = [5, 10, 15, 30, 45, 60, 90, 120];
 const STALL_NOTICE_DELAY_MS = 2000;
@@ -40,6 +43,7 @@ let locale = resolveUiLocale(uiPrefs.uiLanguage);
 let library = normalizeLibrary(null);
 let episode = null;
 let episodeId = "";
+let episodeConfigUrl = "";
 let languageCode = "";
 let sourcesByLanguage = new Map();
 let selectedSourceId = "";
@@ -62,6 +66,7 @@ let episodeGeneration = 0;
 let chapterGeneration = 0;
 let durationUnlocked = false;
 let seekDragging = false;
+let uiBusy = false;
 let progressTimer = null;
 let lastProgressWrite = 0;
 let mediaMetadataTitle = "";
@@ -76,6 +81,17 @@ let onboardingUiSelect = null;
 let onboardingAudioSelect = null;
 const toastTimes = new Map();
 const errorTimes = new Map();
+let focusOfflineCancel = false;
+const offline = new OfflineManager({
+  baseUrl: documentBaseUrl,
+  onChange: (snapshot) => {
+    renderOfflineUi();
+    if (focusOfflineCancel && snapshot.phase === "downloading") {
+      focusOfflineCancel = false;
+      requestAnimationFrame(() => els.offlineCancelBtn.focus());
+    }
+  },
+});
 
 function resolveUiLocale(preference) {
   if (preference !== "auto") {
@@ -134,8 +150,16 @@ function setLoading(loading) {
 }
 
 function setBusy(busy) {
+  uiBusy = busy;
   els.player.classList.toggle("is-busy", busy);
-  for (const element of [els.episodeSelect, els.langSelect, els.qualitySelect]) element.disabled = busy;
+  updateSelectionControlState();
+}
+
+function updateSelectionControlState() {
+  const offlineLocked = navigator.onLine === false;
+  els.episodeSelect.disabled = uiBusy || offlineLocked;
+  els.langSelect.disabled = uiBusy || offlineLocked;
+  els.qualitySelect.disabled = uiBusy || offlineLocked || (episode ? qualityOptionsForCurrentLanguage().length <= 1 : true);
 }
 
 function setMeta(message, error = false) {
@@ -153,6 +177,184 @@ function sourceLabel(source, includeDetails = true) {
   if (source.codec === "mp3") quality = source.bitrate >= 128 ? t("qLegacyFair") : source.bitrate >= 96 ? t("qLegacyLow") : t("qLegacyUltraLow");
   else quality = source.bitrate >= 256 ? t("qPremium") : source.bitrate >= 128 ? t("qHigh") : source.bitrate >= 96 ? t("qLow") : t("qUltraLow");
   return includeDetails ? `${quality} · ${source.bitrate} kb/s · ${source.codec.toUpperCase()}` : quality;
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: unit > 1 ? 1 : 0 }).format(amount)} ${units[unit]}`;
+}
+
+function currentOfflineSelection() {
+  if (!episode || !episodeConfigUrl) return null;
+  const language = episode.languages[languageCode];
+  const source = currentSource || sourcesByLanguage.get(languageCode)?.find((item) => item.id === selectedSourceId);
+  if (!language || !source?.url) return null;
+  return {
+    episodeId,
+    episodeTitle: displayTitle(),
+    languageCode,
+    languageLabel: language.label || languageCode,
+    sourceId: source.id,
+    sourceLabel: sourceLabel(source, true),
+    sourceUrl: source.url,
+    mime: source.mime,
+    cacheVersion: episode.cacheVersion,
+    assets: [
+      { url: libraryUrl, required: false },
+      { url: episodeConfigUrl, required: true },
+      { url: resolveCover(episode), required: false },
+      { url: chapterUrl, required: false },
+    ].filter((asset) => {
+      try { return asset.url && new URL(asset.url).origin === new URL(documentBaseUrl).origin; }
+      catch { return false; }
+    }),
+  };
+}
+
+function selectionFromManifest(manifest) {
+  if (!manifest) return null;
+  return {
+    episodeId: manifest.episodeId,
+    episodeTitle: manifest.episodeTitle,
+    languageCode: manifest.languageCode,
+    languageLabel: manifest.languageLabel,
+    sourceId: manifest.sourceId,
+    sourceLabel: manifest.sourceLabel,
+    sourceUrl: manifest.sourceUrl,
+    mime: manifest.mime,
+    cacheVersion: manifest.cacheVersion,
+    assets: manifest.assets || [],
+  };
+}
+
+function playbackSources(all, selected) {
+  if (navigator.onLine !== false) return all;
+  const cached = offline.active;
+  if (cached?.episodeId === episodeId && cached.languageCode === languageCode && cached.sourceId === selected?.id && cached.sourceUrl === selected?.url) return [selected];
+  return selected ? [selected] : [];
+}
+
+function manifestDescription(manifest) {
+  return t("offlineSavedOther", {
+    book: manifest.episodeTitle || manifest.episodeId,
+    language: manifest.languageLabel || manifest.languageCode,
+    quality: manifest.sourceLabel || manifest.sourceId,
+    size: formatBytes(manifest.totalSize),
+  });
+}
+
+function renderOfflineUi() {
+  if (!els.offlineRow) return;
+  updateSelectionControlState();
+  els.offlineRow.hidden = !offline.supported;
+  if (!offline.supported) return;
+  setText(els.offlineLabel, t("offlineLabel"));
+  const selection = currentOfflineSelection();
+  const activeMatches = selection && manifestMatchesSelection(offline.active, selection);
+  const busy = offline.phase === "preparing" || offline.phase === "downloading";
+  const percent = Math.round(offline.progress * 100);
+  let status = "";
+  let action = t("offlineDownload");
+  let showDownload = true;
+  let showCancel = false;
+  let showRemove = Boolean(offline.active) && !busy;
+
+  els.offlineProgress.hidden = true;
+  if (offline.phase === "preparing") {
+    status = t("offlinePreparing");
+    showDownload = false;
+  } else if (offline.phase === "downloading" && offline.staging) {
+    status = t("offlineDownloading", { percent, size: formatBytes(offline.progress * offline.staging.totalSize), total: formatBytes(offline.staging.totalSize) });
+    els.offlineProgress.hidden = false;
+    showDownload = false;
+    showCancel = true;
+  } else if (offline.staging) {
+    status = `${manifestDescription(offline.staging)} · ${t("offlinePaused", { percent })}`;
+    action = t("offlineResume");
+    showCancel = true;
+    els.offlineProgress.hidden = false;
+  } else if (activeMatches) {
+    status = t("offlineReady", { size: formatBytes(offline.active.totalSize) });
+    showDownload = false;
+  } else if (offline.active) {
+    status = manifestDescription(offline.active);
+    action = t("offlineReplace");
+  }
+
+  els.offlineProgress.value = percent;
+  setText(els.offlineStatus, status);
+  setText(els.offlineDownloadBtn, action);
+  setText(els.offlineCancelBtn, t("offlineCancel"));
+  setText(els.offlineRemoveBtn, t("offlineRemove"));
+  els.offlineDownloadBtn.hidden = !showDownload;
+  els.offlineDownloadBtn.disabled = busy || (!selection && !offline.staging) || navigator.onLine === false;
+  els.offlineCancelBtn.hidden = !showCancel;
+  els.offlineRemoveBtn.hidden = !showRemove;
+}
+
+function offlineErrorMessage(error) {
+  if (error?.code === "offline") return t("offlineConnect");
+  if (["unsupported", "cross-origin"].includes(error?.code)) return t("offlineUnsupported");
+  if (error?.code === "range") return t("offlineRangeUnsupported");
+  if (error?.code === "quota") return t("offlineStorageFull");
+  if (["changed", "incomplete"].includes(error?.code)) return t("offlineFileChanged");
+  return t("offlineDownloadFailed");
+}
+
+async function waitForPlaybackPriority(signal) {
+  while (["loading", "stalled"].includes(media.state)) {
+    if (signal.aborted) throw new DOMException("Download canceled", "AbortError");
+    await new Promise((resolve, reject) => {
+      const finish = () => { signal.removeEventListener("abort", abort); resolve(); };
+      const timer = setTimeout(finish, 500);
+      const abort = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); reject(new DOMException("Download canceled", "AbortError")); };
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+}
+
+async function downloadOfflineSelection() {
+  const selection = offline.staging ? selectionFromManifest(offline.staging) : currentOfflineSelection();
+  if (!selection) return;
+  offline.setPhase("preparing", offline.progress);
+  try {
+    const preflight = await offline.inspectSource(selection);
+    const replacing = offline.active && !manifestMatchesSelection(offline.active, selection);
+    if (!preflight.canResume) {
+      if (replacing && !confirm(t("offlineReplaceConfirm", { book: offline.active.episodeTitle || offline.active.episodeId }))) {
+        offline.setPhase(offline.staging ? "paused" : "idle", offline.progress);
+        return;
+      }
+      if (!confirm(t("offlineConfirm", {
+        book: selection.episodeTitle,
+        language: selection.languageLabel,
+        quality: selection.sourceLabel,
+        size: formatBytes(preflight.totalSize),
+      }))) {
+        offline.setPhase(offline.staging ? "paused" : "idle", offline.progress);
+        return;
+      }
+    }
+    if (preflight.availableBytes != null && preflight.availableBytes < preflight.requiredBytes) {
+      if (!offline.active || !confirm(t("offlineRemoveForSpace", { book: offline.active.episodeTitle || offline.active.episodeId }))) {
+        throw new OfflineDownloadError("quota", "Insufficient browser storage");
+      }
+      await offline.removeActive();
+    }
+    const persisted = await offline.requestPersistence();
+    focusOfflineCancel = true;
+    await offline.start(selection, preflight, { waitForPriority: waitForPlaybackPriority });
+    showToast(t("offlineComplete"), "success", 6000, "offline-complete");
+    if (persisted === false) showToast(t("offlinePersistenceWarning"), "warning", 7000, "offline-persistence");
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    if (offline.phase === "preparing") offline.setPhase(offline.staging ? "paused" : "idle", offline.progress);
+    reportError("offline download", error, offlineErrorMessage(error));
+  } finally { focusOfflineCancel = false; renderOfflineUi(); }
 }
 
 function updateMeta() {
@@ -201,7 +403,7 @@ function qualityOptionsForCurrentLanguage(forceSource = null) {
 function populateQualitySelect(forceSource = null) {
   const visible = qualityOptionsForCurrentLanguage(forceSource);
   optionsFrom(els.qualitySelect, visible.map((source) => ({ ...source, value: source.id })), forceSource?.id || selectedSourceId, (source) => episode.debug.showAllQualities ? sourceLabel(source, true) : sourceLabel(source, false));
-  els.qualitySelect.disabled = visible.length <= 1;
+  els.qualitySelect.disabled = uiBusy || navigator.onLine === false || visible.length <= 1;
 }
 
 function updateTitle() {
@@ -329,9 +531,8 @@ function requestAvailabilityScan(generation, code = languageCode, immediate = fa
 }
 
 async function loadLibrary(signal) {
-  const url = new URL("media/library.json", documentBaseUrl).href;
   try {
-    const response = await fetchWithRetry(url, { cache: "no-store", credentials: "same-origin", signal });
+    const response = await fetchWithRetry(libraryUrl, { cache: "no-store", credentials: "same-origin", signal });
     if (!response.ok) return normalizeLibrary(null);
     return normalizeLibrary(parseJson(await response.text(), "media/library.json"));
   } catch (error) {
@@ -360,6 +561,7 @@ async function loadEpisode(id) {
   setLoading(true);
   setBusy(true);
   clearCover();
+  episodeConfigUrl = "";
   setText(els.episodeTitle, t("audio"));
   setMeta(t("loading"));
 
@@ -376,14 +578,22 @@ async function loadEpisode(id) {
 
     episode = loadedEpisode;
     episodeId = id;
+    episodeConfigUrl = configUrl;
     sourcesByLanguage = new Map(Object.values(episode.languages).map((language) => [language.code, buildSources(language, els.audio)]));
     if (new URL(location.href).searchParams.get("clearAvailCache") === "1") storage.clearAvailability(episode.id, episode.cacheVersion);
     applyCachedAvailability();
     const prefs = storage.readEpisode(episodeId);
     const codes = Object.keys(episode.languages);
-    languageCode = codes.includes(prefs.language) ? prefs.language : guessLanguage(codes, episode.defaultLanguage);
+    const downloaded = navigator.onLine === false && offline.active?.episodeId === id
+      && String(offline.active.cacheVersion) === String(episode.cacheVersion) ? offline.active : null;
+    languageCode = downloaded && codes.includes(downloaded.languageCode)
+      ? downloaded.languageCode
+      : codes.includes(prefs.language) ? prefs.language : guessLanguage(codes, episode.defaultLanguage);
     const languageSources = sourcesByLanguage.get(languageCode);
-    let selected = languageSources.find((source) => source.id === prefs.quality && source.availability !== "missing") || chooseDefaultSource(languageSources);
+    let selected = downloaded
+      ? languageSources.find((source) => source.id === downloaded.sourceId && source.url === downloaded.sourceUrl)
+      : null;
+    if (!selected) selected = languageSources.find((source) => source.id === prefs.quality && source.availability !== "missing") || chooseDefaultSource(languageSources);
     if (!selected) throw new Error("No configured audio source can be selected for this browser.");
     selectedSourceId = selected.id;
     currentSource = selected;
@@ -396,7 +606,7 @@ async function loadEpisode(id) {
     chapterLoadShouldNotify = false;
     scannedAvailabilityLanguages = new Set();
     chapterUrl = resolveLanguageAsset(episode.languages[languageCode], episode.languages[languageCode].chapters);
-    media.setSelection(languageSources, selected.id, storage.getProgress(episodeId, languageCode), false);
+    media.setSelection(playbackSources(languageSources, selected), selected.id, storage.getProgress(episodeId, languageCode), false);
     media.setPlaybackRate(uiPrefs.playbackRate);
     media.setVolume(uiPrefs.volume);
     populateLibrarySelect();
@@ -409,9 +619,10 @@ async function loadEpisode(id) {
     updateChapterButtons();
     storage.setLastEpisode(id);
     setEpisodeUrl(id);
+    renderOfflineUi();
     void chaptersReady.finally(() => requestAvailabilityScan(generation, languageCode));
   } finally {
-    if (generation === episodeGeneration) { setLoading(false); setBusy(false); }
+    if (generation === episodeGeneration) { setLoading(false); setBusy(false); renderOfflineUi(); }
   }
 }
 
@@ -663,6 +874,7 @@ const media = new MediaController(els.audio, {
     selectedSourceId = source.id;
     populateQualitySelect(source);
     updateMeta();
+    renderOfflineUi();
   },
   onSourceSuccess: (source) => {
     if (!source) return;
@@ -676,6 +888,10 @@ const media = new MediaController(els.audio, {
     showToast(t("audioFallbackCompatible"), "warning", 5000, `fallback:${next.id}`);
   },
   onBlocked: () => showToast(t("playBlocked"), "warning", 7000, "play-blocked"),
+  onOffline: () => {
+    const selection = currentOfflineSelection();
+    if (!selection || !manifestMatchesSelection(offline.active, selection)) showToast(t("offlineWaiting"), "warning", 7000, "offline-waiting");
+  },
   onExhausted: (error) => {
     setMeta(t("sourceExhausted"), true);
     reportError("all audio sources failed", error, t("sourceExhausted"));
@@ -806,6 +1022,7 @@ function applyStrings() {
     else if (chaptersLoaded) renderChapters();
   }
   updatePlaybackUi(media.state);
+  renderOfflineUi();
 }
 
 function populateUiLanguageSelect() {
@@ -831,7 +1048,7 @@ function renderOnboarding(uiValue = uiPrefs.uiLanguage, audioValue = languageCod
   strong.textContent = ot("onboardP1");
   intro.appendChild(strong);
   const list = document.createElement("ul");
-  for (const key of ["onboardItemChapters", "onboardItemExpand", "onboardItemOptions", "onboardItemLang", "onboardItemQuality", "onboardItemTheme", "onboardItemUiLang"]) {
+  for (const key of ["onboardItemPlayback", "onboardItemChapters", "onboardItemShortcuts", "onboardItemOptions", "onboardItemSleep", "onboardItemOffline"]) {
     const item = document.createElement("li"); item.textContent = ot(key); list.appendChild(item);
   }
   const controls = document.createElement("div");
@@ -964,6 +1181,11 @@ function updateSleepButton() {
 }
 
 async function changeLanguage(nextCode) {
+  if (navigator.onLine === false) {
+    els.langSelect.value = languageCode;
+    showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
+    return;
+  }
   if (!episode.languages[nextCode] || nextCode === languageCode) return;
   const position = media.position();
   saveProgress(true);
@@ -984,11 +1206,17 @@ async function changeLanguage(nextCode) {
   applyCover();
   storage.setProgress(episodeId, languageCode, position);
   storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: selected.id });
-  await media.setSelection(all, selected.id, position, shouldPlay);
+  await media.setSelection(playbackSources(all, selected), selected.id, position, shouldPlay);
+  renderOfflineUi();
   void ensureChapters({ notifyFailure: false, showLoading: false }).finally(() => requestAvailabilityScan(episodeGeneration, languageCode));
 }
 
 async function changeQuality(nextId) {
+  if (navigator.onLine === false) {
+    els.qualitySelect.value = selectedSourceId;
+    showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
+    return;
+  }
   const all = sourcesByLanguage.get(languageCode) || [];
   const selected = all.find((source) => source.id === nextId);
   if (!selected || selected.id === selectedSourceId) return;
@@ -998,7 +1226,8 @@ async function changeQuality(nextId) {
   currentSource = selected;
   storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: selected.id });
   updateMeta();
-  await media.setSelection(all, selected.id, position, shouldPlay);
+  await media.setSelection(playbackSources(all, selected), selected.id, position, shouldPlay);
+  renderOfflineUi();
 }
 
 function updateMediaSessionMetadata() {
@@ -1070,6 +1299,11 @@ els.optionsBtn.addEventListener("click", () => {
 els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
 els.closeSleepBtn.addEventListener("click", () => closePanel(els.sleepPanel, els.sleepBtn, true));
 els.episodeSelect.addEventListener("change", async () => {
+  if (navigator.onLine === false) {
+    els.episodeSelect.value = episodeId;
+    showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
+    return;
+  }
   const previous = episodeId;
   try { media.requestPause(); await loadEpisode(els.episodeSelect.value); }
   catch (error) { reportError("episode change", error, t("errorLoading")); await loadEpisode(previous); }
@@ -1095,6 +1329,21 @@ els.themeSelect.addEventListener("change", () => { uiPrefs.theme = els.themeSele
 els.fontSizeSelect.addEventListener("change", () => { uiPrefs.fontSize = els.fontSizeSelect.value; storage.writeUi(uiPrefs); setAppearance(); });
 els.uiLangSelect.addEventListener("change", () => { uiPrefs.uiLanguage = els.uiLangSelect.value; storage.writeUi(uiPrefs); locale = resolveUiLocale(uiPrefs.uiLanguage); applyStrings(); updateTitle(); });
 els.optionsPanel.addEventListener("submit", (event) => event.preventDefault());
+els.offlineDownloadBtn.addEventListener("click", () => void downloadOfflineSelection());
+els.offlineCancelBtn.addEventListener("click", async () => {
+  els.offlineCancelBtn.disabled = true;
+  try { await offline.cancel(); }
+  finally { els.offlineCancelBtn.disabled = false; renderOfflineUi(); }
+});
+els.offlineRemoveBtn.addEventListener("click", async () => {
+  if (!offline.active || !confirm(t("offlineRemoveConfirm", { book: offline.active.episodeTitle || offline.active.episodeId }))) return;
+  els.offlineRemoveBtn.disabled = true;
+  try {
+    await offline.removeActive();
+    showToast(t("offlineRemoved"), "success", 4000, "offline-removed");
+  } catch (error) { reportError("remove offline download", error, t("offlineDownloadFailed")); }
+  finally { els.offlineRemoveBtn.disabled = false; renderOfflineUi(); }
+});
 
 els.seek.addEventListener("input", () => {
   seekDragging = true;
@@ -1119,7 +1368,14 @@ bindDialogDismiss(els.resetDialog, els.resetCloseX);
 els.onboardingOk.addEventListener("click", acceptOnboarding);
 els.resetBtn.addEventListener("click", () => openDialog(els.resetDialog, els.resetOk));
 els.resetCancel.addEventListener("click", () => closeDialog(els.resetDialog));
-els.resetOk.addEventListener("click", () => { storage.reset(); media.destroy(); location.reload(); });
+els.resetOk.addEventListener("click", async () => {
+  els.resetOk.disabled = true;
+  try { await offline.reset(); }
+  catch (error) { reportError("offline reset", error); }
+  storage.reset();
+  media.destroy();
+  location.reload();
+});
 
 document.addEventListener("click", (event) => { if (!els.player.contains(event.target)) closeAllPanels(); });
 document.addEventListener("keydown", (event) => {
@@ -1142,6 +1398,7 @@ window.addEventListener("offline", () => {
   cancelAvailabilityWork();
   offlinePlaybackIntent = media.playbackIntent;
   showToast(t("connectionLost"), "warning", 7000, "offline");
+  renderOfflineUi();
 });
 window.addEventListener("online", () => {
   showToast(t("connectionRestored"), "success", 4000, "online");
@@ -1149,6 +1406,7 @@ window.addEventListener("online", () => {
   scannedAvailabilityLanguages.delete(languageCode);
   requestAvailabilityScan(episodeGeneration, languageCode);
   if (offlinePlaybackIntent) { offlinePlaybackIntent = false; void media.requestPlay(); }
+  renderOfflineUi();
 });
 
 async function boot() {
@@ -1156,12 +1414,15 @@ async function boot() {
   applyUiPreferences();
   applyStrings();
   initializeMediaSession();
+  const offlineReady = offline.init();
+  if (navigator.onLine === false) await offlineReady;
   const bootController = new AbortController();
   library = await loadLibrary(bootController.signal);
   const rawQueryId = new URL(location.href).searchParams.get("episode") || "";
   const queryId = library.byId.has(rawQueryId) || (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(rawQueryId) && rawQueryId !== "..") ? rawQueryId : "";
   const savedId = storage.getLastEpisode();
-  const initialId = queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
+  const downloadedId = navigator.onLine === false ? offline.active?.episodeId || "" : "";
+  const initialId = downloadedId || queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
   try {
     await loadEpisode(initialId);
     if (episode.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();

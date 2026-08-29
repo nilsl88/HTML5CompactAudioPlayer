@@ -11,9 +11,11 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `index.html`: semantic markup, controls, dialogs, and the `<audio>` element.
 - `player.css`: design tokens, responsive layout, control states, tooltips, and reduced-motion rules.
 - `player.js`: application coordinator, DOM rendering, event wiring, localization, and feature orchestration.
+- `sw.js`: network-first application shell and byte-range responses from downloaded audio chunks.
 - `i18n.js`: interface strings for English, Danish, Norwegian Bokmål, and Swedish.
 - `js/config.js`: configuration parsing, validation, URL resolution, and localization helpers.
 - `js/media-controller.js`: the only owner of audio source changes, loading, seeking, play/pause state, and fallback transitions.
+- `js/offline.js`: service-worker registration, storage preflight, chunk downloads, resume state, and offline manifests.
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
 - `js/availability.js`: abortable HTTP HEAD and Range availability probes.
 - `js/chapters.js`: cached chapter requests and WebVTT loading.
@@ -38,6 +40,7 @@ Run checks before handing off a change:
 
 ```bash
 node --check player.js
+node --check sw.js
 for file in i18n.js js/*.js tests/*.mjs; do node --check "$file"; done
 node --test tests/*.test.mjs
 git diff --check
@@ -79,10 +82,11 @@ Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappin
 - The player summary is language, quality, then active chapter title. Omit the chapter field when there is no parsed active cue.
 - Global shortcuts apply only outside interactive controls: Space toggles playback, Left/Right Arrow seeks five seconds, Up/Down Arrow uses the configured forward/back skip interval, and Escape closes overlays.
 - Keep visual notifications centered as a non-interactive overlay inside `player-card`. The toast host stays `aria-hidden` because the separate polite live region owns screen-reader announcements.
+- Keep the first-visit onboarding dialog current when user-facing features change. Its translated list must cover playback, chapters, keyboard shortcuts, Options, sleep timer, persistence, chapter caching, and offline downloads. Build its content with safe DOM APIs and keep the language selectors functional.
 
 ## Storage and network
 
-All storage access goes through `PlayerStorage`. Corrupt JSON, unavailable storage, quota errors, obsolete values, and private-browsing restrictions must degrade safely. Migrate old keys instead of discarding valid preferences.
+All `localStorage` access goes through `PlayerStorage`. `OfflineManager` owns Cache Storage media and manifests. Corrupt JSON, unavailable storage, quota errors, obsolete values, and private-browsing restrictions must degrade safely. Migrate old keys instead of discarding valid preferences.
 
 Cached chapter text is keyed by episode, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same episode and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
 
@@ -91,6 +95,19 @@ Availability probes are advisory. They must be abortable, must not download full
 Chapter loading must never block basic playback or assign an audio source. Start the selected language's VTT request after episode configuration and ahead of cover and availability probes. Reuse one in-flight request, use the persistent cache before the network, allow normal HTTP caching, and keep the request timeout at 20 seconds unless evidence supports another value.
 
 Availability scans wait until chapter loading completes and the browser is idle. Opening Options may request a scan sooner, but it must still wait for an active chapter request. A chapter failure must remain retryable from the panel and after the browser reports that connectivity has returned.
+
+Offline download is optional and must not change online playback behavior.
+
+- Keep online requests network-first. A completed download is a fallback, not a saved offline-mode preference.
+- Download only the selected episode, audio language, and source. Keep one completed audiobook and one resumable staging download.
+- Require same-origin audio with a valid total size and HTTP byte-range support. Do not accept a full `200` response for a requested chunk.
+- Store media as sequential 8 MiB Cache Storage chunks. Only a `ready` manifest may serve audio.
+- Serve correct `200`, `206`, `416`, `Content-Length`, and `Content-Range` responses without assembling the full audiobook in memory.
+- Keep episode configuration in the offline cache. Cover, chapter, and library files are optional supporting assets.
+- Check estimated quota, handle `QuotaExceededError`, request persistence where available, and explain that browser storage can still be evicted.
+- Let interrupted transfers resume, but explicit cancellation and Reset Player must remove partial chunks.
+- Increment the service-worker shell version when its cached file list or versioned entry points change.
+- Offline service workers require HTTPS or localhost and never support `file://`.
 
 ## Error handling
 
@@ -109,6 +126,8 @@ Use inline SVG or CSS for platform-independent icons. Avoid Unicode symbols for 
 For media changes, check first Play, Pause, resume, seek before metadata, quality/language/episode switching while paused and playing, codec fallback, rejected `play()`, offline recovery, and stale async results.
 
 For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/episode requests, current-title updates, and the no-chapter case.
+
+For offline changes, check unsupported browsers, invalid range servers, insufficient quota, complete download, cancellation, interrupted resume, offline reload, seeking near both ends, online reconnect, source replacement, cache-version mismatch, eviction, and reset cleanup.
 
 For UI changes, check keyboard focus, Escape and focus restoration, Space and all four Arrow shortcuts, hover and focus tooltips, light/dark themes, reduced motion, forced colors, 200% zoom, and 320/360/390/430px widths. Use real Safari on iPhone/iPad and Android browsers for final media verification.
 

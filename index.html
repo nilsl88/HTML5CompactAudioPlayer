@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=3">
+  <link rel="stylesheet" href="./player.css?v=4">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -72,6 +72,18 @@
           <div id="volumeRow" class="setting-row range-row"><label for="volumeRange">Volume</label><div class="range-wrap"><input id="volumeRange" type="range" min="0" max="100" value="100" step="1"><output id="volumeValue" for="volumeRange">100%</output></div></div>
           <div class="setting-row range-row"><label for="speedRange">Playback speed</label><div class="range-wrap"><input id="speedRange" type="range" min="0.5" max="2" value="1" step="0.05"><output id="speedValue" for="speedRange">1×</output></div></div>
           <div class="setting-row"><label for="skipSelect">Skip interval</label><select id="skipSelect"><option value="5">5 s</option><option value="10">10 s</option><option value="15">15 s</option><option value="30">30 s</option><option value="60">60 s</option></select></div>
+          <section id="offlineRow" class="offline-setting" aria-labelledby="offlineLabel" hidden>
+            <div class="offline-heading">
+              <span id="offlineLabel">Offline</span>
+              <span id="offlineStatus" class="setting-help"></span>
+            </div>
+            <progress id="offlineProgress" max="100" value="0" aria-labelledby="offlineLabel offlineStatus" hidden></progress>
+            <div class="offline-actions">
+              <button id="offlineDownloadBtn" class="secondary-button" type="button">Download for offline use</button>
+              <button id="offlineCancelBtn" class="secondary-button" type="button" hidden>Cancel download</button>
+              <button id="offlineRemoveBtn" class="secondary-button" type="button" hidden>Remove download</button>
+            </div>
+          </section>
         </fieldset>
         <fieldset class="settings-group">
           <legend id="appearanceLegend">Appearance</legend>
@@ -83,7 +95,7 @@
       </form>
 
       <div id="toastHost" class="toast-host" aria-hidden="true"></div>
-      <audio id="audio" preload="none"></audio>
+      <audio id="audio" preload="none" crossorigin="anonymous"></audio>
     </section>
   </main>
 
@@ -105,6 +117,6 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script type="module" src="./player.js?v=3"></script>
+  <script type="module" src="./player.js?v=4"></script>
 </body>
 </html>

@@ -27,9 +27,12 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 - Optional Media Session lock-screen controls
 - Saved progress per episode and audio language
 - Safe preference, chapter, and availability caching
+- User-initiated offline download for one selected audiobook, language, and quality
 - Keyboard controls, focus management, offline feedback, and reduced-motion support
 
 Keyboard shortcuts outside focused controls are Space for play/pause, Left/Right Arrow for a five-second seek, Up Arrow for the configured skip forward, and Down Arrow for the configured skip backward. Escape closes open panels.
+
+The first-visit **How this player works** dialog explains playback, chapters, shortcuts, Options, sleep timer, saved progress, chapter caching, and offline downloads. It also lets the user choose the interface language and audio language before starting. Set `ui.onboardingEnabled` to `false` to disable it.
 
 The player does not provide adaptive streaming, a playback queue, or transcript rendering.
 
@@ -51,6 +54,7 @@ The example configuration references audio files that are not committed to this 
 index.html              Semantic player markup and dialogs
 player.css              Responsive layout and design tokens
 player.js               Application coordinator and DOM event wiring
+sw.js                   Network-first app shell and offline ranged-audio responses
 i18n.js                 Interface strings
 js/
   availability.js       HEAD and Range availability probes
@@ -58,6 +62,7 @@ js/
   config.js             Configuration validation and normalization
   dialogs.js            Dialog, panel, and focus behavior
   media-controller.js   Sole owner of audio source, seek, and play transitions
+  offline.js            Offline preflight, quota checks, chunk downloads, and manifests
   source-selection.js   MIME evidence, quality display, and fallback ordering
   storage.js            Safe preferences, progress, chapter, and availability persistence
   utils.js              Shared utilities and abortable fetch retries
@@ -222,6 +227,25 @@ The audio element starts with `preload="none"` and no `src`.
 
 Browsers control actual buffering and may treat `preload` as a hint after a source is assigned.
 
+## Offline downloads
+
+Options includes **Download for offline use** when Service Worker and Cache Storage are available. It downloads the current audiobook, audio language, and quality. Other languages, bitrates, and codec fallbacks are not included. Downloading another selection normally keeps the previous copy until the new one is complete. If browser storage cannot hold both temporarily, the player asks before removing the old copy.
+
+The download also stores the player shell, episode configuration, cover, and chapter file needed for an offline reload. A missing optional cover or chapter file does not prevent audio from being saved. The player uses the network first whenever it is online and keeps the completed copy as a fallback. Returning online does not delete the download.
+
+Audio is requested in sequential 8 MiB byte ranges and stored in Cache Storage. Interrupted transfers retain completed chunks and show **Resume download** on the next online visit. Explicit cancellation removes the partial copy. Playback traffic has priority while the player is loading or stalled.
+
+Offline download requires:
+
+- HTTPS in production or `http://localhost` during development
+- audio hosted on the same origin as the player
+- valid HTTP `206 Partial Content` responses with `Content-Range` and a known total size
+- enough browser-managed storage for the selected source
+
+The player checks `navigator.storage.estimate()` before starting and requests persistent storage where supported. Quota values are estimates, persistence can be refused, and browsers may evict site data later. Keep the page open while downloading; iOS and other mobile browsers can suspend page work in the background.
+
+Only a complete manifest is eligible for playback. The service worker reconstructs audio range responses from cached chunks, so offline seeking does not load the entire audiobook into memory. Change `cacheVersion` when replacing an audio file. An older completed copy remains usable offline until the user replaces or removes it.
+
 ## Availability probing
 
 Availability is advisory. Each source is `available`, `missing`, or `unknown`.
@@ -262,6 +286,8 @@ New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:a
 
 Progress writes are throttled and flushed when the page is hidden or left.
 
+Offline audio does not use `localStorage`. Cache Storage keeps a small offline manifest, one completed audiobook cache, and at most one interrupted staging cache. Reset Player removes both offline caches as well as the saved settings listed above. The service-worker app shell remains installed so a later online visit can refresh it.
+
 ## Accessibility and keyboard controls
 
 Controls use native buttons, labels, fieldsets, outputs, sections, and dialogs. Chapter and sleep panels use ordinary button semantics instead of ARIA menu behavior.
@@ -285,8 +311,10 @@ The layout supports 320 CSS px viewports, browser zoom, long labels, safe-area i
 - Media Session is optional. Unsupported actions or metadata failures do not affect normal playback.
 - Lock-screen controls, background playback, interruptions, route changes, and app switching remain controlled by the operating system and browser.
 - Cross-origin configuration, chapter, image, and audio servers must permit the requests they receive. Authentication and CORS policies vary by deployment.
+- Cross-origin audio remains available for normal playback but cannot use the offline-download control.
 - Device codec support can differ from `canPlayType()` results. Runtime fallback is the final authority.
-- Chapter text can remain available offline after it has been stored. Audio files are not placed in localStorage or an application-managed offline cache.
+- Offline downloads are best-effort browser storage. Clearing website data, private-browsing restrictions, quota pressure, or browser eviction can remove them.
+- Downloads do not continue as background jobs after the browser suspends or closes the page. An interrupted download can resume when the player is open and online again.
 
 ## Tests
 
@@ -294,8 +322,9 @@ Run the dependency-free checks with:
 
 ```bash
 node --check player.js
+node --check sw.js
 for file in i18n.js js/*.js tests/*.mjs; do node --check "$file"; done
-node --test
+node --test tests/*.test.mjs
 ```
 
 The tests cover:
@@ -303,6 +332,8 @@ The tests cover:
 - Configuration and legacy library normalization
 - URL and MIME handling
 - Storage migration, corruption, chapter caching, reset behavior, and availability cache compatibility
+- Offline manifest validation, size preflight, complete download promotion, interruption and resume
+- Service-worker open-ended and suffix ranges, streamed `206` bodies, and network-first routing checks
 - Cached chapter requests, HTTP failures, and WebVTT parsing
 - Source selection and fallback order
 - blocked playback and codec rejection
@@ -317,9 +348,9 @@ The tests cover:
 
 Automated tests do not prove operating-system media behavior. Before a production release, test with real audio files on:
 
-- iPhone Safari: first Play, source changes, lock screen, background/foreground, interruptions, and volume-control visibility
+- iPhone Safari: first Play, source changes, offline download, airplane-mode reload and seeking, interrupted-download resume, lock screen, background/foreground, and volume-control visibility
 - iPad Safari: the same flows in portrait, landscape, split view, and with a hardware keyboard
-- Android Chrome, Firefox, and Samsung Internet: touch ranges, app switching, screen lock, network loss, and Media Session controls
-- macOS Safari, Chrome, Firefox, and Edge: keyboard controls, codec fallback, storage reload, dialogs, zoom, and offline recovery
+- Android Chrome, Firefox, and Samsung Internet: touch ranges, offline reload and seeking, app switching, screen lock, network loss, and Media Session controls
+- macOS Safari, Chrome, Firefox, and Edge: keyboard controls, codec fallback, downloaded-copy replacement, storage reload, dialogs, zoom, and offline recovery
 
 Also test 320, 360, 390, and 430 CSS pixel widths, tablet layouts, 200% zoom, long translated titles, reduced motion, and high-contrast/forced-colors modes.
