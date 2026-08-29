@@ -6,7 +6,9 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 
 ## Features
 
-![Compact Audio Player preview](preview.webp)
+<p align="center">
+  <img src="preview.webp" alt="Compact Audio Player preview">
+</p>
 
 - Play and pause with lazy audio loading
 - Seek bar, current time, duration, and configurable skip buttons
