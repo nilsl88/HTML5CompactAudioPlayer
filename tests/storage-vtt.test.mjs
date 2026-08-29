@@ -37,6 +37,29 @@ test("reads legacy availability cache values", () => {
   assert.equal(new PlayerStorage(memory).readAvailability("book", 1).en["opus-96"], true);
 });
 
+test("stores chapters by episode, language, version, and URL", () => {
+  const memory = new MemoryStorage();
+  const storage = new PlayerStorage(memory);
+  const text = "WEBVTT\n\n00:00.000 --> 00:10.000\nOpening";
+  assert.equal(storage.writeChapters("book", "en", 1, "https://example.test/en.vtt", text), true);
+  assert.equal(storage.readChapters("book", "en", 1, "https://example.test/en.vtt"), text);
+  assert.equal(storage.readChapters("book", "da", 1, "https://example.test/en.vtt"), "");
+  assert.equal(storage.readChapters("book", "en", 2, "https://example.test/en.vtt"), "");
+  assert.equal(storage.readChapters("book", "en", 1, "https://example.test/other.vtt"), "");
+  storage.reset();
+  assert.equal(storage.readChapters("book", "en", 1, "https://example.test/en.vtt"), "");
+});
+
+test("chapter cache replaces obsolete versions and rejects corrupt values", () => {
+  const memory = new MemoryStorage();
+  const storage = new PlayerStorage(memory);
+  storage.writeChapters("book", "en", 1, "/chapters.vtt", "WEBVTT\n");
+  storage.writeChapters("book", "en", 2, "/chapters.vtt", "WEBVTT\n\n00:00.000 --> 00:01.000\nNew");
+  assert.equal(storage.readChapters("book", "en", 1, "/chapters.vtt"), "");
+  memory.setItem("compactPlayer:chapters:book:en:2", "{broken");
+  assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
+});
+
 test("parses real-world WebVTT without retaining cue markup", () => {
   const cues = parseWebVtt(`WEBVTT\nKind: chapters\n\nintro\n00:00.000 --> 00:10.000 align:start\n<v Narrator>Intro &amp; setup</v>\n\nNOTE ignored\ntext\n\n00:10,000 --> 00:20,000\nSecond\nline\n\n00:bad --> 00:30.000\nInvalid`);
   assert.deepEqual(cues, [

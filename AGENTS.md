@@ -16,7 +16,8 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/media-controller.js`: the only owner of audio source changes, loading, seeking, play/pause state, and fallback transitions.
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
 - `js/availability.js`: abortable HTTP HEAD and Range availability probes.
-- `js/storage.js`: guarded localStorage access, migrations, progress, preferences, and availability cache.
+- `js/chapters.js`: cached chapter requests and WebVTT loading.
+- `js/storage.js`: guarded localStorage access, migrations, progress, preferences, chapter text, and availability cache.
 - `js/vtt.js`: safe WebVTT chapter parsing.
 - `js/dialogs.js`: panel and dialog focus behavior, Escape handling, and focus restoration.
 - `js/utils.js`: shared formatting, URL checks, abort errors, and fetch retries.
@@ -75,14 +76,21 @@ Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappin
 - Preserve visible `:focus-visible` styles, Escape behavior, focus restoration, and modal focus containment.
 - Primary controls should remain comfortable touch targets. At phone widths up to 430px, the transport controls use one seven-column row so Options stays beside the other controls.
 - Keep reduced-motion and forced-colors support. Test long translated labels and at least 320px-wide layouts.
+- The player summary is language, quality, then active chapter title. Omit the chapter field when there is no parsed active cue.
+- Global shortcuts apply only outside interactive controls: Space toggles playback, Left/Right Arrow seeks five seconds, Up/Down Arrow uses the configured forward/back skip interval, and Escape closes overlays.
+- Keep visual notifications centered as a non-interactive overlay inside `player-card`. The toast host stays `aria-hidden` because the separate polite live region owns screen-reader announcements.
 
 ## Storage and network
 
 All storage access goes through `PlayerStorage`. Corrupt JSON, unavailable storage, quota errors, obsolete values, and private-browsing restrictions must degrade safely. Migrate old keys instead of discarding valid preferences.
 
+Cached chapter text is keyed by episode, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same episode and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
+
 Availability probes are advisory. They must be abortable, must not download full media, and must never override a source that the media pipeline successfully plays. Do not probe every language or quality unnecessarily.
 
-Chapter loading must never block basic playback. Parse VTT defensively, discard malformed cues, and render chapter titles as text rather than HTML.
+Chapter loading must never block basic playback or assign an audio source. Start the selected language's VTT request after episode configuration and ahead of cover and availability probes. Reuse one in-flight request, use the persistent cache before the network, allow normal HTTP caching, and keep the request timeout at 20 seconds unless evidence supports another value.
+
+Availability scans wait until chapter loading completes and the browser is idle. Opening Options may request a scan sooner, but it must still wait for an active chapter request. A chapter failure must remain retryable from the panel and after the browser reports that connectivity has returned.
 
 ## Error handling
 
@@ -100,6 +108,8 @@ Use inline SVG or CSS for platform-independent icons. Avoid Unicode symbols for 
 
 For media changes, check first Play, Pause, resume, seek before metadata, quality/language/episode switching while paused and playing, codec fallback, rejected `play()`, offline recovery, and stale async results.
 
-For UI changes, check keyboard focus, Escape and focus restoration, hover and focus tooltips, light/dark themes, reduced motion, forced colors, 200% zoom, and 320/360/390/430px widths. Use real Safari on iPhone/iPad and Android browsers for final media verification.
+For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/episode requests, current-title updates, and the no-chapter case.
+
+For UI changes, check keyboard focus, Escape and focus restoration, Space and all four Arrow shortcuts, hover and focus tooltips, light/dark themes, reduced motion, forced colors, 200% zoom, and 320/360/390/430px widths. Use real Safari on iPhone/iPad and Android browsers for final media verification.
 
 Update `README.md` when a change affects configuration, browser limitations, testing, storage, codec selection, or deployment instructions.

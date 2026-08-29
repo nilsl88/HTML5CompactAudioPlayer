@@ -14,7 +14,7 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 
 - Play and pause with lazy audio loading
 - Seek bar, current time, duration, and configurable skip buttons
-- Previous/next chapter and chapter selection from WebVTT
+- Previous/next chapter, chapter selection, and current chapter display from WebVTT
 - Audio-language and quality selection
 - Opus, AAC/M4A, and MP3 sources
 - Deterministic runtime source fallback
@@ -26,8 +26,10 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 - Optional audiobook selector through `media/library.json`
 - Optional Media Session lock-screen controls
 - Saved progress per episode and audio language
-- Safe preference and availability caching
+- Safe preference, chapter, and availability caching
 - Keyboard controls, focus management, offline feedback, and reduced-motion support
+
+Keyboard shortcuts outside focused controls are Space for play/pause, Left/Right Arrow for a five-second seek, Up Arrow for the configured skip forward, and Down Arrow for the configured skip backward. Escape closes open panels.
 
 The player does not provide adaptive streaming, a playback queue, or transcript rendering.
 
@@ -52,11 +54,12 @@ player.js               Application coordinator and DOM event wiring
 i18n.js                 Interface strings
 js/
   availability.js       HEAD and Range availability probes
+  chapters.js           Cached chapter requests and WebVTT parsing
   config.js             Configuration validation and normalization
   dialogs.js            Dialog, panel, and focus behavior
   media-controller.js   Sole owner of audio source, seek, and play transitions
   source-selection.js   MIME evidence, quality display, and fallback ordering
-  storage.js            Safe persistence and legacy migration
+  storage.js            Safe preferences, progress, chapter, and availability persistence
   utils.js              Shared utilities and abortable fetch retries
   vtt.js                WebVTT chapter parser
 tests/                  Node built-in tests; no test packages required
@@ -80,7 +83,7 @@ Common optional fields:
 - `title`: localized title map
 - `cover`: path or HTTP(S) URL; image data URLs are also accepted
 - `duration`: duration hint in seconds
-- `cacheVersion`: change this when audio files are added or removed
+- `cacheVersion`: change this when audio or chapter files are updated, added, or removed
 - `debug.showAllQualities`: show all codec families and technical details
 - `ui.onboardingEnabled`: disable the first-visit help dialog when `false`
 
@@ -171,7 +174,7 @@ Use `?episode=<id>` to select an episode. Query values not present in the librar
 
 ## WebVTT chapters
 
-Chapters load when the user opens the chapter panel, uses chapter navigation, or selects sleep at chapter end. Chapter loading never blocks audio playback.
+The selected language's chapters start loading after the episode configuration. This request is independent of audio loading and never blocks playback. Opening the chapter panel, using chapter navigation, or selecting sleep at chapter end reuses the loaded data or the same in-flight request.
 
 ```vtt
 WEBVTT
@@ -183,7 +186,7 @@ Introduction
 Chapter 1
 ```
 
-The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML.
+The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML. The active chapter title appears after language and quality in the player summary; it is omitted when no active chapter exists.
 
 ## Source selection and fallback
 
@@ -234,19 +237,28 @@ Only the active audio language is scanned. Changing language cancels stale probe
 
 Results are cached for seven days. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current episode cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
 
+## Chapter loading
+
+The selected language's small WebVTT file starts loading after the episode configuration and before cover or availability-probe traffic. It does not assign or preload an audio source. Normal HTTP caching applies. Successful responses are also stored in guarded localStorage by episode, audio language, chapter URL, and `cacheVersion`, so repeat visits can display chapters without another request.
+
+Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests show a Retry action in the chapter panel and are retried after the browser reports that the connection has returned.
+
+Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
+
 ## Storage
 
 All storage access is guarded. Unavailable storage, malformed JSON, obsolete values, and quota errors cannot stop startup.
 
-The player reads and migrates these existing keys:
+The player uses these storage keys and migrates their supported legacy forms:
 
 - `compactPlayer:<episode>`: language, quality, and progress by audio language
 - `compactPlayer:ui`: theme, text size, player language, speed, volume, and skip interval
 - `compactPlayer:lastEpisode`: last library selection
+- `compactPlayer:chapters:<episode>:<language>:<cacheVersion>`: cached WebVTT chapter text
 - `compactAudioPlayer.onboardingShown.v1`: onboarding state
 - `cap_avail_*`: legacy availability cache
 
-New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:availability:<episode>:<cacheVersion>`. Reset removes current and legacy player keys.
+New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:availability:<episode>:<cacheVersion>`. Chapter entries also record their source URL and timestamp. A newer `cacheVersion` removes the obsolete chapter entry for that episode and language. Reset removes current and legacy player keys.
 
 Progress writes are throttled and flushed when the page is hidden or left.
 
@@ -256,10 +268,13 @@ Controls use native buttons, labels, fieldsets, outputs, sections, and dialogs. 
 
 - `Space`: play or pause when focus is outside a control
 - `Arrow Left` / `Arrow Right`: seek five seconds
+- `Arrow Up` / `Arrow Down`: skip forward or backward using the configured interval
 - `Escape`: close an open panel or dialog
 - `Tab` / `Shift+Tab`: normal document and modal focus movement
 
 Panels place focus inside when opened and restore it to their trigger when closed by Escape or a close action. Dialogs use the native modal API with a focus-trap fallback. Status announcements are deduplicated to avoid repeated screen-reader output.
+
+Visual notifications for network state, playback errors, chapter loading, and sleep-timer changes are centered over the player card. They do not move the layout or intercept pointer input. A separate polite live region announces the same message to assistive technology.
 
 The layout supports 320 CSS px viewports, browser zoom, long labels, safe-area insets, reduced motion, and forced-colors mode. Primary controls use 44 CSS pixel targets.
 
@@ -271,6 +286,7 @@ The layout supports 320 CSS px viewports, browser zoom, long labels, safe-area i
 - Lock-screen controls, background playback, interruptions, route changes, and app switching remain controlled by the operating system and browser.
 - Cross-origin configuration, chapter, image, and audio servers must permit the requests they receive. Authentication and CORS policies vary by deployment.
 - Device codec support can differ from `canPlayType()` results. Runtime fallback is the final authority.
+- Chapter text can remain available offline after it has been stored. Audio files are not placed in localStorage or an application-managed offline cache.
 
 ## Tests
 
@@ -286,13 +302,14 @@ The tests cover:
 
 - Configuration and legacy library normalization
 - URL and MIME handling
-- Storage migration, corruption, and availability cache compatibility
-- WebVTT parsing
+- Storage migration, corruption, chapter caching, reset behavior, and availability cache compatibility
+- Cached chapter requests, HTTP failures, and WebVTT parsing
 - Source selection and fallback order
 - blocked playback and codec rejection
 - stale play Promise rejection after a newer source selection
 - seeking before metadata
 - duplicate HTML IDs and label associations
+- active chapter metadata and configurable Up/Down Arrow shortcuts
 - CSS custom-property references
 - production dependency and lazy-preload checks
 

@@ -20,6 +20,33 @@ test("chapter navigation uses platform-independent icons", async () => {
   assert.doesNotMatch(html, /[⏮⏭]/u);
 });
 
+test("player metadata includes only the active chapter title", async () => {
+  const source = await readFile(new URL("player.js", root), "utf8");
+  assert.match(source, /const chapterTitle = cues\[activeCueIndex\]\?\.title \|\| "";/);
+  assert.match(source, /setMeta\(\[language\?\.label \|\| languageCode, sourceLabel\(source, false\), chapterTitle\]\.filter\(Boolean\)/);
+  assert.match(source, /function markActiveChapter\(position\)[\s\S]*?activeCueIndex = index;[\s\S]*?updateMeta\(\);/);
+});
+
+test("vertical arrow shortcuts use the configured skip interval", async () => {
+  const source = await readFile(new URL("player.js", root), "utf8");
+  assert.match(source, /event\.code === "ArrowUp"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) \+ uiPrefs\.skipSeconds\);/);
+  assert.match(source, /event\.code === "ArrowDown"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) - uiPrefs\.skipSeconds\);/);
+});
+
+test("visual notifications are centered inside the player", async () => {
+  const html = await readFile(new URL("index.html", root), "utf8");
+  const css = await readFile(new URL("player.css", root), "utf8");
+  assert.match(html, /<div id="toastHost" class="toast-host" aria-hidden="true"><\/div>\s*<audio id="audio"[^>]*><\/audio>\s*<\/section>/);
+  const rule = css.match(/\.toast-host\s*{([^}]*)}/)?.[1] || "";
+  assert.match(rule, /position:\s*absolute/);
+  assert.match(rule, /top:\s*50%/);
+  assert.match(rule, /left:\s*50%/);
+  assert.match(rule, /transform:\s*translate\(-50%,\s*-50%\)/);
+  assert.match(rule, /pointer-events:\s*none/);
+  assert.match(rule, /z-index:\s*30/);
+  assert.match(rule, /width:\s*min\(26rem,\s*calc\(100% - 2rem\)\)/);
+});
+
 test("options uses a platform-independent icon", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   assert.match(html, /<button id="optionsBtn"[^>]*>\s*<svg class="control-icon control-icon-stroke"[^>]*aria-hidden="true"[^>]*focusable="false"/);
