@@ -7,7 +7,9 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 ## Features
 
 <p align="center">
-  <img src="preview.webp" alt="Compact Audio Player preview">
+  <a href="preview.webp">
+    <img src="preview.webp" width="50%" alt="Compact Audio Player preview; click to open full size">
+  </a>
 </p>
 
 - Play and pause with lazy audio loading
