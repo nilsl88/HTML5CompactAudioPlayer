@@ -1,0 +1,32 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Windows metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local tooling and generated output
+node_modules/
+.cache/
+coverage/
+dist/
+build/
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+!.env.example
