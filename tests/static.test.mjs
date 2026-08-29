@@ -116,3 +116,41 @@ test("production HTML has no runtime dependencies", async () => {
   assert.match(html, /<audio[^>]+preload="none"/);
   assert.match(html, /type="module"/);
 });
+
+test("offline controls are semantic and media opts into service-worker handling", async () => {
+  const html = await readFile(new URL("index.html", root), "utf8");
+  assert.match(html, /<section id="offlineRow"[^>]*aria-labelledby="offlineLabel"[^>]*hidden>/);
+  for (const id of ["offlineDownloadBtn", "offlineCancelBtn", "offlineRemoveBtn"]) {
+    assert.match(html, new RegExp(`<button id="${id}"[^>]*type="button"`));
+  }
+  assert.match(html, /<progress id="offlineProgress"[^>]*aria-labelledby="offlineLabel offlineStatus"/);
+  assert.match(html, /<audio id="audio"[^>]*preload="none"[^>]*crossorigin="anonymous"/);
+});
+
+test("service worker keeps online requests first and serves cached byte ranges", async () => {
+  const worker = await readFile(new URL("sw.js", root), "utf8");
+  assert.match(worker, /async function networkFirst\(request\)[\s\S]*?await fetch\(request\)/);
+  assert.match(worker, /new Response\(stream, \{ status: range\.partial \? 206 : 200, headers \}\)/);
+  assert.match(worker, /"content-range"\] = `bytes \$\{range\.start\}-\$\{range\.end\}\/\$\{manifest\.totalSize\}`/);
+  assert.match(worker, /request\.headers\.get\(DOWNLOAD_HEADER\) === "1"/);
+  assert.doesNotMatch(worker, /importScripts\(|https:\/\/.*(?:workbox|unpkg|jsdelivr)/i);
+});
+
+test("service-worker shell and versioned entry points stay in sync", async () => {
+  const html = await readFile(new URL("index.html", root), "utf8");
+  const source = await readFile(new URL("player.js", root), "utf8");
+  const worker = await readFile(new URL("sw.js", root), "utf8");
+  assert.match(html, /player\.css\?v=4/);
+  assert.match(html, /player\.js\?v=4/);
+  assert.match(source, /i18n\.js\?v=4/);
+  assert.match(worker, /const SHELL_VERSION = "v4"/);
+  for (const path of ["player.css?v=4", "player.js?v=4", "i18n.js?v=4", "js/offline.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
+});
+
+test("offline lifecycle is optional and reset clears downloaded media", async () => {
+  const source = await readFile(new URL("player.js", root), "utf8");
+  assert.match(source, /const offline = new OfflineManager/);
+  assert.match(source, /offline\.init\(\)/);
+  assert.match(source, /await offline\.reset\(\)/);
+  assert.match(source, /navigator\.onLine === false \? offline\.active\?\.episodeId/);
+});
