@@ -1,8 +1,4 @@
-/* Compact Audio Player i18n strings (v168) */
-(() => {
-  "use strict";
-
-  window.CAP_UI_STRINGS = {
+export const UI_STRINGS = {
   en: {
     openCover: "Open cover image",
     loading: "Loading audio files and languages…",
@@ -96,6 +92,15 @@
     audioLoadError: "Error: Could not load audio.",
     audioFallbackCompatible: "Switched to a compatible audio format.",
     noChaptersFound: "No chapters found",
+    audioSettings: "Audio",
+    coverDialogTitle: "Cover image",
+    playbackControls: "Playback controls",
+    playBlocked: "Playback was blocked. Press Play to try again.",
+    audioStalled: "Audio is waiting for the network.",
+    sourceExhausted: "None of the configured audio sources could be played.",
+    sourceUnavailable: "This audio source is unavailable.",
+    offlineWaiting: "You are offline. Playback will resume when the connection returns.",
+    qualityChanged: "Changed to {quality}.",
   },
   da: {
     openCover: "Åbn forsidebillede",
@@ -190,6 +195,15 @@
     audioLoadError: "Fejl: Kunne ikke indlæse lyd.",
     audioFallbackCompatible: "Skiftede til et kompatibelt lydformat.",
     noChaptersFound: "Ingen kapitler fundet",
+    audioSettings: "Lyd",
+    coverDialogTitle: "Forsidebillede",
+    playbackControls: "Afspilningsknapper",
+    playBlocked: "Afspilning blev blokeret. Tryk på Afspil for at prøve igen.",
+    audioStalled: "Lyden venter på netværket.",
+    sourceExhausted: "Ingen af de konfigurerede lydkilder kunne afspilles.",
+    sourceUnavailable: "Denne lydkilde er ikke tilgængelig.",
+    offlineWaiting: "Du er offline. Afspilningen fortsætter, når forbindelsen er tilbage.",
+    qualityChanged: "Skiftede til {quality}.",
   },
   nb: {
     openCover: "Åpne omslagsbilde",
@@ -284,6 +298,15 @@
     audioLoadError: "Feil: Kunne ikke laste inn lyd.",
     audioFallbackCompatible: "Byttet til et kompatibelt lydformat.",
     noChaptersFound: "Ingen kapitler funnet",
+    audioSettings: "Lyd",
+    coverDialogTitle: "Omslagsbilde",
+    playbackControls: "Avspillingsknapper",
+    playBlocked: "Avspillingen ble blokkert. Trykk på Spill av for å prøve igjen.",
+    audioStalled: "Lyden venter på nettverket.",
+    sourceExhausted: "Ingen av de konfigurerte lydkildene kunne spilles av.",
+    sourceUnavailable: "Denne lydkilden er ikke tilgjengelig.",
+    offlineWaiting: "Du er frakoblet. Avspillingen fortsetter når tilkoblingen er tilbake.",
+    qualityChanged: "Byttet til {quality}.",
   },
   sv: {
     openCover: "Öppna omslagsbild",
@@ -378,6 +401,14 @@
     audioLoadError: "Fel: Kunde inte ladda ljud.",
     audioFallbackCompatible: "Bytte till ett kompatibelt ljudformat.",
     noChaptersFound: "Inga kapitel hittades",
+    audioSettings: "Ljud",
+    coverDialogTitle: "Omslagsbild",
+    playbackControls: "Uppspelningsknappar",
+    playBlocked: "Uppspelningen blockerades. Tryck på Spela för att försöka igen.",
+    audioStalled: "Ljudet väntar på nätverket.",
+    sourceExhausted: "Ingen av de konfigurerade ljudkällorna kunde spelas upp.",
+    sourceUnavailable: "Den här ljudkällan är inte tillgänglig.",
+    offlineWaiting: "Du är offline. Uppspelningen fortsätter när anslutningen är tillbaka.",
+    qualityChanged: "Bytte till {quality}.",
   }
-  };
-})();
+};

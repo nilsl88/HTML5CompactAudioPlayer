@@ -1,204 +1,110 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=1" />
+  <link rel="stylesheet" href="./player.css?v=2">
 </head>
-<body class="isLoading">
-  <a class="skip-link" href="#mainApp">Skip to player</a>
-  <div id="statusAnnouncer" role="status" aria-live="polite" class="sr-only"></div>
-  <main id="mainApp" class="page">
-    <header class="header">
-      <div class="titleBlock">
-        <div id="episodeTitle" class="title">Audio</div>
-        <div id="episodeMeta" class="meta">Loading…</div>
-      </div>
+<body class="is-loading">
+  <a class="skip-link" href="#player">Skip to player</a>
+  <div id="statusAnnouncer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <main class="page">
+    <header class="page-header">
+      <h1 id="episodeTitle" class="episode-title">Audio</h1>
+      <p id="episodeMeta" class="episode-meta">Loading…</p>
     </header>
 
-    <section class="playerCard isExpanded isLoading" aria-label="Audio player">
-      <div id="skeletonOverlay" class="skeletonOverlay" aria-hidden="true">
-        <div class="skRow skBarRow">
-          <div class="sk skCircle"></div>
-          <div class="sk skSeek"></div>
-        </div>
-        <div class="skRow skTimeRow">
-          <div class="sk skTime"></div>
-          <div class="sk skTime"></div>
-        </div>
-        <div class="skRow skBtnsRow">
-          <div class="sk skIcon"></div>
-          <div class="sk skIcon"></div>
-          <div class="sk skBtn"></div>
-          <div class="sk skBtn"></div>
-          <div class="sk skIcon"></div>
-          <div class="sk skIcon"></div>
-          <div class="sk skIcon"></div>
-        </div>
+    <section id="player" class="player-card is-loading" aria-labelledby="episodeTitle" aria-busy="true">
+      <div class="skeleton" aria-hidden="true">
+        <span class="skeleton-play"></span>
+        <span class="skeleton-progress"></span>
+        <span class="skeleton-controls"></span>
       </div>
-      <div class="playerBar">
-        <button id="playPauseBtn" class="playBtn" type="button" aria-label="Play">▶︎</button>
 
-        <div class="progressBlock">
-          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek" />
-          <div class="timeRow" aria-label="Time">
-            <span id="timeCur" class="time">0:00</span>
-            <span id="timeDur" class="time">0:00</span>
+      <div class="player-bar">
+        <button id="playPauseBtn" class="play-button" type="button" aria-label="Play" disabled>
+          <span id="playPauseIcon" aria-hidden="true">▶</span>
+        </button>
+        <div class="progress-block">
+          <label id="seekLabel" class="sr-only" for="seek">Seek</label>
+          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" step="1" disabled>
+          <div class="time-row" aria-hidden="true">
+            <output id="timeCur" class="time" for="seek">0:00</output>
+            <output id="timeDur" class="time">—:—</output>
           </div>
         </div>
-
       </div>
 
-      <div id="coverWrap" class="coverWrap" hidden>
-        <img id="coverImg" class="coverImg" alt="" decoding="async" loading="eager" fetchpriority="low" />
-      </div>
+      <button id="coverButton" class="cover-button" type="button" hidden>
+        <img id="coverImg" class="cover-image" alt="" decoding="async" fetchpriority="low">
+      </button>
 
-      <!-- Expanded controls (always shown) -->
-      <div id="focusRow" class="focusRow" aria-label="Expanded controls">
-        <button id="focusChaptersBtn" class="iconBtn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="chaptersMenu" title="Chapters">☰︎</button>
-        <button id="focusPrevChapterBtn" class="iconBtn" type="button" aria-label="Previous chapter" title="Previous chapter">⏮︎</button>
-        <button id="focusSkipBack" class="focusSkipBtn" type="button" aria-label="Skip back"><<15</button>
-        <button id="focusSkipForward" class="focusSkipBtn" type="button" aria-label="Skip forward">15>></button>
-        <button id="focusNextChapterBtn" class="iconBtn" type="button" aria-label="Next chapter" title="Next chapter">⏭︎</button>
-        <button id="sleepBtn" class="iconBtn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="sleepMenu" title="Sleep timer">☾</button>
-        <button id="focusOptionsBtn" class="iconBtn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="optionsPanel" title="Options">⚙︎</button>
-      </div>
+      <fieldset class="transport-controls">
+        <legend class="sr-only">Playback controls</legend>
+        <button id="chaptersBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="chaptersPanel"><span aria-hidden="true">☰</span><span class="sr-only">Chapters</span></button>
+        <button id="prevChapterBtn" class="icon-button" type="button" aria-label="Previous chapter" disabled><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5h2v14H4zM19 5v14L7 12z"></path></svg></button>
+        <button id="skipBackBtn" class="skip-button" type="button" aria-label="Skip back 15 seconds"><span aria-hidden="true">−15</span></button>
+        <button id="skipForwardBtn" class="skip-button" type="button" aria-label="Skip forward 15 seconds"><span aria-hidden="true">+15</span></button>
+        <button id="nextChapterBtn" class="icon-button" type="button" aria-label="Next chapter" disabled><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M18 5h2v14h-2zM5 5v14l12-7z"></path></svg></button>
+        <button id="sleepBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="sleepPanel"><span aria-hidden="true">☾</span><span class="sr-only">Sleep timer</span></button>
+        <button id="optionsBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="optionsPanel"><svg class="control-icon control-icon-stroke" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3m0 14v3M2 12h3m14 0h3M4.93 4.93l2.12 2.12m9.9 9.9 2.12 2.12m0-14.14-2.12 2.12m-9.9 9.9-2.12 2.12"></path></svg><span class="sr-only">Options</span></button>
+      </fieldset>
 
-      <div id="optionsPanel" class="drawer" hidden>
-        <div class="drawerRow" id="episodeRow" hidden>
-          <label class="label" for="episodeSelect">Audiobook</label>
-          <select id="episodeSelect" class="select"></select>
-        </div>
+      <section id="chaptersPanel" class="popup-panel" aria-labelledby="chaptersTitle" hidden>
+        <header class="panel-header"><h2 id="chaptersTitle" class="panel-title">Chapters</h2><button id="closeChaptersBtn" class="icon-button" type="button" aria-label="Close chapters"><span aria-hidden="true">×</span></button></header>
+        <div id="chaptersList" class="panel-list"></div>
+      </section>
 
-        <div class="drawerRow">
-          <label class="label" for="langSelect">Language</label>
-          <select id="langSelect" class="select"></select>
-        </div>
-        <div class="drawerRow">
-          <label class="label" for="qualitySelect">Quality</label>
-          <select id="qualitySelect" class="select"></select>
-        </div>
+      <section id="sleepPanel" class="popup-panel" aria-labelledby="sleepTitle" hidden>
+        <header class="panel-header"><h2 id="sleepTitle" class="panel-title">Sleep timer</h2><button id="closeSleepBtn" class="icon-button" type="button" aria-label="Close"><span aria-hidden="true">×</span></button></header>
+        <div id="sleepList" class="panel-list"></div>
+      </section>
 
-        <div class="drawerRow drawerRowRange" id="volumeRow">
-          <label class="label" for="volumeRange">Volume</label>
-          <div class="rangeWrap">
-            <input id="volumeRange" class="range" type="range" min="0" max="100" value="100" step="1" aria-label="Volume" />
-            <span id="volumeValue" class="rangeValue" aria-live="polite">100%</span>
-          </div>
-        </div>
+      <form id="optionsPanel" class="options-panel" hidden>
+        <h2 id="optionsTitle" class="sr-only">Options</h2>
+        <fieldset class="settings-group">
+          <legend id="audioSettingsLegend">Audio</legend>
+          <div id="episodeRow" class="setting-row" hidden><label for="episodeSelect">Audiobook</label><select id="episodeSelect"></select></div>
+          <div class="setting-row"><label for="langSelect">Audio language</label><select id="langSelect"></select></div>
+          <div class="setting-row"><label for="qualitySelect">Quality</label><select id="qualitySelect"></select></div>
+          <div id="volumeRow" class="setting-row range-row"><label for="volumeRange">Volume</label><div class="range-wrap"><input id="volumeRange" type="range" min="0" max="100" value="100" step="1"><output id="volumeValue" for="volumeRange">100%</output></div></div>
+          <div class="setting-row range-row"><label for="speedRange">Playback speed</label><div class="range-wrap"><input id="speedRange" type="range" min="0.5" max="2" value="1" step="0.05"><output id="speedValue" for="speedRange">1×</output></div></div>
+          <div class="setting-row"><label for="skipSelect">Skip interval</label><select id="skipSelect"><option value="5">5 s</option><option value="10">10 s</option><option value="15">15 s</option><option value="30">30 s</option><option value="60">60 s</option></select></div>
+        </fieldset>
+        <fieldset class="settings-group">
+          <legend id="appearanceLegend">Appearance</legend>
+          <div class="setting-row"><label for="themeSelect">Mode</label><select id="themeSelect"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+          <div class="setting-row"><label for="fontSizeSelect">Text size</label><select id="fontSizeSelect"><option value="s">Small</option><option value="m">Medium</option><option value="l">Large</option></select></div>
+          <div class="setting-row"><label for="uiLangSelect">Player language</label><select id="uiLangSelect"></select></div>
+        </fieldset>
+        <div class="reset-row"><button id="resetBtn" class="text-button" type="button">Reset player</button></div>
+      </form>
 
-        <div class="drawerRow drawerRowRange">
-          <label class="label" for="speedRange">Playback speed</label>
-          <div class="rangeWrap">
-            <input id="speedRange" class="range" type="range" min="0.5" max="2" value="1" step="0.05" aria-label="Playback speed" />
-            <span id="speedValue" class="rangeValue" aria-live="polite">1×</span>
-          </div>
-        </div>
-
-        <div class="drawerRow">
-          <label class="label" for="skipSelect">Skip interval</label>
-          <select id="skipSelect" class="select">
-            <option value="5">5 s</option>
-            <option value="10">10 s</option>
-            <option value="15">15 s</option>
-            <option value="30">30 s</option>
-            <option value="60">60 s</option>
-          </select>
-        </div>
-
-        <div class="drawerDivider" role="separator" aria-hidden="true"></div>
-
-<div class="drawerRow">
-          <label class="label" for="themeSelect">Mode</label>
-          <select id="themeSelect" class="select">
-            <option value="system">System</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-          </select>
-        </div>
-<div class="drawerRow">
-          <label class="label" for="fontSizeSelect">Text size</label>
-          <select id="fontSizeSelect" class="select">
-            <option value="m">Medium</option>
-            <option value="s">Small</option>
-            <option value="l">Large</option>
-          </select>
-        </div>
- <div class="drawerRow">
-          <label class="label" for="uiLangSelect">Player language</label>
-          <select id="uiLangSelect" class="select"></select>
-        </div>
-<div class="drawerRow drawerRowLink">
-  <div class="label"></div>
-  <button id="resetBtn" class="textLinkBtn" type="button"><span class="linkText">Reset player</span></button>
-</div>
-      </div>
-
-
-      <div id="sleepMenu" class="menu sleepMenu" role="menu" aria-label="Sleep timer" hidden>
-        <div class="menuHeader">
-          <div class="menuTitle" id="sleepMenuTitle">Sleep timer</div>
-          <button id="closeSleepBtn" class="iconBtn" type="button" aria-label="Close" title="Close">✕︎</button>
-        </div>
-        <div id="sleepList" class="menuList" role="none"></div>
-      </div>
-
-      <div id="chaptersMenu" class="menu" role="menu" aria-label="Chapters" hidden>
-        <div class="menuHeader">
-          <div class="menuTitle">Chapters</div>
-          <button id="closeChaptersBtn" class="iconBtn" type="button" aria-label="Close chapters">✕︎</button>
-        </div>
-        <div id="chaptersList" class="menuList" role="none"></div>
-      </div>
-
-      <audio id="audio" preload="metadata" crossorigin="anonymous">
-        <track id="chaptersTrack" kind="chapters" />
-      </audio>
+      <audio id="audio" preload="none"></audio>
     </section>
-
-    <!-- Toasts are placed close to the player so feedback isn't far away on tall pages -->
-    <div id="toastHost" class="toastHost" aria-live="polite" aria-atomic="true"></div>
+    <div id="toastHost" class="toast-host" aria-hidden="true"></div>
   </main>
 
-    <!-- Full-size cover lightbox (keeps audio playing in the background) -->
-    <div id="coverLightbox" class="coverLightbox" hidden tabindex="-1" aria-hidden="true">
-      <div id="coverLightboxBox" class="coverLightboxBox" role="dialog" aria-modal="true">
-        <img id="coverLightboxImg" class="coverLightboxImg" alt="" decoding="async" />
-      </div>
-    </div>
+  <dialog id="coverDialog" class="cover-dialog" aria-labelledby="coverDialogTitle">
+    <h2 id="coverDialogTitle" class="sr-only">Cover image</h2>
+    <button id="closeCoverBtn" class="dialog-close icon-button" type="button" aria-label="Close"><span aria-hidden="true">×</span></button>
+    <img id="coverDialogImg" class="cover-dialog-image" alt="" decoding="async">
+  </dialog>
 
+  <dialog id="onboardingDialog" class="modal" aria-labelledby="onboardingTitle" aria-describedby="onboardingBody">
+    <header class="modal-header"><h2 id="onboardingTitle">How this player works</h2><button id="onboardingCloseX" class="icon-button" type="button" aria-label="Close"><span aria-hidden="true">×</span></button></header>
+    <div id="onboardingBody" class="modal-body"></div>
+    <footer class="modal-footer"><button id="onboardingOk" class="primary-button" type="button">Got it</button></footer>
+  </dialog>
 
-<!-- First-visit help modal -->
-<div id="onboardingModal" class="modalBackdrop" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="onboardingTitle" aria-describedby="onboardingBody">
-    <div class="modalHeader">
-      <h2 id="onboardingTitle" class="modalTitle">How this player works</h2>
-      <button id="onboardingCloseX" class="iconBtn modalClose" type="button" aria-label="Close" title="Close">✕︎</button>
-    </div>
-    <div id="onboardingBody" class="modalBody"></div>
-    <div class="modalFooter">
-      <button id="onboardingOk" class="primaryBtn" type="button">Got it</button>
-    </div>
-  </div>
-</div>
+  <dialog id="resetDialog" class="modal" aria-labelledby="resetTitle" aria-describedby="resetBody">
+    <header class="modal-header"><h2 id="resetTitle">Reset player</h2><button id="resetCloseX" class="icon-button" type="button" aria-label="Close"><span aria-hidden="true">×</span></button></header>
+    <div id="resetBody" class="modal-body"></div>
+    <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
+  </dialog>
 
-<!-- Reset confirmation modal -->
-<div id="resetModal" class="modalBackdrop" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="resetTitle" aria-describedby="resetBody">
-    <div class="modalHeader">
-      <h2 id="resetTitle" class="modalTitle">Reset player</h2>
-      <button id="resetCloseX" class="iconBtn modalClose" type="button" aria-label="Close" title="Close">✕︎</button>
-    </div>
-    <div id="resetBody" class="modalBody"></div>
-    <div class="modalFooter modalFooterSplit">
-      <button id="resetCancel" class="secondaryBtn" type="button">Cancel</button>
-      <button id="resetOk" class="primaryBtn" type="button">Reset</button>
-    </div>
-  </div>
-</div>
-
-  <script src="./i18n.js?v=1" defer></script>
-  <script src="./player.js?v=1" defer></script>
+  <script type="module" src="./player.js?v=2"></script>
 </body>
 </html>
