@@ -38,13 +38,15 @@ The player does not provide adaptive streaming, a playback queue, or transcript 
 
 ## Run locally
 
-ES modules require an HTTP server. Direct `file://` use is not supported.
+Start a local HTTP server from the repository directory. Python is included on most development systems:
 
 ```bash
 python3 -m http.server 8080
 ```
 
 Open `http://localhost:8080/`.
+
+You can use any other static web server instead of Python, such as Caddy, nginx, Apache, or a local editor server.
 
 The example configuration references audio files that are not committed to this repository. Add the configured files under `media/episode-001/<language>/` to test playback.
 
