@@ -75,7 +75,7 @@ Keep new `library.json` entries minimal: `id` is required and `folder` is needed
 
 Load the active episode configuration at startup. Load remaining library titles only after Options opens, limit title lookups to two concurrent requests, and reuse the normalized configurations from the in-memory cache. A failed background lookup must leave the ID fallback visible and must not affect playback.
 
-Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappings and relative URL behavior. Reject unsafe schemes and traversal without changing valid relative media paths.
+Supported codec keys are `opus`, `aac`, and `mp3`. AAC sources support AAC-LC (`mp4a.40.2`), HE-AAC v1 (`mp4a.40.5`), and HE-AAC v2 (`mp4a.40.29`) MIME evidence, followed by generic `audio/mp4`; runtime decoding remains authoritative. Keep relative URL behavior and reject unsafe schemes and traversal without changing valid relative media paths.
 
 `chapterSource` is `vtt`, `embedded`, `auto`, or `none`. A legacy language with a non-empty `chapters` value and no mode normalizes to `vtt`. Embedded mode reads the active AAC/M4A/M4B source; auto mode tries WebVTT first and then embedded metadata.
 

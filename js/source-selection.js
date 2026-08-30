@@ -2,15 +2,36 @@ import { CODECS, resolveLanguageAsset } from "./config.js";
 
 export const CODEC_PREFERENCE = [...CODECS];
 
+// AAC sources may contain AAC-LC, HE-AAC v1, or HE-AAC v2. Keep the
+// profile strings separate: codecs is an evidence hint, not a guarantee
+// that the downloaded file uses that exact profile.
+export const AAC_MIME_TYPES = [
+  'audio/mp4; codecs="mp4a.40.2"',
+  'audio/mp4; codecs="mp4a.40.5"',
+  'audio/mp4; codecs="mp4a.40.29"',
+  "audio/mp4",
+];
+
 export function extensionFromPath(path) {
   return String(path || "").toLowerCase().match(/\.([a-z0-9]+)(?:[?#]|$)/)?.[1] || "";
 }
 
 export function mimeFor(codec, extension = "") {
   if (codec === "opus") return extension === "ogg" ? 'audio/ogg; codecs="opus"' : 'audio/webm; codecs="opus"';
-  if (codec === "aac") return 'audio/mp4; codecs="mp4a.40.2"';
+  if (codec === "aac") return AAC_MIME_TYPES[0];
   if (codec === "mp3") return "audio/mpeg";
   return "";
+}
+
+export function mimeCandidatesFor(codec, extension = "") {
+  if (codec === "aac") return [...AAC_MIME_TYPES];
+  const mime = mimeFor(codec, extension);
+  return mime ? [mime] : [];
+}
+
+function supportScore(audioElement, mime) {
+  const evidence = String(audioElement?.canPlayType?.(mime) || "");
+  return evidence === "probably" ? 2 : evidence === "maybe" ? 1 : 0;
 }
 
 export function buildSources(language, audioElement) {
@@ -19,16 +40,17 @@ export function buildSources(language, audioElement) {
     for (const [bitrateValue, path] of Object.entries(language?.sources?.[codec] || {})) {
       const bitrate = Number.parseInt(bitrateValue, 10);
       const extension = extensionFromPath(path);
-      const mime = mimeFor(codec, extension);
-      const evidence = String(audioElement?.canPlayType?.(mime) || "");
+      const mimeCandidates = mimeCandidatesFor(codec, extension);
+      const supportedCandidates = mimeCandidates.map((mime) => ({ mime, support: supportScore(audioElement, mime) }));
+      const selected = supportedCandidates.reduce((best, candidate) => candidate.support > best.support ? candidate : best, { mime: "", support: 0 });
       sources.push({
         id: `${codec}-${bitrate}`,
         codec,
         bitrate,
         extension,
-        mime,
+        mime: selected.mime,
         url: resolveLanguageAsset(language, path),
-        support: evidence === "probably" ? 2 : evidence === "maybe" ? 1 : 0,
+        support: selected.support,
         availability: "unknown",
       });
     }

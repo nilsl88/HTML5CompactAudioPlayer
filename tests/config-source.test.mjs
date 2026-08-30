@@ -71,6 +71,13 @@ test("builds MIME evidence and one visible codec family", () => {
   assert.deepEqual(visibleSources(sources).map((source) => source.id), ["opus-128", "opus-96"]);
 });
 
+test("uses HE-AAC MIME evidence when AAC-LC is not reported", () => {
+  const audio = { canPlayType: (mime) => mime.includes("mp4a.40.5") ? "probably" : "" };
+  const [source] = buildSources({ baseUrl: "https://example.test/audio/", sources: { aac: { 64: "book.m4b" } } }, audio);
+  assert.equal(source.mime, 'audio/mp4; codecs="mp4a.40.5"');
+  assert.equal(source.support, 2);
+});
+
 test("fallback queue is deterministic and contains no duplicate URL", () => {
   const sources = [
     { id: "opus-128", codec: "opus", bitrate: 128, url: "o128", support: 2, availability: "unknown" },
