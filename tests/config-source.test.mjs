@@ -12,14 +12,50 @@ test("normalizes the documented episode schema without changing paths", () => {
     },
   }, { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
   assert.equal(episode.defaultLanguage, "en");
+  assert.equal(episode.languages.en.chapterSource, "vtt");
   assert.equal(resolveLanguageAsset(episode.languages.en, "audio.webm"), "https://example.test/media/book/en/audio.webm");
   assert.equal(resolveLanguageAsset(episode.languages.en, "chapters.vtt"), "https://example.test/media/book/en/chapters.vtt");
+});
+
+test("normalizes explicit embedded chapter modes", () => {
+  const episode = normalizeEpisode({
+    id: "book",
+    defaultLanguage: "en",
+    languages: {
+      en: { label: "English", chapterSource: "embedded", sources: { aac: { 128: "book.m4b" } } },
+    },
+  }, { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
+  assert.equal(episode.languages.en.chapterSource, "embedded");
+  assert.equal(episode.languages.en.chapters, "");
+});
+
+test("normalizes cover source modes without changing legacy behavior", () => {
+  const context = { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" };
+  const base = { id: "book", defaultLanguage: "en", languages: { en: { sources: { aac: { 128: "book.m4b" } } } } };
+  assert.equal(normalizeEpisode({ ...base, cover: "cover.webp" }, context).coverSource, "file");
+  assert.equal(normalizeEpisode({ ...base, coverSource: "embedded" }, context).coverSource, "embedded");
+  assert.equal(normalizeEpisode(base, context).coverSource, "none");
 });
 
 test("supports legacy library collection aliases", () => {
   const library = normalizeLibrary({ defaultId: "two", episodes: [{ id: "one" }, { id: "two", path: "nested/two" }] });
   assert.equal(library.defaultId, "two");
   assert.equal(library.byId.get("two").folder, "nested/two");
+});
+
+test("accepts a minimal library index and defaults folders to IDs", () => {
+  const library = normalizeLibrary({ default: "one", audiofiles: [{ id: "one" }, { id: "two" }] });
+  assert.equal(library.defaultId, "one");
+  assert.equal(library.ui.onboardingEnabled, true);
+  assert.deepEqual(library.episodes.map(({ id, folder, title }) => ({ id, folder, title })), [
+    { id: "one", folder: "one", title: null },
+    { id: "two", folder: "two", title: null },
+  ]);
+});
+
+test("normalizes onboarding as a library-wide setting", () => {
+  assert.equal(normalizeLibrary({ ui: { onboardingEnabled: false }, audiofiles: [{ id: "one" }] }).ui.onboardingEnabled, false);
+  assert.equal(normalizeLibrary({ ui: { onboardingEnabled: true }, audiofiles: [{ id: "one" }] }).ui.onboardingEnabled, true);
 });
 
 test("rejects unsafe library traversal", () => {

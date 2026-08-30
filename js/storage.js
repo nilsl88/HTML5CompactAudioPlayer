@@ -19,6 +19,10 @@ function chapterCacheKey(episodeId, language, cacheVersion) {
   return `compactPlayer:chapters:${encodeURIComponent(String(episodeId))}:${encodeURIComponent(String(language))}:${encodeURIComponent(String(cacheVersion))}`;
 }
 
+function chapterDataKey(episodeId, language, cacheVersion, sourceKey) {
+  return `${chapterCacheKey(episodeId, language, cacheVersion)}:${encodeURIComponent(String(sourceKey || ""))}`;
+}
+
 export class PlayerStorage {
   constructor(storage) { this.storage = storage || null; }
 
@@ -94,10 +98,33 @@ export class PlayerStorage {
     try {
       for (let index = this.storage.length - 1; index >= 0; index -= 1) {
         const storedKey = this.storage.key(index);
-        if (storedKey?.startsWith(prefix) && storedKey !== key) this.storage.removeItem(storedKey);
+        const suffix = storedKey?.startsWith(prefix) ? storedKey.slice(prefix.length) : "";
+        if (suffix && !suffix.includes(":") && storedKey !== key) this.storage.removeItem(storedKey);
       }
     } catch {}
     return this.writeJson(key, { schemaVersion: SCHEMA_VERSION, timestamp: Date.now(), url: String(url || ""), text: value });
+  }
+
+  readChapterData(episodeId, language, cacheVersion, sourceKey) {
+    const raw = this.readJson(chapterDataKey(episodeId, language, cacheVersion, sourceKey));
+    if (raw.sourceKey !== String(sourceKey || "") || !["vtt", "embedded"].includes(raw.kind)) return null;
+    if (raw.kind === "vtt" && typeof raw.text === "string" && raw.text && raw.text.length <= MAX_CHAPTER_CACHE_LENGTH) return { kind: raw.kind, text: raw.text };
+    if (raw.kind === "embedded" && Array.isArray(raw.cues) && raw.cues.length <= 10000) {
+      const cues = raw.cues.filter((cue) => cue && Number.isFinite(cue.start) && cue.start >= 0 && (cue.end == null || (Number.isFinite(cue.end) && cue.end >= cue.start)) && typeof cue.title === "string" && cue.title.trim());
+      if (cues.length === raw.cues.length) return { kind: raw.kind, cues };
+    }
+    return null;
+  }
+
+  writeChapterData(episodeId, language, cacheVersion, sourceKey, data) {
+    const key = chapterDataKey(episodeId, language, cacheVersion, sourceKey);
+    if (!data || !["vtt", "embedded"].includes(data.kind)) return false;
+    const value = data.kind === "vtt"
+      ? { kind: data.kind, text: String(data.text || "") }
+      : { kind: data.kind, cues: Array.isArray(data.cues) ? data.cues : [] };
+    if (data.kind === "vtt" && (!value.text || value.text.length > MAX_CHAPTER_CACHE_LENGTH)) return false;
+    if (data.kind === "embedded" && (value.cues.length > 10000 || JSON.stringify(value.cues).length > MAX_CHAPTER_CACHE_LENGTH)) return false;
+    return this.writeJson(key, { schemaVersion: SCHEMA_VERSION, timestamp: Date.now(), sourceKey: String(sourceKey || ""), ...value });
   }
 
   readAvailability(episodeId, cacheVersion, ttlMs = 7 * 86400000) {

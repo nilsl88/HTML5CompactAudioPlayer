@@ -1,13 +1,14 @@
-import { UI_STRINGS } from "./i18n.js?v=4";
+import { UI_STRINGS } from "./i18n.js?v=6";
 import { scanSources } from "./js/availability.js";
-import { loadChapterFile, parseChapterText } from "./js/chapters.js";
+import { loadChapters, parseChapterText } from "./js/chapters.js";
 import { localizedValue, normalizeEpisode, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./js/dialogs.js";
 import { MediaController } from "./js/media-controller.js";
+import { loadEmbeddedMp4Cover } from "./js/mp4-chapters.js";
 import { OfflineDownloadError, OfflineManager, manifestMatchesSelection } from "./js/offline.js";
 import { buildSources, chooseDefaultSource, visibleSources } from "./js/source-selection.js";
 import { PlayerStorage } from "./js/storage.js";
-import { clearChildren, clamp, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
+import { clearChildren, clamp, createAbortError, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
 
 const els = Object.fromEntries([
   "player", "episodeTitle", "episodeMeta", "playPauseBtn", "playPauseIcon", "seek", "seekLabel", "timeCur", "timeDur",
@@ -41,6 +42,9 @@ const AVAILABILITY_IDLE_DELAY_MS = 1500;
 let uiPrefs = storage.readUi();
 let locale = resolveUiLocale(uiPrefs.uiLanguage);
 let library = normalizeLibrary(null);
+const episodeConfigCache = new Map();
+const episodeConfigRequests = new Map();
+let libraryTitlesPromise = null;
 let episode = null;
 let episodeId = "";
 let episodeConfigUrl = "";
@@ -51,6 +55,8 @@ let currentSource = null;
 let cues = [];
 let activeCueIndex = -1;
 let chapterUrl = "";
+let chapterMode = "none";
+let chapterSourceKey = "";
 let chaptersLoaded = false;
 let chaptersFailed = false;
 let chapterController = null;
@@ -69,10 +75,13 @@ let seekDragging = false;
 let uiBusy = false;
 let progressTimer = null;
 let lastProgressWrite = 0;
+let resetInProgress = false;
 let mediaMetadataTitle = "";
 let mediaMetadataChapter = "";
 let offlinePlaybackIntent = false;
 let coverGeneration = 0;
+let coverController = null;
+let coverObjectUrl = "";
 let trackObjectUrl = "";
 let sleepGeneration = 0;
 let sleepState = { mode: "off", minutes: 0, endAt: 0, chapterEnd: null, timeout: null, ticker: null, completing: false };
@@ -206,7 +215,7 @@ function currentOfflineSelection() {
     assets: [
       { url: libraryUrl, required: false },
       { url: episodeConfigUrl, required: true },
-      { url: resolveCover(episode), required: false },
+      { url: ["file", "auto"].includes(episode.coverSource) ? resolveCover(episode) : "", required: false },
       { url: chapterUrl, required: false },
     ].filter((asset) => {
       try { return asset.url && new URL(asset.url).origin === new URL(documentBaseUrl).origin; }
@@ -416,16 +425,18 @@ function updateTitle() {
 
 function clearCover() {
   coverGeneration += 1;
+  coverController?.abort();
+  coverController = null;
+  if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
+  coverObjectUrl = "";
   els.coverButton.hidden = true;
+  els.coverImg.onload = null;
+  els.coverImg.onerror = null;
   els.coverImg.removeAttribute("src");
   els.coverImg.alt = "";
 }
 
-function applyCover() {
-  clearCover();
-  const src = resolveCover(episode);
-  if (!src) return;
-  const generation = coverGeneration;
+function showCoverImage(src, generation, onFailure) {
   els.coverImg.onload = () => {
     if (generation !== coverGeneration) return;
     els.coverImg.alt = displayTitle();
@@ -435,12 +446,61 @@ function applyCover() {
     updateMediaSessionMetadata();
   };
   els.coverImg.onerror = () => {
-    if (generation === coverGeneration) {
-      clearCover();
-      showToast(t("coverLoadFailed"), "warning", 5000);
-    }
+    if (generation === coverGeneration) onFailure();
   };
   els.coverImg.src = src;
+}
+
+function embeddedCoverAudioSource() {
+  const isMp4 = (source) => source?.codec === "aac" || source?.mime?.startsWith("audio/mp4")
+    || ["m4a", "m4b", "mp4"].includes(source?.extension);
+  if (isMp4(currentSource)) return currentSource;
+  if (navigator.onLine === false) return null;
+  return (sourcesByLanguage.get(languageCode) || []).find(isMp4) || null;
+}
+
+function coverFailed(generation, error) {
+  if (generation !== coverGeneration) return;
+  if (error) reportError("embedded cover", error);
+  clearCover();
+  showToast(t("coverLoadFailed"), "warning", 5000, "cover-load");
+}
+
+async function applyEmbeddedCover(generation) {
+  const source = embeddedCoverAudioSource();
+  if (!source?.url) {
+    coverFailed(generation);
+    return;
+  }
+  const controller = new AbortController();
+  coverController = controller;
+  try {
+    const cover = await loadEmbeddedMp4Cover(source.url, { signal: controller.signal });
+    if (controller.signal.aborted || generation !== coverGeneration) return;
+    if (!cover) throw new Error("The M4A/M4B file does not contain supported cover artwork.");
+    coverObjectUrl = URL.createObjectURL(new Blob([cover.data], { type: cover.mime }));
+    showCoverImage(coverObjectUrl, generation, () => coverFailed(generation, new Error("The embedded cover image could not be decoded.")));
+  } catch (error) {
+    if (error?.name !== "AbortError") coverFailed(generation, error);
+  } finally {
+    if (coverController === controller) coverController = null;
+  }
+}
+
+function applyCover() {
+  clearCover();
+  const generation = coverGeneration;
+  const mode = episode?.coverSource || (episode?.cover ? "file" : "none");
+  if (mode === "none") return;
+  const configuredCover = resolveCover(episode);
+  if ((mode === "file" || mode === "auto") && configuredCover) {
+    showCoverImage(configuredCover, generation, () => {
+      if (mode === "auto") void applyEmbeddedCover(generation);
+      else coverFailed(generation);
+    });
+    return;
+  }
+  if (mode === "embedded" || mode === "auto") void applyEmbeddedCover(generation);
 }
 
 function applyCachedAvailability() {
@@ -543,6 +603,70 @@ async function loadLibrary(signal) {
 
 function episodeFolder(id) { return library.byId.get(id)?.folder || id; }
 
+function episodeConfigLocation(id) {
+  const folder = episodeFolder(id);
+  const encodedFolder = folder.split("/").map(encodeURIComponent).join("/");
+  const episodeBaseUrl = new URL(`media/${encodedFolder}/`, documentBaseUrl).href;
+  return { folder, episodeBaseUrl, configUrl: safeUrl("episode.json", episodeBaseUrl) };
+}
+
+function waitForEpisodeConfig(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(createAbortError());
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener("abort", abort); reject(createAbortError()); };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", abort); reject(error); },
+    );
+  });
+}
+
+function requestEpisodeConfig(id) {
+  if (episodeConfigCache.has(id)) return Promise.resolve(episodeConfigCache.get(id));
+  if (episodeConfigRequests.has(id)) return episodeConfigRequests.get(id);
+  const { folder, episodeBaseUrl, configUrl } = episodeConfigLocation(id);
+  const request = (async () => {
+    const response = await fetchWithRetry(configUrl, { cache: "default", credentials: "same-origin" });
+    if (!response.ok) throw new Error(`Could not load episode configuration (HTTP ${response.status}).`);
+    const raw = parseJson(await response.text(), `media/${folder}/episode.json`);
+    const loadedEpisode = normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl });
+    const result = { episode: loadedEpisode, configUrl };
+    episodeConfigCache.set(id, result);
+    const record = library.byId.get(id);
+    if (record) record.title = loadedEpisode.title;
+    return result;
+  })();
+  episodeConfigRequests.set(id, request);
+  void request.then(
+    () => episodeConfigRequests.delete(id),
+    () => episodeConfigRequests.delete(id),
+  );
+  return request;
+}
+
+async function loadLibraryTitles() {
+  if (libraryTitlesPromise || library.episodes.length <= 1 || navigator.onLine === false) return libraryTitlesPromise;
+  const records = library.episodes.filter((record) => !episodeConfigCache.has(record.id));
+  if (!records.length) { populateLibrarySelect(); return null; }
+  libraryTitlesPromise = (async () => {
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < records.length) {
+        const record = records[cursor]; cursor += 1;
+        try { await requestEpisodeConfig(record.id); }
+        catch (error) { if (error?.name !== "AbortError") reportError(`library title (${record.id})`, error); }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker()));
+    populateLibrarySelect();
+  })();
+  try { await libraryTitlesPromise; }
+  finally { libraryTitlesPromise = null; }
+  return null;
+}
+
 async function loadEpisode(id) {
   saveProgress(true);
   cancelSleep(true);
@@ -566,19 +690,13 @@ async function loadEpisode(id) {
   setMeta(t("loading"));
 
   try {
-    const folder = episodeFolder(id);
-    const encodedFolder = folder.split("/").map(encodeURIComponent).join("/");
-    const episodeBaseUrl = new URL(`media/${encodedFolder}/`, documentBaseUrl).href;
-    const configUrl = safeUrl("episode.json", episodeBaseUrl);
-    const response = await fetchWithRetry(configUrl, { cache: "no-store", credentials: "same-origin", signal: episodeController.signal });
-    if (!response.ok) throw new Error(`Could not load episode configuration (HTTP ${response.status}).`);
-    const raw = parseJson(await response.text(), `media/${folder}/episode.json`);
-    const loadedEpisode = normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl });
+    const loaded = await waitForEpisodeConfig(requestEpisodeConfig(id), episodeController.signal);
+    const loadedEpisode = loaded.episode;
     if (generation !== episodeGeneration) return;
 
     episode = loadedEpisode;
     episodeId = id;
-    episodeConfigUrl = configUrl;
+    episodeConfigUrl = loaded.configUrl;
     sourcesByLanguage = new Map(Object.values(episode.languages).map((language) => [language.code, buildSources(language, els.audio)]));
     if (new URL(location.href).searchParams.get("clearAvailCache") === "1") storage.clearAvailability(episode.id, episode.cacheVersion);
     applyCachedAvailability();
@@ -605,7 +723,10 @@ async function loadEpisode(id) {
     chapterLoadPromise = null;
     chapterLoadShouldNotify = false;
     scannedAvailabilityLanguages = new Set();
-    chapterUrl = resolveLanguageAsset(episode.languages[languageCode], episode.languages[languageCode].chapters);
+    const selectedLanguage = episode.languages[languageCode];
+    chapterMode = selectedLanguage.chapterSource || (selectedLanguage.chapters ? "vtt" : "none");
+    chapterUrl = resolveLanguageAsset(selectedLanguage, selectedLanguage.chapters);
+    chapterSourceKey = getChapterSourceKey(selected);
     media.setSelection(playbackSources(languageSources, selected), selected.id, storage.getProgress(episodeId, languageCode), false);
     media.setPlaybackRate(uiPrefs.playbackRate);
     media.setVolume(uiPrefs.volume);
@@ -644,18 +765,31 @@ function resetChapters() {
   clearChildren(els.chaptersList);
   if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
   els.chaptersTrack.removeAttribute("src");
-  chapterUrl = resolveLanguageAsset(episode.languages[languageCode], episode.languages[languageCode].chapters);
+  const language = episode?.languages?.[languageCode];
+  chapterMode = language?.chapterSource || (language?.chapters ? "vtt" : "none");
+  chapterUrl = resolveLanguageAsset(language, language?.chapters);
+  chapterSourceKey = getChapterSourceKey(currentSource);
   mediaMetadataChapter = "";
   updateMediaSessionMetadata();
   updateChapterButtons();
 }
 
-function applyChapterData(text, loaded) {
+function getChapterSourceKey(source = currentSource) {
+  if (chapterMode === "embedded") return `embedded:${source?.url || ""}`;
+  if (chapterMode === "auto") return `auto:${chapterUrl}|${source?.url || ""}`;
+  return chapterUrl;
+}
+
+function applyChapterData(text, loaded, kind = "vtt") {
   try {
     if (trackObjectUrl) URL.revokeObjectURL(trackObjectUrl);
-    trackObjectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
-    els.chaptersTrack.src = trackObjectUrl;
-    els.chaptersTrack.track.mode = "hidden";
+    trackObjectUrl = "";
+    els.chaptersTrack.removeAttribute("src");
+    if (kind === "vtt" && text) {
+      trackObjectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+      els.chaptersTrack.src = trackObjectUrl;
+      els.chaptersTrack.track.mode = "hidden";
+    }
   } catch (error) {
     reportError("native chapter track", error);
   }
@@ -669,7 +803,7 @@ function applyChapterData(text, loaded) {
 
 function ensureChapters({ force = false, notifyFailure = true, showLoading = !els.chaptersPanel.hidden } = {}) {
   if (chaptersLoaded && !chaptersFailed) return Promise.resolve(cues);
-  if (!chapterUrl) { chaptersLoaded = true; chaptersFailed = false; renderChapters(); return Promise.resolve(cues); }
+  if (chapterMode === "none" || (chapterMode === "vtt" && !chapterUrl)) { chaptersLoaded = true; chaptersFailed = false; renderChapters(); return Promise.resolve(cues); }
   if (chaptersFailed && !force) {
     if (showLoading) renderChapterFailure();
     return Promise.resolve(cues);
@@ -679,12 +813,18 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
     if (showLoading) renderPanelMessage(t("loadingChapters"));
     return chapterLoadPromise;
   }
+  const sourceKey = getChapterSourceKey(currentSource);
+  chapterSourceKey = sourceKey;
   if (!force) {
-    const cachedText = storage.readChapters(episode.id, languageCode, episode.cacheVersion, chapterUrl);
-    if (cachedText) {
-      const cached = parseChapterText(cachedText);
-      applyChapterData(cached.text, cached.cues);
+    const cachedData = storage.readChapterData?.(episode.id, languageCode, episode.cacheVersion, sourceKey);
+    if (cachedData) {
+      const cached = cachedData.kind === "vtt" ? parseChapterText(cachedData.text) : cachedData;
+      applyChapterData(cached.text || "", cached.cues, cachedData.kind);
       return Promise.resolve(cues);
+    }
+    if (["vtt", "auto"].includes(chapterMode)) {
+      const cachedText = storage.readChapters(episode.id, languageCode, episode.cacheVersion, chapterUrl);
+      if (cachedText) { const cached = parseChapterText(cachedText); applyChapterData(cached.text, cached.cues, "vtt"); return Promise.resolve(cues); }
     }
   }
   if (force) chapterController?.abort();
@@ -698,10 +838,11 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
   if (showLoading) renderPanelMessage(t("loadingChapters"));
   const promise = (async () => {
     try {
-      const { text, cues: loaded } = await loadChapterFile(requestUrl, { signal: controller.signal });
-      if (generation !== chapterGeneration || requestUrl !== chapterUrl) return cues;
-      storage.writeChapters(episode.id, languageCode, episode.cacheVersion, requestUrl, text);
-      applyChapterData(text, loaded);
+      const result = await loadChapters({ mode: chapterMode, vttUrl: requestUrl, sourceUrl: currentSource?.url, sourceMime: currentSource?.mime, signal: controller.signal });
+      if (generation !== chapterGeneration || requestUrl !== chapterUrl || sourceKey !== getChapterSourceKey(currentSource)) return cues;
+      storage.writeChapterData?.(episode.id, languageCode, episode.cacheVersion, sourceKey, result);
+      if (result.kind === "vtt") storage.writeChapters(episode.id, languageCode, episode.cacheVersion, requestUrl, result.text);
+      applyChapterData(result.text || "", result.cues, result.kind);
     } catch (error) {
       if (error?.name === "AbortError" || generation !== chapterGeneration) return cues;
       chaptersLoaded = false;
@@ -810,9 +951,31 @@ function markActiveChapter(position) {
 }
 
 function updateChapterButtons() {
-  const disabled = !chapterUrl || chaptersFailed || (chaptersLoaded && !cues.length);
+  const disabled = chapterMode === "none" || (chapterMode === "vtt" && !chapterUrl) || chaptersFailed || (chaptersLoaded && !cues.length);
   els.prevChapterBtn.disabled = disabled;
   els.nextChapterBtn.disabled = disabled;
+}
+
+function refreshEmbeddedChaptersForSource(source) {
+  if (!episode || !["embedded", "auto"].includes(chapterMode)) return;
+  const nextKey = getChapterSourceKey(source);
+  if (nextKey === chapterSourceKey && (chaptersLoaded || chapterLoadPromise)) return;
+  chapterController?.abort();
+  chapterController = null;
+  chapterLoadPromise = null;
+  chapterLoadShouldNotify = false;
+  chapterGeneration += 1;
+  chapterSourceKey = nextKey;
+  cues = [];
+  activeCueIndex = -1;
+  chaptersLoaded = false;
+  chaptersFailed = false;
+  clearChildren(els.chaptersList);
+  if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
+  els.chaptersTrack.removeAttribute("src");
+  updateMeta();
+  updateChapterButtons();
+  void ensureChapters({ notifyFailure: false, showLoading: false });
 }
 
 async function previousChapter() {
@@ -875,6 +1038,7 @@ const media = new MediaController(els.audio, {
     populateQualitySelect(source);
     updateMeta();
     renderOfflineUi();
+    refreshEmbeddedChaptersForSource(source);
   },
   onSourceSuccess: (source) => {
     if (!source) return;
@@ -907,7 +1071,7 @@ function scheduleProgress() {
 }
 
 function saveProgress(force = false) {
-  if (!episode) return;
+  if (!episode || resetInProgress) return;
   if (!force && Date.now() - lastProgressWrite < 4900) return;
   lastProgressWrite = Date.now();
   storage.setProgress(episodeId, languageCode, media.position());
@@ -1228,6 +1392,7 @@ async function changeQuality(nextId) {
   updateMeta();
   await media.setSelection(playbackSources(all, selected), selected.id, position, shouldPlay);
   renderOfflineUi();
+  refreshEmbeddedChaptersForSource(selected);
 }
 
 function updateMediaSessionMetadata() {
@@ -1294,6 +1459,7 @@ els.optionsBtn.addEventListener("click", () => {
   if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
   closeAllPanels(els.optionsPanel);
   openPanel(els.optionsPanel, els.optionsBtn, els.episodeRow.hidden ? els.langSelect : els.episodeSelect);
+  void loadLibraryTitles();
   requestAvailabilityScan(episodeGeneration, languageCode, true);
 });
 els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
@@ -1369,11 +1535,16 @@ els.onboardingOk.addEventListener("click", acceptOnboarding);
 els.resetBtn.addEventListener("click", () => openDialog(els.resetDialog, els.resetOk));
 els.resetCancel.addEventListener("click", () => closeDialog(els.resetDialog));
 els.resetOk.addEventListener("click", async () => {
+  if (resetInProgress) return;
+  resetInProgress = true;
   els.resetOk.disabled = true;
+  setText(els.resetOk, t("resetting"));
+  if (progressTimer) clearTimeout(progressTimer);
+  progressTimer = null;
+  media.destroy();
+  storage.reset();
   try { await offline.reset(); }
   catch (error) { reportError("offline reset", error); }
-  storage.reset();
-  media.destroy();
   location.reload();
 });
 
@@ -1425,7 +1596,7 @@ async function boot() {
   const initialId = downloadedId || queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
   try {
     await loadEpisode(initialId);
-    if (episode.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
+    if (library.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
   } catch (error) {
     setLoading(false);
     setMeta(t("errorLoading"), true);

@@ -19,6 +19,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
 - `js/availability.js`: abortable HTTP HEAD and Range availability probes.
 - `js/chapters.js`: cached chapter requests and WebVTT loading.
+- `js/mp4-chapters.js`: bounded Range-based MP4 chapter and cover-art parsing.
 - `js/storage.js`: guarded localStorage access, migrations, progress, preferences, chapter text, and availability cache.
 - `js/vtt.js`: safe WebVTT chapter parsing.
 - `js/dialogs.js`: panel and dialog focus behavior, Escape handling, and focus restoration.
@@ -64,11 +65,21 @@ All media operations must go through `MediaController`.
 
 Episode files live at `media/<folder>/episode.json`. Preserve these fields and aliases:
 
-- `id`, `defaultLanguage`, `title`, `cover`, `duration`, `cacheVersion`, `debug.showAllQualities`, and `ui.onboardingEnabled`.
-- `languages.<code>.label`, `basePath`, `chapters`, and `sources`.
+- `id`, `defaultLanguage`, `title`, `cover`, `coverSource`, `duration`, `cacheVersion`, and `debug.showAllQualities`.
+- `languages.<code>.label`, `basePath`, `chapterSource`, `chapters`, and `sources`.
 - Library collections named `audiofiles`, `episodes`, or `items`, plus existing `default`, `defaultId`, `folder`, `path`, and `label` aliases.
 
+Keep new `library.json` entries minimal: `id` is required and `folder` is needed only when it differs from the ID. Episode titles belong in `episode.json`. The player may still read legacy library titles as fallback labels.
+
+`library.ui.onboardingEnabled` controls the first-visit help dialog for the whole player and defaults to `true`. Do not read onboarding policy from individual episodes; the saved onboarding state is library-wide.
+
+Load the active episode configuration at startup. Load remaining library titles only after Options opens, limit title lookups to two concurrent requests, and reuse the normalized configurations from the in-memory cache. A failed background lookup must leave the ID fallback visible and must not affect playback.
+
 Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappings and relative URL behavior. Reject unsafe schemes and traversal without changing valid relative media paths.
+
+`chapterSource` is `vtt`, `embedded`, `auto`, or `none`. A legacy language with a non-empty `chapters` value and no mode normalizes to `vtt`. Embedded mode reads the active AAC/M4A/M4B source; auto mode tries WebVTT first and then embedded metadata.
+
+`coverSource` is `file`, `embedded`, `auto`, or `none`. A legacy episode with a non-empty `cover` value and no mode normalizes to `file`. Auto mode tries the configured cover before inspecting MP4 metadata. Embedded cover loading must remain asynchronous, abortable, limited to JPEG/PNG metadata no larger than 10 MB, and independent of audio-element loading. Revoke replaced Blob URLs.
 
 ## UI and accessibility
 
@@ -88,7 +99,11 @@ Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappin
 
 All `localStorage` access goes through `PlayerStorage`. `OfflineManager` owns Cache Storage media and manifests. Corrupt JSON, unavailable storage, quota errors, obsolete values, and private-browsing restrictions must degrade safely. Migrate old keys instead of discarding valid preferences.
 
+Reset must block progress writes before clearing storage. Cancel pending progress timers and stop media before deleting saved state so `pagehide`, visibility, or pause events cannot recreate progress during reload.
+
 Cached chapter text is keyed by episode, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same episode and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
+
+Embedded chapter cues use the same cache namespace with the active source URL included in the key. Validate cue timestamps and titles before using cached data. Embedded metadata parsing must use bounded Range requests, support QuickTime chapter tracks and Nero `chpl`, and never block audio playback.
 
 Availability probes are advisory. They must be abortable, must not download full media, and must never override a source that the media pipeline successfully plays. Do not probe every language or quality unnecessarily.
 
@@ -126,6 +141,10 @@ Use inline SVG or CSS for platform-independent icons. Avoid Unicode symbols for 
 For media changes, check first Play, Pause, resume, seek before metadata, quality/language/episode switching while paused and playing, codec fallback, rejected `play()`, offline recovery, and stale async results.
 
 For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/episode requests, current-title updates, and the no-chapter case.
+
+For embedded chapters, check QuickTime and Nero metadata, metadata near the end of a file, unsupported ranges, malformed atoms, UTF-8/UTF-16 titles, quality/source fallback changes, and playback continuing while parsing fails.
+
+For embedded covers, check JPEG and PNG metadata, missing or malformed `covr` atoms, external-file fallback, stale episode and language work, Blob URL cleanup, unsupported ranges, offline downloaded M4A/M4B files, and playback continuing while parsing fails.
 
 For offline changes, check unsupported browsers, invalid range servers, insufficient quota, complete download, cancellation, interrupted resume, offline reload, seeking near both ends, online reconnect, source replacement, cache-version mismatch, eviction, and reset cleanup.
 

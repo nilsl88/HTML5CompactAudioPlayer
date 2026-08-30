@@ -117,6 +117,26 @@ test("production HTML has no runtime dependencies", async () => {
   assert.match(html, /type="module"/);
 });
 
+test("library titles load lazily from cached episode configurations", async () => {
+  const source = await readFile(new URL("player.js", root), "utf8");
+  const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
+  assert.ok(library.audiofiles.every((item) => item.id && !item.title && !item.label));
+  assert.match(source, /const episodeConfigCache = new Map\(\);/);
+  assert.match(source, /Array\.from\(\{ length: Math\.min\(2, records\.length\) \}/);
+  assert.match(source, /openPanel\(els\.optionsPanel[\s\S]*?void loadLibraryTitles\(\);/);
+  assert.match(source, /record\.title = loadedEpisode\.title;/);
+});
+
+test("onboarding policy belongs to the library", async () => {
+  const source = await readFile(new URL("player.js", root), "utf8");
+  const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
+  const episode = JSON.parse(await readFile(new URL("media/episode-001/episode.json", root), "utf8"));
+  assert.equal(library.ui.onboardingEnabled, true);
+  assert.equal(Object.hasOwn(episode, "ui"), false);
+  assert.match(source, /library\.ui\.onboardingEnabled && !storage\.hasSeenOnboarding\(\)/);
+  assert.doesNotMatch(source, /episode\.ui\.onboardingEnabled/);
+});
+
 test("offline controls are semantic and media opts into service-worker handling", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   assert.match(html, /<section id="offlineRow"[^>]*aria-labelledby="offlineLabel"[^>]*hidden>/);
@@ -140,11 +160,11 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("player.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(html, /player\.css\?v=4/);
-  assert.match(html, /player\.js\?v=4/);
-  assert.match(source, /i18n\.js\?v=4/);
-  assert.match(worker, /const SHELL_VERSION = "v4"/);
-  for (const path of ["player.css?v=4", "player.js?v=4", "i18n.js?v=4", "js/offline.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
+  assert.match(html, /player\.css\?v=6/);
+  assert.match(html, /player\.js\?v=6/);
+  assert.match(source, /i18n\.js\?v=6/);
+  assert.match(worker, /const SHELL_VERSION = "v6"/);
+  for (const path of ["player.css?v=6", "player.js?v=6", "i18n.js?v=6", "js/offline.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
 });
 
 test("offline lifecycle is optional and reset clears downloaded media", async () => {
@@ -153,4 +173,6 @@ test("offline lifecycle is optional and reset clears downloaded media", async ()
   assert.match(source, /offline\.init\(\)/);
   assert.match(source, /await offline\.reset\(\)/);
   assert.match(source, /navigator\.onLine === false \? offline\.active\?\.episodeId/);
+  assert.match(source, /function saveProgress\(force = false\)\s*{\s*if \(!episode \|\| resetInProgress\) return;/);
+  assert.match(source, /resetInProgress = true;[\s\S]*?clearTimeout\(progressTimer\);[\s\S]*?media\.destroy\(\);[\s\S]*?storage\.reset\(\);[\s\S]*?await offline\.reset\(\);[\s\S]*?location\.reload\(\);/);
 });

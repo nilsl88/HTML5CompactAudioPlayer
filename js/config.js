@@ -3,8 +3,9 @@ import { normalizeLanguageTag, safeUrl } from "./utils.js";
 export const CODECS = ["opus", "aac", "mp3"];
 
 export function normalizeLibrary(raw) {
-  const library = { defaultId: "", episodes: [], byId: new Map() };
+  const library = { defaultId: "", episodes: [], byId: new Map(), ui: { onboardingEnabled: true } };
   if (!raw || typeof raw !== "object") return library;
+  library.ui.onboardingEnabled = raw.ui?.onboardingEnabled !== false;
   const items = Array.isArray(raw.audiofiles) ? raw.audiofiles
     : Array.isArray(raw.episodes) ? raw.episodes
       : Array.isArray(raw.items) ? raw.items : [];
@@ -67,6 +68,9 @@ export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
       label: String(value.label || rawCode),
       baseUrl: baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`,
       chapters: String(value.chapters || ""),
+      chapterSource: ["vtt", "embedded", "auto", "none"].includes(value.chapterSource)
+        ? value.chapterSource
+        : (String(value.chapters || "").trim() ? "vtt" : "none"),
       sources,
     };
   }
@@ -77,10 +81,12 @@ export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
     defaultLanguage: languages[defaultLanguage] ? defaultLanguage : Object.keys(languages)[0],
     title: raw.title && typeof raw.title === "object" ? { ...raw.title } : {},
     cover: String(raw.cover || ""),
+    coverSource: ["file", "embedded", "auto", "none"].includes(raw.coverSource)
+      ? raw.coverSource
+      : (String(raw.cover || "").trim() ? "file" : "none"),
     duration: Number.isFinite(raw.duration) && raw.duration > 0 ? raw.duration : 0,
     cacheVersion: raw.cacheVersion == null ? 1 : String(raw.cacheVersion),
     debug: { showAllQualities: Boolean(raw.debug?.showAllQualities) },
-    ui: { onboardingEnabled: raw.ui?.onboardingEnabled !== false },
     languages,
     episodeBaseUrl,
     documentBaseUrl,
