@@ -5,16 +5,18 @@
     "showAllQualities": false
   },
   "title": {
-    "en": "Episode 001",
-    "da": "Episode 001",
-    "nb": "Episode 001",
-    "sv": "Avsnitt 001"
+    "en": "Audiobook 1",
+    "da": "Lydbog 1",
+    "nb": "Lydbok 1",
+    "sv": "Ljudbok 1"
   },
+  "coverSource": "auto",
   "cover": "./episode-001.webp",
   "languages": {
     "en": {
       "label": "English",
       "basePath": "media/episode-001/en/",
+      "chapterSource": "vtt",
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
@@ -39,6 +41,7 @@
     "da": {
       "label": "Dansk",
       "basePath": "media/episode-001/da/",
+      "chapterSource": "vtt",
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
@@ -63,6 +66,7 @@
     "nb": {
       "label": "Norsk (Bokmål)",
       "basePath": "media/episode-001/nb/",
+      "chapterSource": "vtt",
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
@@ -87,6 +91,7 @@
     "sv": {
       "label": "Svenska",
       "basePath": "media/episode-001/sv/",
+      "chapterSource": "vtt",
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
@@ -108,9 +113,6 @@
         }
       }
     }
-  },
-  "ui": {
-    "onboardingEnabled": true
   },
   "cacheVersion": 1 
 }
