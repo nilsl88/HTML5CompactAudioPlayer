@@ -1,18 +1,19 @@
-const SHELL_VERSION = "v4";
+const SHELL_VERSION = "v6";
 const SHELL_CACHE = `compact-player-shell-${SHELL_VERSION}`;
 const META_CACHE = "compact-player-offline-meta-v1";
 const DOWNLOAD_HEADER = "x-compact-player-download";
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=4",
-  "./player.js?v=4",
-  "./i18n.js?v=4",
+  "./player.css?v=6",
+  "./player.js?v=6",
+  "./i18n.js?v=6",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/config.js",
   "./js/dialogs.js",
   "./js/media-controller.js",
+  "./js/mp4-chapters.js",
   "./js/offline.js",
   "./js/source-selection.js",
   "./js/storage.js",

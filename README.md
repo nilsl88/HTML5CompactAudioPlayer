@@ -14,13 +14,13 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 
 - Play and pause with lazy audio loading
 - Seek bar, current time, duration, and configurable skip buttons
-- Previous/next chapter, chapter selection, and current chapter display from WebVTT
+- Previous/next chapter, chapter selection, and current chapter display from WebVTT or embedded M4A/M4B metadata
 - Audio-language and quality selection
 - Opus, AAC/M4A, and MP3 sources
 - Deterministic runtime source fallback
 - Playback speed and supported programmatic volume control
 - Timed sleep and sleep at the end of a chapter
-- Cover image and full-size cover dialog
+- External or embedded M4A/M4B cover artwork and a full-size cover dialog
 - System, light, and dark themes with three text sizes
 - English, Danish, Norwegian Bokmål, and Swedish interface text
 - Optional audiobook selector through `media/library.json`
@@ -32,7 +32,7 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 
 Keyboard shortcuts outside focused controls are Space for play/pause, Left/Right Arrow for a five-second seek, Up Arrow for the configured skip forward, and Down Arrow for the configured skip backward. Escape closes open panels.
 
-The first-visit **How this player works** dialog explains playback, chapters, shortcuts, Options, sleep timer, saved progress, chapter caching, and offline downloads. It also lets the user choose the interface language and audio language before starting. Set `ui.onboardingEnabled` to `false` to disable it.
+The first-visit **How this player works** dialog explains playback, chapters, shortcuts, Options, sleep timer, saved progress, chapter caching, and offline downloads. It also lets the user choose the interface language and audio language before starting. Set `ui.onboardingEnabled` to `false` in `library.json` to disable it for the whole player.
 
 The player does not provide adaptive streaming, a playback queue, or transcript rendering.
 
@@ -58,10 +58,11 @@ sw.js                   Network-first app shell and offline ranged-audio respons
 i18n.js                 Interface strings
 js/
   availability.js       HEAD and Range availability probes
-  chapters.js           Cached chapter requests and WebVTT parsing
+  chapters.js           Chapter source selection and cached chapter loading
   config.js             Configuration validation and normalization
   dialogs.js            Dialog, panel, and focus behavior
   media-controller.js   Sole owner of audio source, seek, and play transitions
+  mp4-chapters.js       Bounded Range-based MP4 chapter and cover parser
   offline.js            Offline preflight, quota checks, chunk downloads, and manifests
   source-selection.js   MIME evidence, quality display, and fallback ordering
   storage.js            Safe preferences, progress, chapter, and availability persistence
@@ -87,10 +88,10 @@ Common optional fields:
 
 - `title`: localized title map
 - `cover`: path or HTTP(S) URL; image data URLs are also accepted
+- `coverSource`: `file`, `embedded`, `auto`, or `none`; existing configurations with `cover` default to `file`
 - `duration`: duration hint in seconds
 - `cacheVersion`: change this when audio or chapter files are updated, added, or removed
 - `debug.showAllQualities`: show all codec families and technical details
-- `ui.onboardingEnabled`: disable the first-visit help dialog when `false`
 
 Example:
 
@@ -102,19 +103,18 @@ Example:
     "en": "Episode 001",
     "da": "Episode 001"
   },
+  "coverSource": "auto",
   "cover": "./episode-001.webp",
   "duration": 3600,
   "cacheVersion": 1,
   "debug": {
     "showAllQualities": false
   },
-  "ui": {
-    "onboardingEnabled": true
-  },
   "languages": {
     "en": {
       "label": "English",
       "basePath": "media/episode-001/en/",
+      "chapterSource": "vtt",
       "chapters": "chapters.vtt",
       "sources": {
         "opus": {
@@ -139,7 +139,8 @@ Example:
 
 - `label`: visible language name
 - `basePath`: optional base for source and chapter paths; resolved from the site root
-- `chapters`: WebVTT file name or URL
+- `chapterSource`: `vtt`, `embedded`, `auto`, or `none`; defaults to `vtt` when `chapters` is present
+- `chapters`: WebVTT file name or URL; used by `vtt` and tried first by `auto`
 - `sources`: map of codec, bitrate, and file path
 
 Without `basePath`, source and chapter paths are resolved from the episode folder.
@@ -153,6 +154,19 @@ Supported codec keys are `opus`, `aac`, and `mp3`. MIME types are derived as fol
 
 Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schemes, and empty source maps are rejected during normalization without changing the documented schema.
 
+### Cover artwork
+
+`coverSource` controls where the player gets the episode cover:
+
+- `file` uses the configured `cover` value.
+- `embedded` reads artwork from an M4A, M4B, or MP4 audio source.
+- `auto` tries the configured cover first and uses embedded artwork only if that image is missing or cannot be decoded.
+- `none` hides the cover.
+
+If `coverSource` is omitted, a configuration with `cover` keeps the earlier `file` behavior. A configuration without `cover` defaults to `none`.
+
+Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. The server must support byte ranges and, for cross-origin audio, expose the required CORS headers. A downloaded M4A/M4B can supply its artwork while offline because the service worker supports byte ranges over the saved audio chunks.
+
 ## Optional library
 
 Add `media/library.json` to show an audiobook selector when more than one valid entry exists:
@@ -160,20 +174,23 @@ Add `media/library.json` to show an audiobook selector when more than one valid 
 ```json
 {
   "default": "episode-001",
+  "ui": {
+    "onboardingEnabled": true
+  },
   "audiofiles": [
-    {
-      "id": "episode-001",
-      "folder": "episode-001",
-      "title": {
-        "en": "Audiobook 1",
-        "da": "Lydbog 1"
-      }
-    }
+    { "id": "episode-001" },
+    { "id": "episode-002" }
   ]
 }
 ```
 
-The current `audiofiles` field remains the documented format. Older `episodes` and `items` collection names, plus `defaultId`, `path`, `label`, and related aliases, are still accepted.
+Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder` only when the directory name differs. Titles belong in each book's `episode.json` and are the source for both the player heading and library selector.
+
+`ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Episode-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
+
+The selected episode configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `episode.json` again. Until a title is available, the selector uses the entry ID. A failed optional title request does not prevent the current book from playing.
+
+Library-level `title` and `label` values remain accepted for backward compatibility and as initial fallback labels. Older `episodes` and `items` collection names, plus `defaultId`, `path`, and related aliases, are also accepted.
 
 Use `?episode=<id>` to select an episode. Query values not present in the library are restricted to safe single-folder identifiers.
 
@@ -269,6 +286,21 @@ Audio availability probes wait until chapter loading finishes and the browser is
 
 Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
 
+## Embedded M4A/M4B chapters
+
+Set a language's `chapterSource` to `embedded` to read QuickTime chapter tracks or Nero `chpl` metadata from the active M4A/M4B source. Use `auto` to try the configured WebVTT file first and fall back to embedded metadata. Embedded metadata is read with bounded HTTP Range requests, so the player does not fetch the complete audiobook just to find chapter markers.
+
+```json
+{
+  "chapterSource": "embedded",
+  "sources": {
+    "aac": { "128": "book.m4b" }
+  }
+}
+```
+
+Embedded chapters reload when the language, quality, or fallback source changes. The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. A parser failure leaves audio playback available and can be retried from the Chapters panel. Embedded cues are cached per episode, language, cache version, and source URL.
+
 ## Storage
 
 All storage access is guarded. Unavailable storage, malformed JSON, obsolete values, and quota errors cannot stop startup.
@@ -279,6 +311,7 @@ The player uses these storage keys and migrates their supported legacy forms:
 - `compactPlayer:ui`: theme, text size, player language, speed, volume, and skip interval
 - `compactPlayer:lastEpisode`: last library selection
 - `compactPlayer:chapters:<episode>:<language>:<cacheVersion>`: cached WebVTT chapter text
+- `compactPlayer:chapters:<episode>:<language>:<cacheVersion>:<source>`: cached VTT or embedded chapter data for a source
 - `compactAudioPlayer.onboardingShown.v1`: onboarding state
 - `cap_avail_*`: legacy availability cache
 
@@ -335,6 +368,7 @@ The tests cover:
 - Offline manifest validation, size preflight, complete download promotion, interruption and resume
 - Service-worker open-ended and suffix ranges, streamed `206` bodies, and network-first routing checks
 - Cached chapter requests, HTTP failures, and WebVTT parsing
+- Embedded QuickTime/Nero chapter parsing, Range metadata reads, source changes, and chapter cache separation
 - Source selection and fallback order
 - blocked playback and codec rejection
 - stale play Promise rejection after a newer source selection

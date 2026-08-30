@@ -91,6 +91,7 @@ export const UI_STRINGS = {
     resetBody: "This will clear your saved settings, playback position, cached file availability, chapters, and offline audiobook download from this device.\n\nSelect Reset to continue (the page will reload), or Cancel to keep everything as-is.",
   
     resetOk: "Reset",
+    resetting: "Resetting…",
   
     resetCancel: "Cancel",
     errorTitle: "Player error",
@@ -225,6 +226,7 @@ export const UI_STRINGS = {
     resetBody: "Dette rydder dine gemte indstillinger, afspilningsposition, cache for tilgængelige filer, kapitler og den hentede offline-lydbog fra denne enhed.\n\nVælg Nulstil for at fortsætte (siden genindlæses), eller Annuller for at beholde alt som det er.",
   
     resetOk: "Nulstil",
+    resetting: "Nulstiller…",
   
     resetCancel: "Annuller",
     errorTitle: "Afspillerfejl",
@@ -359,6 +361,7 @@ export const UI_STRINGS = {
     resetBody: "Dette sletter lagrede innstillinger, avspillingsposisjon, cache for tilgjengelige filer, kapitler og den nedlastede lydboken fra denne enheten.\n\nVelg Tilbakestill for å fortsette (siden lastes på nytt), eller Avbryt for å beholde alt som det er.",
   
     resetOk: "Tilbakestill",
+    resetting: "Tilbakestiller…",
   
     resetCancel: "Avbryt",
     errorTitle: "Avspillingsfeil",
@@ -493,6 +496,7 @@ export const UI_STRINGS = {
     resetBody: "Detta rensar dina sparade inställningar, uppspelningsposition, cache för tillgängliga filer, kapitel och den nedladdade ljudboken från den här enheten.\n\nVälj Återställ för att fortsätta (sidan laddas om), eller Avbryt för att behålla allt som det är.",
   
     resetOk: "Återställ",
+    resetting: "Återställer…",
   
     resetCancel: "Avbryt",
     errorTitle: "Spelarfel",

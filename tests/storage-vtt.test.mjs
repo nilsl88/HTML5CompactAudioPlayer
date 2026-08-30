@@ -60,6 +60,14 @@ test("chapter cache replaces obsolete versions and rejects corrupt values", () =
   assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
 });
 
+test("caches embedded chapter cues by active source", () => {
+  const storage = new PlayerStorage(new MemoryStorage());
+  const cues = [{ start: 0, end: 12, title: "Opening" }];
+  assert.equal(storage.writeChapterData("book", "en", 1, "embedded:https://example.test/book.m4b", { kind: "embedded", cues }), true);
+  assert.deepEqual(storage.readChapterData("book", "en", 1, "embedded:https://example.test/book.m4b"), { kind: "embedded", cues });
+  assert.equal(storage.readChapterData("book", "en", 1, "embedded:https://example.test/other.m4b"), null);
+});
+
 test("parses real-world WebVTT without retaining cue markup", () => {
   const cues = parseWebVtt(`WEBVTT\nKind: chapters\n\nintro\n00:00.000 --> 00:10.000 align:start\n<v Narrator>Intro &amp; setup</v>\n\nNOTE ignored\ntext\n\n00:10,000 --> 00:20,000\nSecond\nline\n\n00:bad --> 00:30.000\nInvalid`);
   assert.deepEqual(cues, [
