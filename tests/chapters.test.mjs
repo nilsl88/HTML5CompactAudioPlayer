@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
-import { loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
+import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));
@@ -95,6 +95,26 @@ test("reads Nero embedded chapters with one metadata range", async () => {
   ]);
 });
 
+test("finds MP4 metadata after a large media-data atom", async () => {
+  const metadata = neroMetadata();
+  const total = 17 * 1024 * 1024;
+  const moovStart = total - metadata.length;
+  const file = new Uint8Array(total);
+  const view = new DataView(file.buffer);
+  view.setUint32(0, moovStart, false);
+  file.set(new TextEncoder().encode("mdat"), 4);
+  file.set(metadata, moovStart);
+  const chapters = await loadEmbeddedMp4Chapters("https://example.test/large-book.m4b", { fetchImpl: rangedFetch(file, total) });
+  assert.equal(chapters.length, 2);
+  assert.equal(chapters[1].title, "Chapter 1");
+});
+
+test("decodes QuickTime chapter text without trailing format data", () => {
+  const title = new TextEncoder().encode("Opening Credits");
+  const sample = concatBytes(new Uint8Array([0, title.length]), title, new TextEncoder().encode("encd"), new Uint8Array([0, 0, 0, 1]));
+  assert.equal(decodeMp4ChapterTitle(sample), "Opening Credits");
+});
+
 test("reads JPEG cover artwork from MP4 metadata", async () => {
   const metadata = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]), 13);
   const cover = await loadEmbeddedMp4Cover("https://example.test/book.m4b", { fetchImpl: rangedFetch(metadata.file) });
@@ -107,6 +127,21 @@ test("reads PNG cover artwork from MP4 metadata", async () => {
   const cover = await loadEmbeddedMp4Cover("https://example.test/book.m4a", { fetchImpl: rangedFetch(metadata.file) });
   assert.equal(cover.mime, "image/png");
   assert.deepEqual(cover.data, metadata.image);
+});
+
+test("shares one MP4 metadata range between chapters and cover", async () => {
+  const cover = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
+  const file = atom("moov", concatBytes(neroMetadata().subarray(8), cover.file.subarray(8)));
+  let requests = 0;
+  const baseFetch = rangedFetch(file);
+  const fetchImpl = async (...args) => { requests += 1; return baseFetch(...args); };
+  const [chapters, artwork] = await Promise.all([
+    loadEmbeddedMp4Chapters("https://example.test/shared-book.m4b", { fetchImpl }),
+    loadEmbeddedMp4Cover("https://example.test/shared-book.m4b", { fetchImpl }),
+  ]);
+  assert.equal(chapters.length, 2);
+  assert.equal(artwork.mime, "image/jpeg");
+  assert.equal(requests, 1);
 });
 
 test("auto mode keeps usable WebVTT ahead of embedded metadata", async () => {
