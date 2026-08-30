@@ -81,6 +81,8 @@ Supported codec keys are `opus`, `aac`, and `mp3`. Keep the existing MIME mappin
 
 `coverSource` is `file`, `embedded`, `auto`, or `none`. A legacy episode with a non-empty `cover` value and no mode normalizes to `file`. Auto mode tries the configured cover before inspecting MP4 metadata. Embedded cover loading must remain asynchronous, abortable, limited to JPEG/PNG metadata no larger than 10 MB, and independent of audio-element loading. Revoke replaced Blob URLs.
 
+Chapter and cover parsing for the same MP4 source must share an in-flight `moov` request. Keep consumer cancellation independent, abort the network request when every consumer leaves, and retain successful metadata only briefly so large buffers do not accumulate across episode changes.
+
 ## UI and accessibility
 
 - Use native buttons, labels, fieldsets, outputs, sections, dialogs, and tracks. Do not use clickable `div`s or ARIA menu roles for ordinary panels.
@@ -103,7 +105,7 @@ Reset must block progress writes before clearing storage. Cancel pending progres
 
 Cached chapter text is keyed by episode, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same episode and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
 
-Embedded chapter cues use the same cache namespace with the active source URL included in the key. Validate cue timestamps and titles before using cached data. Embedded metadata parsing must use bounded Range requests, support QuickTime chapter tracks and Nero `chpl`, and never block audio playback.
+Embedded chapter cues use the same cache namespace with the active source URL included in the key. Validate cue timestamps and titles before using cached data. Embedded metadata parsing must use bounded Range requests, support QuickTime chapter tracks and Nero `chpl`, and never block audio playback. Traverse top-level atom headers and skip `mdat` by its declared size; a tail buffer can begin inside media data and must not be parsed as an atom boundary.
 
 Availability probes are advisory. They must be abortable, must not download full media, and must never override a source that the media pipeline successfully plays. Do not probe every language or quality unnecessarily.
 
@@ -142,9 +144,9 @@ For media changes, check first Play, Pause, resume, seek before metadata, qualit
 
 For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/episode requests, current-title updates, and the no-chapter case.
 
-For embedded chapters, check QuickTime and Nero metadata, metadata near the end of a file, unsupported ranges, malformed atoms, UTF-8/UTF-16 titles, quality/source fallback changes, and playback continuing while parsing fails.
+For embedded chapters, check QuickTime and Nero metadata, a `moov` atom after a large `mdat`, unsupported ranges, malformed atoms, declared title lengths with trailing format data, UTF-8/UTF-16 titles, quality/source fallback changes, and playback continuing while parsing fails.
 
-For embedded covers, check JPEG and PNG metadata, missing or malformed `covr` atoms, external-file fallback, stale episode and language work, Blob URL cleanup, unsupported ranges, offline downloaded M4A/M4B files, and playback continuing while parsing fails.
+For embedded covers, check JPEG and PNG metadata, missing or malformed `covr` atoms, external-file fallback, stale episode and language work, Blob URL cleanup, unsupported ranges, offline downloaded M4A/M4B files, shared `moov` requests with independent cancellation, and playback continuing while parsing fails.
 
 For offline changes, check unsupported browsers, invalid range servers, insufficient quota, complete download, cancellation, interrupted resume, offline reload, seeking near both ends, online reconnect, source replacement, cache-version mismatch, eviction, and reset cleanup.
 

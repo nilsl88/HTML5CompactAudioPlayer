@@ -165,7 +165,9 @@ Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schem
 
 If `coverSource` is omitted, a configuration with `cover` keeps the earlier `file` behavior. A configuration without `cover` defaults to `none`.
 
-Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. The server must support byte ranges and, for cross-origin audio, expose the required CORS headers. A downloaded M4A/M4B can supply its artwork while offline because the service worker supports byte ranges over the saved audio chunks.
+Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. When chapters and artwork come from the same file, both parsers share one `moov` request and keep the result in memory for 30 seconds. This avoids downloading large MP4 metadata twice during startup.
+
+The server must support byte ranges and, for cross-origin audio, expose the required CORS headers. A downloaded M4A/M4B can supply its artwork while offline because the service worker supports byte ranges over the saved audio chunks.
 
 ## Optional library
 
@@ -299,7 +301,9 @@ Set a language's `chapterSource` to `embedded` to read QuickTime chapter tracks 
 }
 ```
 
-Embedded chapters reload when the language, quality, or fallback source changes. The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. A parser failure leaves audio playback available and can be retried from the Chapters panel. Embedded cues are cached per episode, language, cache version, and source URL.
+Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. QuickTime text samples are trimmed to their declared title length so trailing format records do not appear in chapter names.
+
+The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. A parser failure leaves audio playback available and can be retried from the Chapters panel. Embedded cues are cached per episode, language, cache version, and source URL.
 
 ## Storage
 
@@ -368,7 +372,7 @@ The tests cover:
 - Offline manifest validation, size preflight, complete download promotion, interruption and resume
 - Service-worker open-ended and suffix ranges, streamed `206` bodies, and network-first routing checks
 - Cached chapter requests, HTTP failures, and WebVTT parsing
-- Embedded QuickTime/Nero chapter parsing, Range metadata reads, source changes, and chapter cache separation
+- Embedded QuickTime/Nero chapter parsing, large media-data atoms, title decoding, JPEG/PNG artwork, shared metadata requests, source changes, and chapter cache separation
 - Source selection and fallback order
 - blocked playback and codec rejection
 - stale play Promise rejection after a newer source selection

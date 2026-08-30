@@ -1,4 +1,4 @@
-import { UI_STRINGS } from "./i18n.js?v=6";
+import { UI_STRINGS } from "./i18n.js?v=8";
 import { scanSources } from "./js/availability.js";
 import { loadChapters, parseChapterText } from "./js/chapters.js";
 import { localizedValue, normalizeEpisode, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";

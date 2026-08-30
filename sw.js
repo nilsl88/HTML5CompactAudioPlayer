@@ -1,13 +1,13 @@
-const SHELL_VERSION = "v6";
+const SHELL_VERSION = "v8";
 const SHELL_CACHE = `compact-player-shell-${SHELL_VERSION}`;
 const META_CACHE = "compact-player-offline-meta-v1";
 const DOWNLOAD_HEADER = "x-compact-player-download";
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=6",
-  "./player.js?v=6",
-  "./i18n.js?v=6",
+  "./player.css?v=8",
+  "./player.js?v=8",
+  "./i18n.js?v=8",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/config.js",

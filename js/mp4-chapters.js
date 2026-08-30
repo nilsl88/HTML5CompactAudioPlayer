@@ -3,6 +3,8 @@ import { createAbortError, fetchWithRetry } from "./utils.js";
 export const MP4_METADATA_CHUNK_BYTES = 256 * 1024;
 export const MP4_METADATA_LIMIT_BYTES = 16 * 1024 * 1024;
 export const MP4_COVER_LIMIT_BYTES = 10 * 1024 * 1024;
+const MP4_METADATA_CACHE_MS = 30000;
+const metadataRequestsByFetch = new WeakMap();
 
 const CONTAINER_TYPES = new Set(["moov", "trak", "mdia", "minf", "stbl", "stsd", "edts", "dinf", "udta", "tref", "ilst", "meta"]);
 
@@ -107,12 +109,34 @@ class RangeReader {
   }
 }
 
-function decodeTitle(bytes) {
+async function findTopLevelAtom(reader, first, expectedType) {
+  let start = 0;
+  for (let count = 0; count < 1000 && start + 8 <= reader.total; count += 1) {
+    let bytes = start + 16 <= first.byteLength ? first.subarray(start, start + 16) : null;
+    if (!bytes) bytes = await reader.read(start, Math.min(reader.total, start + 16));
+    if (bytes.byteLength < 8) break;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let size = uint32(view, 0);
+    const type = atomType(bytes, 4);
+    let headerSize = 8;
+    if (size === 1) {
+      if (bytes.byteLength < 16) break;
+      size = uint64(view, 8);
+      headerSize = 16;
+    } else if (size === 0) size = reader.total - start;
+    if (!Number.isSafeInteger(size) || size < headerSize || start + size > reader.total) break;
+    if (type === expectedType) return { type, start, size, headerSize };
+    start += size;
+  }
+  return null;
+}
+
+export function decodeMp4ChapterTitle(bytes) {
   if (!bytes.length) return "";
   let value = bytes;
   if (value.length >= 2) {
     const declared = (value[0] << 8) | value[1];
-    if (declared === value.length - 2) value = value.subarray(2);
+    if (declared > 0 && declared <= value.length - 2) value = value.subarray(2, declared + 2);
   }
   let text;
   if (value.length >= 2 && ((value[0] === 0xfe && value[1] === 0xff) || (value[0] === 0xff && value[1] === 0xfe))) {
@@ -140,7 +164,7 @@ function parseNeroChapters(atom) {
       const titleLength = bytes[offset + 8];
       offset += 9;
       if (!Number.isSafeInteger(startTicks) || offset + titleLength > bytes.length) { chapters.length = 0; break; }
-      const title = decodeTitle(bytes.subarray(offset, offset + titleLength)) || `Chapter ${index + 1}`;
+      const title = decodeMp4ChapterTitle(bytes.subarray(offset, offset + titleLength)) || `Chapter ${index + 1}`;
       chapters.push({ start: startTicks / 10000000, end: null, title });
       offset += titleLength;
     }
@@ -231,28 +255,76 @@ function normalizeChapters(chapters) {
   return unique.map((chapter, index) => ({ start: chapter.start, end: Number.isFinite(chapter.end) && chapter.end >= chapter.start ? chapter.end : (unique[index + 1]?.start ?? null), title: chapter.title }));
 }
 
-async function loadMp4Metadata(url, options = {}) {
+async function readMp4Metadata(url, options = {}) {
   const reader = new RangeReader(url, options);
   const firstEnd = Math.min(MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES);
   const first = await reader.read(0, firstEnd);
-  let top = parseBoxes(first.buffer);
-  let moov = top.find((atom) => atom.type === "moov");
-  if (!moov) {
-    if (!reader.total) throw new Error("The MP4 file size is unknown.");
-    for (let windowSize = MP4_METADATA_CHUNK_BYTES; windowSize <= MP4_METADATA_LIMIT_BYTES && !moov; windowSize *= 2) {
-      const tailStart = Math.max(0, reader.total - windowSize);
-      const tail = await reader.read(tailStart, reader.total);
-      top = parseBoxes(tail.buffer, tailStart);
-      moov = top.find((atom) => atom.type === "moov");
-      if (tailStart === 0) break;
-    }
-  }
+  if (!reader.total) throw new Error("The MP4 file size is unknown.");
+  const moov = await findTopLevelAtom(reader, first, "moov");
   if (!moov) throw new Error("The MP4 metadata box was not found.");
   let moovBytes;
-  if (moov.start === 0 && moov.size <= first.byteLength) moovBytes = first.subarray(moov.start, moov.start + moov.size);
+  if (moov.start + moov.size <= first.byteLength) moovBytes = first.subarray(moov.start, moov.start + moov.size);
   else moovBytes = await reader.read(moov.start, moov.start + moov.size);
   const moovBuffer = moovBytes.buffer.slice(moovBytes.byteOffset, moovBytes.byteOffset + moovBytes.byteLength);
-  return { reader, moovBuffer };
+  return moovBuffer;
+}
+
+function metadataRequestMap(fetchImpl) {
+  let requests = metadataRequestsByFetch.get(fetchImpl);
+  if (!requests) {
+    requests = new Map();
+    metadataRequestsByFetch.set(fetchImpl, requests);
+  }
+  return requests;
+}
+
+function consumeMetadataRequest(entry, requests, key, signal) {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  entry.consumers += 1;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const finish = (callback, value) => {
+      if (finished) return;
+      finished = true;
+      signal?.removeEventListener("abort", abort);
+      entry.consumers -= 1;
+      if (!entry.settled && entry.consumers === 0) {
+        entry.controller.abort();
+        if (requests.get(key) === entry) requests.delete(key);
+      }
+      callback(value);
+    };
+    const abort = () => finish(reject, createAbortError());
+    signal?.addEventListener("abort", abort, { once: true });
+    entry.promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
+  });
+}
+
+function loadMp4Metadata(url, options = {}) {
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== "function") return Promise.reject(new Error("Fetch is unavailable."));
+  const requests = metadataRequestMap(fetchImpl);
+  const key = `${String(url)}|${Number(options.timeoutMs) || 20000}`;
+  let entry = requests.get(key);
+  if (!entry) {
+    const controller = new AbortController();
+    entry = { controller, consumers: 0, settled: false, promise: null };
+    entry.promise = readMp4Metadata(url, { ...options, fetchImpl, signal: controller.signal }).then(
+      (value) => {
+        entry.settled = true;
+        const timer = setTimeout(() => { if (requests.get(key) === entry) requests.delete(key); }, MP4_METADATA_CACHE_MS);
+        timer?.unref?.();
+        return value;
+      },
+      (error) => {
+        entry.settled = true;
+        if (requests.get(key) === entry) requests.delete(key);
+        throw error;
+      },
+    );
+    requests.set(key, entry);
+  }
+  return consumeMetadataRequest(entry, requests, key, options.signal);
 }
 
 function embeddedCoverMime(bytes) {
@@ -263,7 +335,7 @@ function embeddedCoverMime(bytes) {
 }
 
 export async function loadEmbeddedMp4Cover(url, options = {}) {
-  const { moovBuffer } = await loadMp4Metadata(url, options);
+  const moovBuffer = await loadMp4Metadata(url, options);
   for (const cover of findAtoms(moovBuffer, "covr")) {
     const dataAtoms = parseBoxes(payload(cover)).filter((atom) => atom.type === "data" && !atom.truncated);
     for (const dataAtom of dataAtoms) {
@@ -278,7 +350,7 @@ export async function loadEmbeddedMp4Cover(url, options = {}) {
 }
 
 export async function loadEmbeddedMp4Chapters(url, options = {}) {
-  const { reader, moovBuffer } = await loadMp4Metadata(url, options);
+  const moovBuffer = await loadMp4Metadata(url, options);
   const nero = findAtoms(moovBuffer, "chpl");
   const neroChapters = nero.flatMap(parseNeroChapters);
   if (neroChapters.length) return normalizeChapters(neroChapters);
@@ -289,10 +361,11 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
   if (!chapterTrack) return [];
   const samples = parseChapterTrack(chapterTrack);
   if (!samples?.length) return [];
+  const reader = new RangeReader(url, options);
   const chapters = [];
   for (const sample of samples) {
     const bytes = await reader.read(sample.offset, sample.offset + sample.size);
-    chapters.push({ start: sample.start, end: null, title: decodeTitle(bytes) });
+    chapters.push({ start: sample.start, end: null, title: decodeMp4ChapterTitle(bytes) });
   }
   return normalizeChapters(chapters);
 }
