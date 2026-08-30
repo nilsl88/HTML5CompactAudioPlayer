@@ -25,6 +25,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/dialogs.js`: panel and dialog focus behavior, Escape handling, and focus restoration.
 - `js/utils.js`: shared formatting, URL checks, abort errors, and fetch retries.
 - `media/`: example library, episode JSON, cover image, and chapter files.
+- `skills/create-audiobook/SKILL.md`: workflow for encoding new books and generating compatible configuration.
 - `tests/`: dependency-free Node test files.
 
 ## Development commands
@@ -48,6 +49,10 @@ git diff --check
 ```
 
 Do not claim physical iPhone, iPad, or Android testing unless it was actually performed.
+
+## Creating new audiobooks
+
+Use `skills/create-audiobook/SKILL.md` when a user asks to add a book from source audio. It creates 64, 96, 128, and 256 kbps Opus WebM, AAC/M4A, and MP3 variants, then writes a compatible `episode.json` and minimal `library.json` entry. It supports embedded or WebVTT chapters and embedded or external cover art. Require `ffmpeg` and `ffprobe`, keep source files unchanged, validate every output, and never overwrite an existing episode directory without confirmation. Do not commit or push unless the user explicitly asks.
 
 ## Audio architecture
 

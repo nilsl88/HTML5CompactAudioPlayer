@@ -48,6 +48,18 @@ Open `http://localhost:8080/`.
 
 The example configuration references audio files that are not committed to this repository. Add the configured files under `media/episode-001/<language>/` to test playback.
 
+## Create a new audiobook
+
+The project includes the `create-audiobook` skill at `skills/create-audiobook/SKILL.md`. Use it when adding a new book from an M4A, M4B, or other audio source. A prompt such as `Use create-audiobook. Here is my audiobook: /path/book.m4b` guides the encoder through:
+
+- four Opus WebM, AAC/M4A, and MP3 variants at 64, 96, 128, and 256 kbps
+- embedded or WebVTT chapter selection
+- embedded or external cover-art selection
+- a compatible `episode.json` and minimal `library.json` entry
+- output and configuration validation with `ffprobe` and Node.js
+
+The skill requires `ffmpeg` and `ffprobe`. It keeps the input file unchanged and does not commit or push generated files unless requested.
+
 ## Project structure
 
 ```text
@@ -70,6 +82,7 @@ js/
   vtt.js                WebVTT chapter parser
 tests/                  Node built-in tests; no test packages required
 media/                  Library, episode, cover, and chapter data
+skills/create-audiobook/ Prompt workflow for encoding a book and generating episode.json
 ```
 
 `player.js` coordinates the modules but does not assign `audio.src`, call `audio.load()`, seek the element, or call `audio.play()` directly. Those operations belong to `media-controller.js` so source changes follow one path.
