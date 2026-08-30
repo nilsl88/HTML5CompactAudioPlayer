@@ -149,7 +149,7 @@ Supported codec keys are `opus`, `aac`, and `mp3`. MIME types are derived as fol
 
 - WebM Opus: `audio/webm; codecs="opus"`
 - Ogg Opus: `audio/ogg; codecs="opus"`
-- AAC/M4A: `audio/mp4; codecs="mp4a.40.2"`
+- AAC/M4A/M4B: AAC-LC (`audio/mp4; codecs="mp4a.40.2"`), HE-AAC v1 (`mp4a.40.5`), and HE-AAC v2 (`mp4a.40.29`), with a generic `audio/mp4` fallback
 - MP3: `audio/mpeg`
 
 Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schemes, and empty source maps are rejected during normalization without changing the documented schema.
@@ -214,7 +214,7 @@ The parser accepts cue identifiers, cue settings, multiline titles, comma or per
 
 ## Source selection and fallback
 
-`canPlayType()` provides initial evidence, not a guarantee. There are no iOS-version codec rules.
+`canPlayType()` provides initial evidence, not a guarantee. AAC sources are tested against AAC-LC, HE-AAC v1, HE-AAC v2, and generic MP4 audio MIME hints. Runtime decoding remains the final authority, and there are no iOS-version codec rules.
 
 The initial codec preference is:
 
