@@ -49,16 +49,16 @@
         <button id="skipForwardBtn" class="skip-button" type="button" aria-label="Skip forward 15 seconds"><span aria-hidden="true">+15</span></button>
         <button id="nextChapterBtn" class="icon-button" type="button" aria-label="Next chapter" disabled><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M18 5h2v14h-2zM5 5v14l12-7z"></path></svg></button>
         <button id="sleepBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="sleepPanel"><span aria-hidden="true">☾</span><span class="sr-only">Sleep timer</span></button>
-        <button id="optionsBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="optionsPanel"><svg class="control-icon control-icon-stroke" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3m0 14v3M2 12h3m14 0h3M4.93 4.93l2.12 2.12m9.9 9.9 2.12 2.12m0-14.14-2.12 2.12m-9.9 9.9-2.12 2.12"></path></svg><span class="sr-only">Options</span></button>
+        <button id="optionsBtn" class="icon-button" type="button" aria-expanded="false" aria-controls="optionsPanel"><svg class="control-icon control-icon-stroke" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></svg><span class="sr-only">Options</span></button>
       </fieldset>
 
       <section id="chaptersPanel" class="popup-panel" aria-labelledby="chaptersTitle" hidden>
-        <header class="panel-header"><h2 id="chaptersTitle" class="panel-title">Chapters</h2><button id="closeChaptersBtn" class="icon-button" type="button" aria-label="Close chapters"><span aria-hidden="true">×</span></button></header>
+        <header class="panel-header"><h2 id="chaptersTitle" class="panel-title">Chapters</h2><button id="closeChaptersBtn" class="icon-button panel-close" type="button" aria-label="Close chapters"><span aria-hidden="true">×</span></button></header>
         <div id="chaptersList" class="panel-list"></div>
       </section>
 
       <section id="sleepPanel" class="popup-panel" aria-labelledby="sleepTitle" hidden>
-        <header class="panel-header"><h2 id="sleepTitle" class="panel-title">Sleep timer</h2><button id="closeSleepBtn" class="icon-button" type="button" aria-label="Close"><span aria-hidden="true">×</span></button></header>
+        <header class="panel-header"><h2 id="sleepTitle" class="panel-title">Sleep timer</h2><button id="closeSleepBtn" class="icon-button panel-close" type="button" aria-label="Close"><span aria-hidden="true">×</span></button></header>
         <div id="sleepList" class="panel-list"></div>
       </section>
 
