@@ -52,6 +52,7 @@ button { color: inherit; }
 .play-button, .icon-button, .skip-button { display: inline-flex; min-width: var(--control-size); min-height: var(--control-size); align-items: center; justify-content: center; border: 1px solid var(--border); cursor: pointer; }
 .play-button { width: var(--control-size); height: var(--control-size); padding: 0; border-radius: 50%; background: var(--text); color: var(--background); font-size: 1.125rem; }
 .icon-button, .skip-button { padding: var(--space-2); border-radius: var(--radius-sm); background: transparent; }
+.panel-close { border-color: var(--text); background: var(--text); color: var(--background); }
 .control-icon { display: block; width: 1.25rem; height: 1.25rem; fill: currentColor; }
 .control-icon-stroke { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .skip-button { min-width: 3.75rem; font-weight: 700; }
@@ -91,8 +92,8 @@ button { color: inherit; }
 @media (hover: hover) and (pointer: fine) {
   .panel-header [data-tooltip]:hover::after, .modal-header [data-tooltip]:hover::after, .dialog-close[data-tooltip]:hover::after { transform: translateY(0); }
 }
-button:hover:not(:disabled) { background-color: color-mix(in srgb, var(--accent) 12%, transparent); }
-.play-button:hover:not(:disabled) { background-color: color-mix(in srgb, var(--text) 86%, var(--accent)); }
+button:hover:not(:disabled) { background-color: color-mix(in srgb, var(--text) 12%, transparent); }
+.play-button:hover:not(:disabled), .primary-button:hover:not(:disabled), .panel-close:hover:not(:disabled) { background-color: color-mix(in srgb, var(--text) 82%, var(--surface-raised)); }
 button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity: .55; }
 .icon-button.is-active { background: color-mix(in srgb, var(--accent) 16%, transparent); }
 .progress-block { display: grid; min-width: 0; gap: var(--space-1); }
@@ -194,6 +195,6 @@ dialog::backdrop { background: rgb(0 0 0 / 65%); }
 }
 @media (forced-colors: active) {
   :root { --border: CanvasText; --focus: Highlight; }
-  .play-button, .primary-button { forced-color-adjust: none; background: ButtonText; color: ButtonFace; }
+  .play-button, .primary-button, .panel-close { forced-color-adjust: none; background: ButtonText; color: ButtonFace; }
   .chapter-button[aria-current="true"], .sleep-option[aria-pressed="true"] { outline: 2px solid Highlight; }
 }
