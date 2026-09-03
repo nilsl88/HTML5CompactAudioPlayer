@@ -47,10 +47,24 @@ test("visual notifications are centered inside the player", async () => {
   assert.match(rule, /width:\s*min\(26rem,\s*calc\(100% - 2rem\)\)/);
 });
 
-test("options uses a platform-independent icon", async () => {
+test("options uses a platform-independent gear icon", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
-  assert.match(html, /<button id="optionsBtn"[^>]*>\s*<svg class="control-icon control-icon-stroke"[^>]*aria-hidden="true"[^>]*focusable="false"/);
-  assert.doesNotMatch(html, /⚙/u);
+  const button = html.match(/<button id="optionsBtn"[^>]*>[\s\S]*?<\/button>/)?.[0] || "";
+  assert.match(button, /<svg class="control-icon control-icon-stroke"[^>]*aria-hidden="true"[^>]*focusable="false"/);
+  assert.match(button, /<path d="[^"]+z"><\/path><circle cx="12" cy="12" r="3"><\/circle>/);
+  assert.doesNotMatch(button, /⚙/u);
+});
+
+test("popup close buttons use inverse theme colors", async () => {
+  const html = await readFile(new URL("index.html", root), "utf8");
+  const css = await readFile(new URL("player.css", root), "utf8");
+  for (const id of ["closeChaptersBtn", "closeSleepBtn"]) {
+    assert.match(html, new RegExp(`<button id="${id}" class="icon-button panel-close"`));
+  }
+  const rule = css.match(/\.panel-close\s*{([^}]*)}/)?.[1] || "";
+  assert.match(rule, /background:\s*var\(--text\)/);
+  assert.match(rule, /color:\s*var\(--background\)/);
+  assert.match(rule, /border-color:\s*var\(--text\)/);
 });
 
 test("control tooltips support mouse and keyboard users", async () => {
@@ -91,6 +105,17 @@ test("cover hover uses theme-neutral colors", async () => {
   assert.match(rule, /var\(--text\)/);
   assert.match(rule, /var\(--surface-raised\)/);
   assert.doesNotMatch(rule, /var\(--accent\)/);
+});
+
+test("button hover uses neutral gray colors", async () => {
+  const css = await readFile(new URL("player.css", root), "utf8");
+  const standardRule = css.match(/(?:^|\n)button:hover:not\(:disabled\)\s*{([^}]*)}/)?.[1] || "";
+  const inverseRule = css.match(/\.play-button:hover:not\(:disabled\)[^{]+{([^}]*)}/)?.[1] || "";
+  assert.match(standardRule, /var\(--text\)/);
+  assert.doesNotMatch(standardRule, /var\(--accent\)/);
+  assert.match(inverseRule, /var\(--text\)/);
+  assert.match(inverseRule, /var\(--surface-raised\)/);
+  assert.doesNotMatch(inverseRule, /var\(--accent\)/);
 });
 
 test("reset player action is centered and styled as a control", async () => {
