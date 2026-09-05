@@ -1,13 +1,13 @@
 ---
 name: create-audiobook
-description: Create a new static-site audiobook entry from one or more audio files, including Opus, AAC/M4A, MP3 bitrate variants and a compatible episode.json.
+description: Create audiobook configuration from existing audio or encode requested variants for Compact Audio Player. Write book.json and compatible library entries.
 ---
 
 # Create an audiobook
 
-Use this skill when the user provides an audiobook file (or a set of language files) and asks to add it to this player. The result is a self-contained `media/<episode-id>/` directory and a minimal entry in `media/library.json`.
+Use this skill when the user provides an audiobook file (or a set of language files) and asks to add it to this player. The result is a self-contained `media/<book-id>/` directory and a minimal entry in `media/library.json`.
 
-## Before encoding
+## Inspect the request and source
 
 Read the project `AGENTS.md`, then inspect the available tools:
 
@@ -18,20 +18,22 @@ ffprobe -version
 
 Confirm or infer these values from the user’s prompt and file metadata:
 
-- a safe episode ID (lowercase letters, numbers, and hyphens)
+- a safe book ID (lowercase letters, numbers, and hyphens)
 - display title and audio language code/label
 - each input file when more than one language is supplied
-- output directory (normally `media/<episode-id>/<language>/`)
+- output directory (normally `media/<book-id>/<language>/`)
 - whether chapters should use embedded metadata, a supplied WebVTT file, or none
 - whether the cover should use embedded artwork, an external image, or none
 
-Ask only for values that cannot be safely inferred. Never overwrite an existing episode directory or source file without explicit confirmation.
+Ask only for values that cannot be safely inferred. Never overwrite an existing book directory or source file without explicit confirmation.
 
-Use `ffprobe` before encoding to check the audio stream, duration, chapters, attached artwork, and language tags. Treat metadata and titles as untrusted display text.
+For configuration-only requests, inspect the supplied folder and write only the requested configuration. When asked to reuse original audio, reference the existing playable files without re-encoding, merging, renaming, or generating extra variants. Do not modify the library unless adding a book to it is part of the request.
+
+Use `ffprobe` before writing configuration or encoding to check the audio stream, duration, chapters, attached artwork, and language tags. Treat metadata and titles as untrusted display text.
 
 ## Generate the variants
 
-Keep the input untouched. For every language input, create these four bitrates unless the user explicitly requests a smaller set:
+Skip this section for configuration-only or original-audio requests. Otherwise keep the input untouched and create these four bitrates for every language unless the user requests a smaller set:
 
 - Opus WebM: `audio-64k.webm`, `audio-96k.webm`, `audio-128k.webm`, `audio-256k.webm`
 - AAC in M4A: `audio-64k.m4a`, `audio-96k.m4a`, `audio-128k.m4a`, `audio-256k.m4a`
@@ -55,20 +57,22 @@ ffmpeg -i "$INPUT" -map 0:a:0 -map_metadata 0 -map_chapters 0 \
 
 If the input has no attached picture, omit `-map 0:v?`, `-c:v`, and `-disposition:v`. Do not invent chapter text. If the source has chapters but the target browser needs a WebVTT fallback, export or use the user-supplied `.vtt` and set `chapterSource` to `vtt`.
 
-## Write episode.json
+## Write book.json
 
-Create `media/<episode-id>/episode.json` using the existing schema. Keep source paths relative to the language directory:
+Create `media/<folder>/book.json` using the existing schema. Keep each book's configuration separate from the library catalog. Use the actual folder and filenames, not assumed names. If audio and chapters are beside `book.json`, omit `basePath` to resolve them relative to that folder; an explicit `basePath` remains relative to the player page.
+
+For encoded variants in a language subdirectory:
 
 ```json
 {
-  "id": "episode-id",
+  "id": "book-id",
   "defaultLanguage": "en",
   "title": { "en": "Book title" },
   "coverSource": "embedded",
   "languages": {
     "en": {
       "label": "English",
-      "basePath": "media/episode-id/en/",
+      "basePath": "media/book-id/en/",
       "chapterSource": "embedded",
       "sources": {
         "opus": { "64": "audio-64k.webm", "96": "audio-96k.webm", "128": "audio-128k.webm", "256": "audio-256k.webm" },
@@ -83,19 +87,23 @@ Create `media/<episode-id>/episode.json` using the existing schema. Keep source 
 
 Use `chapterSource: "vtt"` with a `chapters` filename when WebVTT is selected. Use `chapterSource: "none"` when no chapters exist. Use `coverSource: "file"` plus a safe relative `cover` path for an external image; use `"embedded"` only when artwork is present in the MP4/M4A/M4B source. `auto` is acceptable when both paths should be tried.
 
-For multiple languages, add one language object per input and keep the same episode ID. Do not duplicate title data in `library.json`; add only this entry if it is not already present:
+For multiple languages, add one language object per input and keep the same book ID. When adding the book to the library, use a `books` array in new catalogs. In an existing catalog, update its current supported collection (`books`, `audiofiles`, `episodes`, or `items`) without losing entries or library-wide settings. Never add a competing collection alongside the existing one.
+
+Do not duplicate book titles in `library.json`. Add this minimal entry only when absent:
 
 ```json
-{ "id": "episode-id" }
+{ "id": "book-id" }
 ```
+
+Add `folder` only when the directory differs from the ID. The player accepts legacy `episode.json`, but new work should use `book.json`. Renaming an existing configuration is a separate migration: deploy the compatible player first, preserve its ID, media paths, and `cacheVersion`, and avoid leaving divergent configurations under both filenames.
 
 ## Validate the result
 
-Check every generated file and configuration before reporting success:
+Check every generated file and configuration before reporting success. Substitute the actual selected source below, including the original M4B for requests without encoding:
 
 ```bash
-ffprobe -v error -show_streams -show_chapters "media/<episode-id>/<language>/audio-128k.m4a"
-node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log("valid JSON")' media/<episode-id>/episode.json
+ffprobe -v error -show_streams -show_chapters "media/<book-id>/<language>/audio-128k.m4a"
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log("valid JSON")' media/<book-id>/book.json
 ```
 
-Verify that each configured URL exists, AAC outputs are served as `audio/mp4`, and the episode remains compatible with the player’s embedded chapter/cover parser. Run the project test commands from `AGENTS.md` when code or shared configuration changes. Do not commit or push unless the user explicitly asks.
+Verify that each configured URL exists, AAC outputs are served as `audio/mp4`, and the book remains compatible with the player’s embedded chapter/cover parser. Run the project test commands from `AGENTS.md` when code or shared configuration changes. Do not commit or push unless the user explicitly asks.

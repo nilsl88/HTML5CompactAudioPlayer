@@ -142,24 +142,24 @@ test("production HTML has no runtime dependencies", async () => {
   assert.match(html, /type="module"/);
 });
 
-test("library titles load lazily from cached episode configurations", async () => {
+test("library titles are requested only from Options", async () => {
   const source = await readFile(new URL("player.js", root), "utf8");
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
-  assert.ok(library.audiofiles.every((item) => item.id && !item.title && !item.label));
-  assert.match(source, /const episodeConfigCache = new Map\(\);/);
-  assert.match(source, /Array\.from\(\{ length: Math\.min\(2, records\.length\) \}/);
+  assert.ok(library.books.every((item) => item.id && !item.title && !item.label));
+  assert.match(source, /bookConfigs = new BookConfigStore\(\{ library, documentBaseUrl \}\)/);
+  assert.match(source, /await bookConfigs\.loadTitles\(/);
   assert.match(source, /openPanel\(els\.optionsPanel[\s\S]*?void loadLibraryTitles\(\);/);
-  assert.match(source, /record\.title = loadedEpisode\.title;/);
+  assert.equal((source.match(/void loadLibraryTitles\(\)/g) || []).length, 1);
 });
 
 test("onboarding policy belongs to the library", async () => {
   const source = await readFile(new URL("player.js", root), "utf8");
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
-  const episode = JSON.parse(await readFile(new URL("media/episode-001/episode.json", root), "utf8"));
+  const book = JSON.parse(await readFile(new URL("media/episode-001/book.json", root), "utf8"));
   assert.equal(library.ui.onboardingEnabled, true);
-  assert.equal(Object.hasOwn(episode, "ui"), false);
+  assert.equal(Object.hasOwn(book, "ui"), false);
   assert.match(source, /library\.ui\.onboardingEnabled && !storage\.hasSeenOnboarding\(\)/);
-  assert.doesNotMatch(source, /episode\.ui\.onboardingEnabled/);
+  assert.doesNotMatch(source, /book\.ui\.onboardingEnabled/);
 });
 
 test("offline controls are semantic and media opts into service-worker handling", async () => {
@@ -185,11 +185,11 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("player.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(html, /player\.css\?v=8/);
-  assert.match(html, /player\.js\?v=8/);
-  assert.match(source, /i18n\.js\?v=8/);
-  assert.match(worker, /const SHELL_VERSION = "v8"/);
-  for (const path of ["player.css?v=8", "player.js?v=8", "i18n.js?v=8", "js/offline.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
+  assert.match(html, /player\.css\?v=9/);
+  assert.match(html, /player\.js\?v=9/);
+  assert.match(source, /i18n\.js\?v=9/);
+  assert.match(worker, /const SHELL_VERSION = "v9"/);
+  for (const path of ["player.css?v=9", "player.js?v=9", "i18n.js?v=9", "js/book-config.js", "js/offline.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
 });
 
 test("offline lifecycle is optional and reset clears downloaded media", async () => {
@@ -198,6 +198,6 @@ test("offline lifecycle is optional and reset clears downloaded media", async ()
   assert.match(source, /offline\.init\(\)/);
   assert.match(source, /await offline\.reset\(\)/);
   assert.match(source, /navigator\.onLine === false \? offline\.active\?\.episodeId/);
-  assert.match(source, /function saveProgress\(force = false\)\s*{\s*if \(!episode \|\| resetInProgress\) return;/);
+  assert.match(source, /function saveProgress\(force = false\)\s*{\s*if \(!book \|\| resetInProgress\) return;/);
   assert.match(source, /resetInProgress = true;[\s\S]*?clearTimeout\(progressTimer\);[\s\S]*?media\.destroy\(\);[\s\S]*?storage\.reset\(\);[\s\S]*?await offline\.reset\(\);[\s\S]*?location\.reload\(\);/);
 });

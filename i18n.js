@@ -95,7 +95,7 @@ export const UI_STRINGS = {
   
     resetCancel: "Cancel",
     errorTitle: "Player error",
-    errorLoading: "Error loading episode.",
+    errorLoading: "Error loading book.",
     audioLoadError: "Error: Could not load audio.",
     audioFallbackCompatible: "Switched to a compatible audio format.",
     noChaptersFound: "No chapters found",
@@ -230,7 +230,7 @@ export const UI_STRINGS = {
   
     resetCancel: "Annuller",
     errorTitle: "Afspillerfejl",
-    errorLoading: "Kunne ikke indlæse episoden.",
+    errorLoading: "Kunne ikke indlæse bogen.",
     audioLoadError: "Fejl: Kunne ikke indlæse lyd.",
     audioFallbackCompatible: "Skiftede til et kompatibelt lydformat.",
     noChaptersFound: "Ingen kapitler fundet",
@@ -365,7 +365,7 @@ export const UI_STRINGS = {
   
     resetCancel: "Avbryt",
     errorTitle: "Avspillingsfeil",
-    errorLoading: "Kunne ikke laste episoden.",
+    errorLoading: "Kunne ikke laste boken.",
     audioLoadError: "Feil: Kunne ikke laste inn lyd.",
     audioFallbackCompatible: "Byttet til et kompatibelt lydformat.",
     noChaptersFound: "Ingen kapitler funnet",
@@ -500,7 +500,7 @@ export const UI_STRINGS = {
   
     resetCancel: "Avbryt",
     errorTitle: "Spelarfel",
-    errorLoading: "Kunde inte ladda avsnittet.",
+    errorLoading: "Kunde inte ladda boken.",
     audioLoadError: "Fel: Kunde inte ladda ljud.",
     audioFallbackCompatible: "Bytte till ett kompatibelt ljudformat.",
     noChaptersFound: "Inga kapitel hittades",

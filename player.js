@@ -1,21 +1,22 @@
-import { UI_STRINGS } from "./i18n.js?v=8";
+import { UI_STRINGS } from "./i18n.js?v=9";
+import { BookConfigStore, queryBookId } from "./js/book-config.js";
 import { scanSources } from "./js/availability.js";
 import { loadChapters, parseChapterText } from "./js/chapters.js";
-import { localizedValue, normalizeEpisode, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
+import { localizedValue, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./js/dialogs.js";
 import { MediaController } from "./js/media-controller.js";
 import { loadEmbeddedMp4Cover } from "./js/mp4-chapters.js";
 import { OfflineDownloadError, OfflineManager, manifestMatchesSelection } from "./js/offline.js";
 import { buildSources, chooseDefaultSource, visibleSources } from "./js/source-selection.js";
 import { PlayerStorage } from "./js/storage.js";
-import { clearChildren, clamp, createAbortError, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
+import { clearChildren, clamp, fetchWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
 
 const els = Object.fromEntries([
-  "player", "episodeTitle", "episodeMeta", "playPauseBtn", "playPauseIcon", "seek", "seekLabel", "timeCur", "timeDur",
+  "player", "bookTitle", "bookMeta", "playPauseBtn", "playPauseIcon", "seek", "seekLabel", "timeCur", "timeDur",
   "coverButton", "coverImg", "chaptersBtn", "prevChapterBtn", "skipBackBtn", "skipForwardBtn", "nextChapterBtn",
   "sleepBtn", "optionsBtn", "chaptersPanel", "chaptersTitle", "closeChaptersBtn", "chaptersList", "sleepPanel",
-  "sleepTitle", "closeSleepBtn", "sleepList", "optionsPanel", "audioSettingsLegend", "appearanceLegend", "episodeRow",
-  "episodeSelect", "langSelect", "qualitySelect", "offlineRow", "offlineLabel", "offlineStatus", "offlineProgress",
+  "sleepTitle", "closeSleepBtn", "sleepList", "optionsPanel", "audioSettingsLegend", "appearanceLegend", "bookRow",
+  "bookSelect", "langSelect", "qualitySelect", "offlineRow", "offlineLabel", "offlineStatus", "offlineProgress",
   "offlineDownloadBtn", "offlineCancelBtn", "offlineRemoveBtn", "volumeRow", "volumeRange", "volumeValue", "speedRange", "speedValue",
   "skipSelect", "themeSelect", "fontSizeSelect", "uiLangSelect", "resetBtn", "audio", "chaptersTrack", "toastHost",
   "statusAnnouncer", "coverDialog", "coverDialogTitle", "closeCoverBtn", "coverDialogImg", "onboardingDialog",
@@ -42,12 +43,10 @@ const AVAILABILITY_IDLE_DELAY_MS = 1500;
 let uiPrefs = storage.readUi();
 let locale = resolveUiLocale(uiPrefs.uiLanguage);
 let library = normalizeLibrary(null);
-const episodeConfigCache = new Map();
-const episodeConfigRequests = new Map();
-let libraryTitlesPromise = null;
-let episode = null;
-let episodeId = "";
-let episodeConfigUrl = "";
+let bookConfigs = null;
+let book = null;
+let bookId = "";
+let bookConfigUrl = "";
 let languageCode = "";
 let sourcesByLanguage = new Map();
 let selectedSourceId = "";
@@ -62,13 +61,13 @@ let chaptersFailed = false;
 let chapterController = null;
 let chapterLoadPromise = null;
 let chapterLoadShouldNotify = false;
-let episodeController = null;
+let bookController = null;
 let probeController = null;
 let probeLanguageCode = "";
 let probeScheduleHandle = null;
 let probeScheduleUsesIdleCallback = false;
 let scannedAvailabilityLanguages = new Set();
-let episodeGeneration = 0;
+let bookGeneration = 0;
 let chapterGeneration = 0;
 let durationUnlocked = false;
 let seekDragging = false;
@@ -155,7 +154,7 @@ function setLoading(loading) {
   document.body.classList.toggle("is-loading", loading);
   els.player.classList.toggle("is-loading", loading);
   els.player.setAttribute("aria-busy", String(loading));
-  els.playPauseBtn.disabled = loading || !episode;
+  els.playPauseBtn.disabled = loading || !book;
 }
 
 function setBusy(busy) {
@@ -166,18 +165,18 @@ function setBusy(busy) {
 
 function updateSelectionControlState() {
   const offlineLocked = navigator.onLine === false;
-  els.episodeSelect.disabled = uiBusy || offlineLocked;
+  els.bookSelect.disabled = uiBusy || offlineLocked;
   els.langSelect.disabled = uiBusy || offlineLocked;
-  els.qualitySelect.disabled = uiBusy || offlineLocked || (episode ? qualityOptionsForCurrentLanguage().length <= 1 : true);
+  els.qualitySelect.disabled = uiBusy || offlineLocked || (book ? qualityOptionsForCurrentLanguage().length <= 1 : true);
 }
 
 function setMeta(message, error = false) {
-  setText(els.episodeMeta, message);
-  els.episodeMeta.classList.toggle("is-error", error);
+  setText(els.bookMeta, message);
+  els.bookMeta.classList.toggle("is-error", error);
 }
 
 function displayTitle() {
-  return localizedValue(episode?.title, languageCode, episode?.id || t("audio"));
+  return localizedValue(book?.title, languageCode, book?.id || t("audio"));
 }
 
 function sourceLabel(source, includeDetails = true) {
@@ -198,12 +197,12 @@ function formatBytes(value) {
 }
 
 function currentOfflineSelection() {
-  if (!episode || !episodeConfigUrl) return null;
-  const language = episode.languages[languageCode];
+  if (!book || !bookConfigUrl) return null;
+  const language = book.languages[languageCode];
   const source = currentSource || sourcesByLanguage.get(languageCode)?.find((item) => item.id === selectedSourceId);
   if (!language || !source?.url) return null;
   return {
-    episodeId,
+    episodeId: bookId,
     episodeTitle: displayTitle(),
     languageCode,
     languageLabel: language.label || languageCode,
@@ -211,11 +210,11 @@ function currentOfflineSelection() {
     sourceLabel: sourceLabel(source, true),
     sourceUrl: source.url,
     mime: source.mime,
-    cacheVersion: episode.cacheVersion,
+    cacheVersion: book.cacheVersion,
     assets: [
       { url: libraryUrl, required: false },
-      { url: episodeConfigUrl, required: true },
-      { url: ["file", "auto"].includes(episode.coverSource) ? resolveCover(episode) : "", required: false },
+      { url: bookConfigUrl, required: true },
+      { url: ["file", "auto"].includes(book.coverSource) ? resolveCover(book) : "", required: false },
       { url: chapterUrl, required: false },
     ].filter((asset) => {
       try { return asset.url && new URL(asset.url).origin === new URL(documentBaseUrl).origin; }
@@ -243,7 +242,7 @@ function selectionFromManifest(manifest) {
 function playbackSources(all, selected) {
   if (navigator.onLine !== false) return all;
   const cached = offline.active;
-  if (cached?.episodeId === episodeId && cached.languageCode === languageCode && cached.sourceId === selected?.id && cached.sourceUrl === selected?.url) return [selected];
+  if (cached?.episodeId === bookId && cached.languageCode === languageCode && cached.sourceId === selected?.id && cached.sourceUrl === selected?.url) return [selected];
   return selected ? [selected] : [];
 }
 
@@ -367,7 +366,7 @@ async function downloadOfflineSelection() {
 }
 
 function updateMeta() {
-  const language = episode?.languages?.[languageCode];
+  const language = book?.languages?.[languageCode];
   const source = currentSource || sourcesByLanguage.get(languageCode)?.find((item) => item.id === selectedSourceId);
   const chapterTitle = cues[activeCueIndex]?.title || "";
   setMeta([language?.label || languageCode, sourceLabel(source, false), chapterTitle].filter(Boolean).join(" • "));
@@ -393,17 +392,17 @@ function optionsFrom(select, records, selected, label) {
 }
 
 function populateLibrarySelect() {
-  optionsFrom(els.episodeSelect, library.episodes.map((item) => ({ ...item, value: item.id })), episodeId, (item) => localizedValue(item.title, locale, item.label || item.id));
-  els.episodeRow.hidden = library.episodes.length <= 1;
+  optionsFrom(els.bookSelect, library.books.map((item) => ({ ...item, value: item.id })), bookId, (item) => localizedValue(item.title, locale, item.label || item.id));
+  els.bookRow.hidden = library.books.length <= 1;
 }
 
 function populateLanguageSelect() {
-  optionsFrom(els.langSelect, Object.values(episode.languages).map((language) => ({ value: language.code, label: language.label })), languageCode, (item) => item.label);
+  optionsFrom(els.langSelect, Object.values(book.languages).map((language) => ({ value: language.code, label: language.label })), languageCode, (item) => item.label);
 }
 
 function qualityOptionsForCurrentLanguage(forceSource = null) {
   const all = sourcesByLanguage.get(languageCode) || [];
-  const visible = visibleSources(all, episode.debug.showAllQualities);
+  const visible = visibleSources(all, book.debug.showAllQualities);
   const forced = forceSource || all.find((source) => source.id === selectedSourceId);
   if (forced && !visible.some((source) => source.id === forced.id)) visible.unshift(forced);
   return visible;
@@ -411,13 +410,13 @@ function qualityOptionsForCurrentLanguage(forceSource = null) {
 
 function populateQualitySelect(forceSource = null) {
   const visible = qualityOptionsForCurrentLanguage(forceSource);
-  optionsFrom(els.qualitySelect, visible.map((source) => ({ ...source, value: source.id })), forceSource?.id || selectedSourceId, (source) => episode.debug.showAllQualities ? sourceLabel(source, true) : sourceLabel(source, false));
+  optionsFrom(els.qualitySelect, visible.map((source) => ({ ...source, value: source.id })), forceSource?.id || selectedSourceId, (source) => book.debug.showAllQualities ? sourceLabel(source, true) : sourceLabel(source, false));
   els.qualitySelect.disabled = uiBusy || navigator.onLine === false || visible.length <= 1;
 }
 
 function updateTitle() {
   const title = displayTitle();
-  setText(els.episodeTitle, title);
+  setText(els.bookTitle, title);
   document.title = title || "Compact Audio Player";
   mediaMetadataTitle = title;
   updateMediaSessionMetadata();
@@ -490,9 +489,9 @@ async function applyEmbeddedCover(generation) {
 function applyCover() {
   clearCover();
   const generation = coverGeneration;
-  const mode = episode?.coverSource || (episode?.cover ? "file" : "none");
+  const mode = book?.coverSource || (book?.cover ? "file" : "none");
   if (mode === "none") return;
-  const configuredCover = resolveCover(episode);
+  const configuredCover = resolveCover(book);
   if ((mode === "file" || mode === "auto") && configuredCover) {
     showCoverImage(configuredCover, generation, () => {
       if (mode === "auto") void applyEmbeddedCover(generation);
@@ -504,7 +503,7 @@ function applyCover() {
 }
 
 function applyCachedAvailability() {
-  const cached = storage.readAvailability(episode.id, episode.cacheVersion);
+  const cached = storage.readAvailability(book.id, book.cacheVersion);
   for (const [code, sources] of sourcesByLanguage) {
     for (const source of sources) {
       const value = cached[code]?.[source.id];
@@ -518,7 +517,7 @@ function applyCachedAvailability() {
 function persistAvailability() {
   const byLanguage = {};
   for (const [code, sources] of sourcesByLanguage) byLanguage[code] = Object.fromEntries(sources.map((source) => [source.id, source.availability]));
-  storage.writeAvailability(episode.id, episode.cacheVersion, byLanguage);
+  storage.writeAvailability(book.id, book.cacheVersion, byLanguage);
 }
 
 function cancelScheduledAvailabilityScan() {
@@ -538,26 +537,26 @@ function cancelAvailabilityWork() {
 
 function startAvailabilityScan(generation, code = languageCode) {
   cancelScheduledAvailabilityScan();
-  if (generation !== episodeGeneration || code !== languageCode || navigator.onLine === false || scannedAvailabilityLanguages.has(code)) return;
+  if (generation !== bookGeneration || code !== languageCode || navigator.onLine === false || scannedAvailabilityLanguages.has(code)) return;
   if (probeController && probeLanguageCode === code && !probeController.signal.aborted) return;
   probeController?.abort();
   const controller = new AbortController();
   probeController = controller;
   probeLanguageCode = code;
   void (async () => {
-    if (generation !== episodeGeneration || controller.signal.aborted) return;
+    if (generation !== bookGeneration || controller.signal.aborted) return;
     const sources = sourcesByLanguage.get(code) || [];
     try {
       await scanSources(sources, {
         signal: controller.signal,
         concurrency: 3,
         onResult: () => {
-          if (generation !== episodeGeneration) return;
+          if (generation !== bookGeneration) return;
           persistAvailability();
           if (code === languageCode) populateQualitySelect(currentSource);
         },
       });
-      if (generation === episodeGeneration && !controller.signal.aborted) scannedAvailabilityLanguages.add(code);
+      if (generation === bookGeneration && !controller.signal.aborted) scannedAvailabilityLanguages.add(code);
     } catch (error) {
       if (error?.name !== "AbortError") reportError("availability scan", error);
     } finally {
@@ -571,7 +570,7 @@ function startAvailabilityScan(generation, code = languageCode) {
 
 function scheduleAvailabilityScan(generation, code = languageCode, immediate = false) {
   cancelScheduledAvailabilityScan();
-  if (generation !== episodeGeneration || code !== languageCode || scannedAvailabilityLanguages.has(code)) return;
+  if (generation !== bookGeneration || code !== languageCode || scannedAvailabilityLanguages.has(code)) return;
   const run = () => {
     probeScheduleHandle = null;
     probeScheduleUsesIdleCallback = false;
@@ -601,76 +600,16 @@ async function loadLibrary(signal) {
   }
 }
 
-function episodeFolder(id) { return library.byId.get(id)?.folder || id; }
-
-function episodeConfigLocation(id) {
-  const folder = episodeFolder(id);
-  const encodedFolder = folder.split("/").map(encodeURIComponent).join("/");
-  const episodeBaseUrl = new URL(`media/${encodedFolder}/`, documentBaseUrl).href;
-  return { folder, episodeBaseUrl, configUrl: safeUrl("episode.json", episodeBaseUrl) };
-}
-
-function waitForEpisodeConfig(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(createAbortError());
-  return new Promise((resolve, reject) => {
-    const abort = () => { signal.removeEventListener("abort", abort); reject(createAbortError()); };
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
-      (error) => { signal.removeEventListener("abort", abort); reject(error); },
-    );
-  });
-}
-
-function requestEpisodeConfig(id) {
-  if (episodeConfigCache.has(id)) return Promise.resolve(episodeConfigCache.get(id));
-  if (episodeConfigRequests.has(id)) return episodeConfigRequests.get(id);
-  const { folder, episodeBaseUrl, configUrl } = episodeConfigLocation(id);
-  const request = (async () => {
-    const response = await fetchWithRetry(configUrl, { cache: "default", credentials: "same-origin" });
-    if (!response.ok) throw new Error(`Could not load episode configuration (HTTP ${response.status}).`);
-    const raw = parseJson(await response.text(), `media/${folder}/episode.json`);
-    const loadedEpisode = normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl });
-    const result = { episode: loadedEpisode, configUrl };
-    episodeConfigCache.set(id, result);
-    const record = library.byId.get(id);
-    if (record) record.title = loadedEpisode.title;
-    return result;
-  })();
-  episodeConfigRequests.set(id, request);
-  void request.then(
-    () => episodeConfigRequests.delete(id),
-    () => episodeConfigRequests.delete(id),
-  );
-  return request;
-}
-
 async function loadLibraryTitles() {
-  if (libraryTitlesPromise || library.episodes.length <= 1 || navigator.onLine === false) return libraryTitlesPromise;
-  const records = library.episodes.filter((record) => !episodeConfigCache.has(record.id));
-  if (!records.length) { populateLibrarySelect(); return null; }
-  libraryTitlesPromise = (async () => {
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < records.length) {
-        const record = records[cursor]; cursor += 1;
-        try { await requestEpisodeConfig(record.id); }
-        catch (error) { if (error?.name !== "AbortError") reportError(`library title (${record.id})`, error); }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker()));
-    populateLibrarySelect();
-  })();
-  try { await libraryTitlesPromise; }
-  finally { libraryTitlesPromise = null; }
-  return null;
+  if (library.books.length <= 1 || navigator.onLine === false) return;
+  await bookConfigs.loadTitles((id, error) => reportError(`library title (${id})`, error));
+  populateLibrarySelect();
 }
 
-async function loadEpisode(id) {
+async function loadBook(id) {
   saveProgress(true);
   cancelSleep(true);
-  episodeController?.abort();
+  bookController?.abort();
   chapterController?.abort();
   chapterController = null;
   chapterLoadPromise = null;
@@ -680,33 +619,33 @@ async function loadEpisode(id) {
   cancelAvailabilityWork();
   if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
   els.chaptersTrack.removeAttribute("src");
-  episodeController = new AbortController();
-  const generation = ++episodeGeneration;
+  bookController = new AbortController();
+  const generation = ++bookGeneration;
   setLoading(true);
   setBusy(true);
   clearCover();
-  episodeConfigUrl = "";
-  setText(els.episodeTitle, t("audio"));
+  bookConfigUrl = "";
+  setText(els.bookTitle, t("audio"));
   setMeta(t("loading"));
 
   try {
-    const loaded = await waitForEpisodeConfig(requestEpisodeConfig(id), episodeController.signal);
-    const loadedEpisode = loaded.episode;
-    if (generation !== episodeGeneration) return;
+    const loaded = await bookConfigs.load(id, { signal: bookController.signal });
+    const loadedBook = loaded.book;
+    if (generation !== bookGeneration) return;
 
-    episode = loadedEpisode;
-    episodeId = id;
-    episodeConfigUrl = loaded.configUrl;
-    sourcesByLanguage = new Map(Object.values(episode.languages).map((language) => [language.code, buildSources(language, els.audio)]));
-    if (new URL(location.href).searchParams.get("clearAvailCache") === "1") storage.clearAvailability(episode.id, episode.cacheVersion);
+    book = loadedBook;
+    bookId = id;
+    bookConfigUrl = loaded.configUrl;
+    sourcesByLanguage = new Map(Object.values(book.languages).map((language) => [language.code, buildSources(language, els.audio)]));
+    if (new URL(location.href).searchParams.get("clearAvailCache") === "1") storage.clearAvailability(book.id, book.cacheVersion);
     applyCachedAvailability();
-    const prefs = storage.readEpisode(episodeId);
-    const codes = Object.keys(episode.languages);
+    const prefs = storage.readBook(bookId);
+    const codes = Object.keys(book.languages);
     const downloaded = navigator.onLine === false && offline.active?.episodeId === id
-      && String(offline.active.cacheVersion) === String(episode.cacheVersion) ? offline.active : null;
+      && String(offline.active.cacheVersion) === String(book.cacheVersion) ? offline.active : null;
     languageCode = downloaded && codes.includes(downloaded.languageCode)
       ? downloaded.languageCode
-      : codes.includes(prefs.language) ? prefs.language : guessLanguage(codes, episode.defaultLanguage);
+      : codes.includes(prefs.language) ? prefs.language : guessLanguage(codes, book.defaultLanguage);
     const languageSources = sourcesByLanguage.get(languageCode);
     let selected = downloaded
       ? languageSources.find((source) => source.id === downloaded.sourceId && source.url === downloaded.sourceUrl)
@@ -723,11 +662,11 @@ async function loadEpisode(id) {
     chapterLoadPromise = null;
     chapterLoadShouldNotify = false;
     scannedAvailabilityLanguages = new Set();
-    const selectedLanguage = episode.languages[languageCode];
+    const selectedLanguage = book.languages[languageCode];
     chapterMode = selectedLanguage.chapterSource || (selectedLanguage.chapters ? "vtt" : "none");
     chapterUrl = resolveLanguageAsset(selectedLanguage, selectedLanguage.chapters);
     chapterSourceKey = getChapterSourceKey(selected);
-    media.setSelection(playbackSources(languageSources, selected), selected.id, storage.getProgress(episodeId, languageCode), false);
+    media.setSelection(playbackSources(languageSources, selected), selected.id, storage.getProgress(bookId, languageCode), false);
     media.setPlaybackRate(uiPrefs.playbackRate);
     media.setVolume(uiPrefs.volume);
     populateLibrarySelect();
@@ -738,17 +677,20 @@ async function loadEpisode(id) {
     const chaptersReady = ensureChapters({ notifyFailure: false, showLoading: false });
     applyCover();
     updateChapterButtons();
-    storage.setLastEpisode(id);
-    setEpisodeUrl(id);
+    storage.setLastBook(id);
+    setBookUrl(id);
     renderOfflineUi();
     void chaptersReady.finally(() => requestAvailabilityScan(generation, languageCode));
+  } catch (error) {
+    if (generation !== bookGeneration) return;
+    throw error;
   } finally {
-    if (generation === episodeGeneration) { setLoading(false); setBusy(false); renderOfflineUi(); }
+    if (generation === bookGeneration) { setLoading(false); setBusy(false); renderOfflineUi(); }
   }
 }
 
-function setEpisodeUrl(id) {
-  try { const url = new URL(location.href); url.searchParams.set("episode", id); history.replaceState(null, "", url); } catch {}
+function setBookUrl(id) {
+  try { const url = new URL(location.href); url.searchParams.set("book", id); url.searchParams.delete("episode"); history.replaceState(null, "", url); } catch {}
 }
 
 function resetChapters() {
@@ -765,7 +707,7 @@ function resetChapters() {
   clearChildren(els.chaptersList);
   if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
   els.chaptersTrack.removeAttribute("src");
-  const language = episode?.languages?.[languageCode];
+  const language = book?.languages?.[languageCode];
   chapterMode = language?.chapterSource || (language?.chapters ? "vtt" : "none");
   chapterUrl = resolveLanguageAsset(language, language?.chapters);
   chapterSourceKey = getChapterSourceKey(currentSource);
@@ -816,14 +758,14 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
   const sourceKey = getChapterSourceKey(currentSource);
   chapterSourceKey = sourceKey;
   if (!force) {
-    const cachedData = storage.readChapterData?.(episode.id, languageCode, episode.cacheVersion, sourceKey);
+    const cachedData = storage.readChapterData?.(book.id, languageCode, book.cacheVersion, sourceKey);
     if (cachedData) {
       const cached = cachedData.kind === "vtt" ? parseChapterText(cachedData.text) : cachedData;
       applyChapterData(cached.text || "", cached.cues, cachedData.kind);
       return Promise.resolve(cues);
     }
     if (["vtt", "auto"].includes(chapterMode)) {
-      const cachedText = storage.readChapters(episode.id, languageCode, episode.cacheVersion, chapterUrl);
+      const cachedText = storage.readChapters(book.id, languageCode, book.cacheVersion, chapterUrl);
       if (cachedText) { const cached = parseChapterText(cachedText); applyChapterData(cached.text, cached.cues, "vtt"); return Promise.resolve(cues); }
     }
   }
@@ -840,8 +782,8 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
     try {
       const result = await loadChapters({ mode: chapterMode, vttUrl: requestUrl, sourceUrl: currentSource?.url, sourceMime: currentSource?.mime, signal: controller.signal });
       if (generation !== chapterGeneration || requestUrl !== chapterUrl || sourceKey !== getChapterSourceKey(currentSource)) return cues;
-      storage.writeChapterData?.(episode.id, languageCode, episode.cacheVersion, sourceKey, result);
-      if (result.kind === "vtt") storage.writeChapters(episode.id, languageCode, episode.cacheVersion, requestUrl, result.text);
+      storage.writeChapterData?.(book.id, languageCode, book.cacheVersion, sourceKey, result);
+      if (result.kind === "vtt") storage.writeChapters(book.id, languageCode, book.cacheVersion, requestUrl, result.text);
       applyChapterData(result.text || "", result.cues, result.kind);
     } catch (error) {
       if (error?.name === "AbortError" || generation !== chapterGeneration) return cues;
@@ -897,7 +839,7 @@ function renderChapterFailure() {
     retry.disabled = true;
     retry.textContent = t("loadingChapters");
     await ensureChapters({ force: true, notifyFailure: true, showLoading: false });
-    requestAvailabilityScan(episodeGeneration, languageCode);
+    requestAvailabilityScan(bookGeneration, languageCode);
     if (els.chaptersPanel.hidden) return;
     const focusTarget = chaptersFailed ? els.chaptersList.querySelector(".chapter-retry-button") : els.chaptersList.querySelector(".chapter-button");
     focusTarget?.focus();
@@ -924,7 +866,7 @@ function renderChapters() {
     button.append(title, time);
     button.addEventListener("click", () => {
       const target = media.seek(cue.start);
-      storage.setProgress(episodeId, languageCode, target);
+      storage.setProgress(bookId, languageCode, target);
       closePanel(els.chaptersPanel, els.chaptersBtn, true);
     });
     els.chaptersList.appendChild(button);
@@ -957,7 +899,7 @@ function updateChapterButtons() {
 }
 
 function refreshEmbeddedChaptersForSource(source) {
-  if (!episode || !["embedded", "auto"].includes(chapterMode)) return;
+  if (!book || !["embedded", "auto"].includes(chapterMode)) return;
   const nextKey = getChapterSourceKey(source);
   if (nextKey === chapterSourceKey && (chaptersLoaded || chapterLoadPromise)) return;
   chapterController?.abort();
@@ -994,7 +936,7 @@ async function nextChapter() {
 }
 
 function updateTime(position, mediaDuration) {
-  const duration = durationUnlocked ? (mediaDuration || episode?.duration || 0) : 0;
+  const duration = durationUnlocked ? (mediaDuration || book?.duration || 0) : 0;
   if (!seekDragging) els.seek.value = duration ? String(Math.round(clamp(position / duration, 0, 1) * 1000)) : "0";
   els.seek.disabled = !duration;
   els.seek.setAttribute("aria-valuetext", duration ? `${formatTime(position)} of ${formatTime(duration)}` : formatTime(position));
@@ -1048,7 +990,7 @@ const media = new MediaController(els.audio, {
   onSourceFailure: (source, error) => reportError(`source failure (${source?.id || "unknown"})`, error),
   onFallback: (_failed, next) => {
     selectedSourceId = next.id;
-    storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: next.id });
+    storage.writeBook(bookId, { ...storage.readBook(bookId), language: languageCode, quality: next.id });
     showToast(t("audioFallbackCompatible"), "warning", 5000, `fallback:${next.id}`);
   },
   onBlocked: () => showToast(t("playBlocked"), "warning", 7000, "play-blocked"),
@@ -1064,19 +1006,19 @@ const media = new MediaController(els.audio, {
 });
 
 function scheduleProgress() {
-  if (!episode) return;
+  if (!book) return;
   const elapsed = Date.now() - lastProgressWrite;
   if (elapsed >= 5000) saveProgress();
   else if (!progressTimer) progressTimer = setTimeout(() => { progressTimer = null; saveProgress(); }, 5000 - elapsed);
 }
 
 function saveProgress(force = false) {
-  if (!episode || resetInProgress) return;
+  if (!book || resetInProgress) return;
   if (!force && Date.now() - lastProgressWrite < 4900) return;
   lastProgressWrite = Date.now();
-  storage.setProgress(episodeId, languageCode, media.position());
-  const prefs = storage.readEpisode(episodeId);
-  storage.writeEpisode(episodeId, { ...prefs, language: languageCode, quality: selectedSourceId });
+  storage.setProgress(bookId, languageCode, media.position());
+  const prefs = storage.readBook(bookId);
+  storage.writeBook(bookId, { ...prefs, language: languageCode, quality: selectedSourceId });
 }
 
 function setAppearance() {
@@ -1152,7 +1094,7 @@ function applyStrings() {
   setText(els.sleepTitle, t("sleepTimer"));
   setText(els.audioSettingsLegend, t("audioSettings"));
   setText(els.appearanceLegend, t("appearanceGroup"));
-  const labelKeys = { episodeSelect: "bookLabel", langSelect: "languageLabel", qualitySelect: "qualityLabel", volumeRange: "volumeLabel", speedRange: "playbackSpeedLabel", skipSelect: "skipIntervalLabel", themeSelect: "appearanceModeLabel", fontSizeSelect: "fontSizeLabel", uiLangSelect: "uiLanguageLabel" };
+  const labelKeys = { bookSelect: "bookLabel", langSelect: "languageLabel", qualitySelect: "qualityLabel", volumeRange: "volumeLabel", speedRange: "playbackSpeedLabel", skipSelect: "skipIntervalLabel", themeSelect: "appearanceModeLabel", fontSizeSelect: "fontSizeLabel", uiLangSelect: "uiLanguageLabel" };
   for (const [id, key] of Object.entries(labelKeys)) document.querySelector(`label[for="${id}"]`).textContent = t(key);
   const themeLabels = { system: "themeSystem", light: "themeLight", dark: "themeDark" };
   for (const [value, key] of Object.entries(themeLabels)) els.themeSelect.querySelector(`[value="${value}"]`).textContent = t(key);
@@ -1177,7 +1119,7 @@ function applyStrings() {
   applySkipInterval(uiPrefs.skipSeconds);
   renderSleepOptions();
   renderResetBody();
-  if (episode) {
+  if (book) {
     populateLibrarySelect();
     populateQualitySelect(currentSource);
     updateMeta();
@@ -1229,7 +1171,7 @@ function renderOnboarding(uiValue = uiPrefs.uiLanguage, audioValue = languageCod
   const audioRow = document.createElement("div"); audioRow.className = "onboard-row";
   const audioLabel = document.createElement("label"); audioLabel.htmlFor = "onboardingAudioLanguage"; audioLabel.textContent = ot("languageLabel");
   onboardingAudioSelect = document.createElement("select"); onboardingAudioSelect.id = "onboardingAudioLanguage";
-  optionsFrom(onboardingAudioSelect, Object.values(episode.languages).map((language) => ({ value: language.code, label: language.label })), audioValue, (item) => item.label);
+  optionsFrom(onboardingAudioSelect, Object.values(book.languages).map((language) => ({ value: language.code, label: language.label })), audioValue, (item) => item.label);
   audioRow.append(audioLabel, onboardingAudioSelect);
   controls.append(uiRow, audioRow);
   els.onboardingBody.append(intro, list, controls);
@@ -1304,7 +1246,7 @@ async function startSleepChapter() {
   await ensureChapters();
   const index = chapterIndexAt(media.position());
   const cue = cues[index];
-  const target = cue?.end && cue.end > media.position() ? cue.end : cues[index + 1]?.start || media.duration() || episode.duration;
+  const target = cue?.end && cue.end > media.position() ? cue.end : cues[index + 1]?.start || media.duration() || book.duration;
   if (!target || target <= media.position()) { showToast(t("sleepEndChapterUnavailable"), "warning"); return; }
   cancelSleep(true);
   sleepState.mode = "chapter";
@@ -1350,7 +1292,7 @@ async function changeLanguage(nextCode) {
     showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
     return;
   }
-  if (!episode.languages[nextCode] || nextCode === languageCode) return;
+  if (!book.languages[nextCode] || nextCode === languageCode) return;
   const position = media.position();
   saveProgress(true);
   cancelSleep(true);
@@ -1368,11 +1310,11 @@ async function changeLanguage(nextCode) {
   updateTitle();
   updateMeta();
   applyCover();
-  storage.setProgress(episodeId, languageCode, position);
-  storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: selected.id });
+  storage.setProgress(bookId, languageCode, position);
+  storage.writeBook(bookId, { ...storage.readBook(bookId), language: languageCode, quality: selected.id });
   await media.setSelection(playbackSources(all, selected), selected.id, position, shouldPlay);
   renderOfflineUi();
-  void ensureChapters({ notifyFailure: false, showLoading: false }).finally(() => requestAvailabilityScan(episodeGeneration, languageCode));
+  void ensureChapters({ notifyFailure: false, showLoading: false }).finally(() => requestAvailabilityScan(bookGeneration, languageCode));
 }
 
 async function changeQuality(nextId) {
@@ -1388,7 +1330,7 @@ async function changeQuality(nextId) {
   const shouldPlay = media.playbackIntent;
   selectedSourceId = selected.id;
   currentSource = selected;
-  storage.writeEpisode(episodeId, { ...storage.readEpisode(episodeId), language: languageCode, quality: selected.id });
+  storage.writeBook(bookId, { ...storage.readBook(bookId), language: languageCode, quality: selected.id });
   updateMeta();
   await media.setSelection(playbackSources(all, selected), selected.id, position, shouldPlay);
   renderOfflineUi();
@@ -1458,21 +1400,21 @@ els.sleepBtn.addEventListener("click", () => {
 els.optionsBtn.addEventListener("click", () => {
   if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
   closeAllPanels(els.optionsPanel);
-  openPanel(els.optionsPanel, els.optionsBtn, els.episodeRow.hidden ? els.langSelect : els.episodeSelect);
+  openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? els.langSelect : els.bookSelect);
   void loadLibraryTitles();
-  requestAvailabilityScan(episodeGeneration, languageCode, true);
+  requestAvailabilityScan(bookGeneration, languageCode, true);
 });
 els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
 els.closeSleepBtn.addEventListener("click", () => closePanel(els.sleepPanel, els.sleepBtn, true));
-els.episodeSelect.addEventListener("change", async () => {
+els.bookSelect.addEventListener("change", async () => {
   if (navigator.onLine === false) {
-    els.episodeSelect.value = episodeId;
+    els.bookSelect.value = bookId;
     showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
     return;
   }
-  const previous = episodeId;
-  try { media.requestPause(); await loadEpisode(els.episodeSelect.value); }
-  catch (error) { reportError("episode change", error, t("errorLoading")); await loadEpisode(previous); }
+  const previous = bookId;
+  try { media.requestPause(); await loadBook(els.bookSelect.value); }
+  catch (error) { reportError("book change", error, t("errorLoading")); await loadBook(previous); }
 });
 els.langSelect.addEventListener("change", () => void changeLanguage(els.langSelect.value));
 els.qualitySelect.addEventListener("change", () => void changeQuality(els.qualitySelect.value));
@@ -1513,11 +1455,11 @@ els.offlineRemoveBtn.addEventListener("click", async () => {
 
 els.seek.addEventListener("input", () => {
   seekDragging = true;
-  const duration = media.duration() || episode?.duration || 0;
+  const duration = media.duration() || book?.duration || 0;
   setText(els.timeCur, formatTime(duration * Number(els.seek.value) / 1000));
 });
 els.seek.addEventListener("change", () => {
-  const duration = media.duration() || episode?.duration || 0;
+  const duration = media.duration() || book?.duration || 0;
   media.seek(duration * Number(els.seek.value) / 1000);
   seekDragging = false;
   saveProgress(true);
@@ -1575,7 +1517,7 @@ window.addEventListener("online", () => {
   showToast(t("connectionRestored"), "success", 4000, "online");
   if (chaptersFailed && chapterUrl) void ensureChapters({ force: true, notifyFailure: false, showLoading: !els.chaptersPanel.hidden });
   scannedAvailabilityLanguages.delete(languageCode);
-  requestAvailabilityScan(episodeGeneration, languageCode);
+  requestAvailabilityScan(bookGeneration, languageCode);
   if (offlinePlaybackIntent) { offlinePlaybackIntent = false; void media.requestPlay(); }
   renderOfflineUi();
 });
@@ -1589,13 +1531,13 @@ async function boot() {
   if (navigator.onLine === false) await offlineReady;
   const bootController = new AbortController();
   library = await loadLibrary(bootController.signal);
-  const rawQueryId = new URL(location.href).searchParams.get("episode") || "";
-  const queryId = library.byId.has(rawQueryId) || (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(rawQueryId) && rawQueryId !== "..") ? rawQueryId : "";
-  const savedId = storage.getLastEpisode();
+  bookConfigs = new BookConfigStore({ library, documentBaseUrl });
+  const queryId = queryBookId(new URL(location.href).searchParams, library);
+  const savedId = storage.getLastBook();
   const downloadedId = navigator.onLine === false ? offline.active?.episodeId || "" : "";
   const initialId = downloadedId || queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
   try {
-    await loadEpisode(initialId);
+    await loadBook(initialId);
     if (library.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
   } catch (error) {
     setLoading(false);

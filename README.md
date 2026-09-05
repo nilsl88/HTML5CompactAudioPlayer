@@ -25,7 +25,7 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 - English, Danish, Norwegian Bokmål, and Swedish interface text
 - Optional audiobook selector through `media/library.json`
 - Optional Media Session lock-screen controls
-- Saved progress per episode and audio language
+- Saved progress per book and audio language
 - Safe preference, chapter, and availability caching
 - User-initiated offline download for one selected audiobook, language, and quality
 - Keyboard controls, focus management, offline feedback, and reduced-motion support
@@ -55,8 +55,10 @@ The project includes the `create-audiobook` skill at `skills/create-audiobook/SK
 - four Opus WebM, AAC/M4A, and MP3 variants at 64, 96, 128, and 256 kbps
 - embedded or WebVTT chapter selection
 - embedded or external cover-art selection
-- a compatible `episode.json` and minimal `library.json` entry
+- a compatible `book.json` and minimal `books` entry in `library.json`
 - output and configuration validation with `ffprobe` and Node.js
+
+You can also ask for configuration only or to reuse the original audio. In those cases the skill inspects the existing files and does not encode extra variants.
 
 The skill requires `ffmpeg` and `ffprobe`. It keeps the input file unchanged and does not commit or push generated files unless requested.
 
@@ -72,6 +74,7 @@ js/
   availability.js       HEAD and Range availability probes
   chapters.js           Chapter source selection and cached chapter loading
   config.js             Configuration validation and normalization
+  book-config.js        Book loading, legacy filename fallback, and shared title requests
   dialogs.js            Dialog, panel, and focus behavior
   media-controller.js   Sole owner of audio source, seek, and play transitions
   mp4-chapters.js       Bounded Range-based MP4 chapter and cover parser
@@ -81,19 +84,21 @@ js/
   utils.js              Shared utilities and abortable fetch retries
   vtt.js                WebVTT chapter parser
 tests/                  Node built-in tests; no test packages required
-media/                  Library, episode, cover, and chapter data
-skills/create-audiobook/ Prompt workflow for encoding a book and generating episode.json
+media/                  Library, book, cover, and chapter data
+skills/create-audiobook/ Prompt workflow for encoding a book and generating book.json
 ```
 
 `player.js` coordinates the modules but does not assign `audio.src`, call `audio.load()`, seek the element, or call `audio.play()` directly. Those operations belong to `media-controller.js` so source changes follow one path.
 
-## Episode configuration
+## Book configuration
 
-Store each episode at `media/<folder>/episode.json`.
+Each book has its own `media/<folder>/book.json`. The separate `media/library.json` is a catalog of book IDs and folders, not a second copy of their configuration. This keeps each book's audio, chapters, artwork, and configuration together.
+
+The player prefers `book.json` and accepts the old `episode.json` filename as described under [Migrating existing sites](#migrating-existing-sites). The bundled example keeps its stable `episode-001` ID and media folder.
 
 Required fields:
 
-- `id`: stable episode identifier
+- `id`: stable book identifier
 - `defaultLanguage`: language code used when no saved or browser match exists
 - `languages`: map of language code to language configuration
 
@@ -113,8 +118,8 @@ Example:
   "id": "episode-001",
   "defaultLanguage": "en",
   "title": {
-    "en": "Episode 001",
-    "da": "Episode 001"
+    "en": "Book 001",
+    "da": "Book 001"
   },
   "coverSource": "auto",
   "cover": "./episode-001.webp",
@@ -156,7 +161,7 @@ Example:
 - `chapters`: WebVTT file name or URL; used by `vtt` and tried first by `auto`
 - `sources`: map of codec, bitrate, and file path
 
-Without `basePath`, source and chapter paths are resolved from the episode folder.
+Without `basePath`, source and chapter paths are resolved from the book folder.
 
 Supported codec keys are `opus`, `aac`, and `mp3`. MIME types are derived as follows:
 
@@ -169,7 +174,7 @@ Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schem
 
 ### Cover artwork
 
-`coverSource` controls where the player gets the episode cover:
+`coverSource` controls where the player gets the book cover:
 
 - `file` uses the configured `cover` value.
 - `embedded` reads artwork from an M4A, M4B, or MP4 audio source.
@@ -192,26 +197,40 @@ Add `media/library.json` to show an audiobook selector when more than one valid 
   "ui": {
     "onboardingEnabled": true
   },
-  "audiofiles": [
+  "books": [
     { "id": "episode-001" },
     { "id": "episode-002" }
   ]
 }
 ```
 
-Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder` only when the directory name differs. Titles belong in each book's `episode.json` and are the source for both the player heading and library selector.
+Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder` only when the directory name differs. Titles belong in each book's `book.json` and are the source for both the player heading and library selector.
 
-`ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Episode-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
+`ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Book-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
 
-The selected episode configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `episode.json` again. Until a title is available, the selector uses the entry ID. A failed optional title request does not prevent the current book from playing.
+The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `book.json` again. Until a title is available, the selector uses the entry ID. A failed optional title request does not prevent the current book from playing.
 
-Library-level `title` and `label` values remain accepted for backward compatibility and as initial fallback labels. Older `episodes` and `items` collection names, plus `defaultId`, `path`, and related aliases, are also accepted.
+Library-level `title` and `label` values remain accepted for backward compatibility and as initial fallback labels. Legacy `audiofiles`, `episodes`, and `items` collections are accepted in that order when `books` is absent. If `books` is present, it takes precedence, even when empty; an invalid non-array `books` value produces an empty catalog rather than revealing a legacy list. Existing `defaultId`, `path`, `episode`, `key`, and `label` aliases remain supported.
 
-Use `?episode=<id>` to select an episode. Query values not present in the library are restricted to safe single-folder identifiers.
+Use `?book=<id>` to select a book. Old `?episode=<id>` links still work. A non-empty `book` parameter wins when both are supplied; an invalid value does not fall back to `episode`. Query values not present in the library are restricted to safe single-folder identifiers. After a successful selection, the player updates the URL to `?book=<id>`.
+
+Startup still prefers a downloaded book while offline, then a valid query, a saved library selection, the library default, and finally the legacy `episode-001` ID.
+
+## Migrating existing sites
+
+1. Deploy the updated player files, including the new book-loading module and service worker, before renaming configuration files.
+2. Optionally rename each `episode.json` to `book.json`. Keep the JSON fields, book ID, folder, audio paths, and `cacheVersion` unchanged for a filename-only migration.
+3. Prefer `books` for the catalog collection and `?book=<id>` for new links. Replace the old collection key instead of adding a second competing list.
+
+Migration is optional: existing configurations, catalogs, and links continue to work. If both configuration filenames exist, `book.json` wins. Avoid maintaining different versions of the same book under both filenames.
+
+The loader tries `episode.json` only after `book.json` returns HTTP 404/410 or a network failure, including a timeout or interrupted response body. It does not hide malformed JSON, invalid book configuration, or other HTTP errors behind the old file. Failed loads remain retryable. Concurrent selection and title requests share one load, while a cancelled selection cannot update a newer one.
+
+Saved preferences and progress keep their existing storage keys. Offline manifests retain their existing fields, including `episodeId` and `episodeTitle`; new downloads cache whichever configuration URL was actually loaded. Existing downloads containing only `episode.json` can still reload offline. Updating the service-worker shell does not delete downloaded media.
 
 ## WebVTT chapters
 
-The selected language's chapters start loading after the episode configuration. This request is independent of audio loading and never blocks playback. Opening the chapter panel, using chapter navigation, or selecting sleep at chapter end reuses the loaded data or the same in-flight request.
+The selected language's chapters start loading after the book configuration. This request is independent of audio loading and never blocks playback. Opening the chapter panel, using chapter navigation, or selecting sleep at chapter end reuses the loaded data or the same in-flight request.
 
 ```vtt
 WEBVTT
@@ -245,7 +264,7 @@ For each source transition, the player creates a finite queue:
 
 A confirmed decode or unsupported-source failure skips the rest of that codec family. A network/source failure may try another bitrate before moving to the next codec. Each URL is attempted once per transition.
 
-`NotAllowedError` stops automatic attempts and asks the user to press Play again. Old Promise rejections, media events, probes, chapter loads, and episode responses are ignored after a newer generation takes ownership.
+`NotAllowedError` stops automatic attempts and asks the user to press Play again. Old Promise rejections, media events, probes, chapter loads, and book responses are ignored after a newer generation takes ownership.
 
 ## Lazy loading
 
@@ -263,7 +282,7 @@ Browsers control actual buffering and may treat `preload` as a hint after a sour
 
 Options includes **Download for offline use** when Service Worker and Cache Storage are available. It downloads the current audiobook, audio language, and quality. Other languages, bitrates, and codec fallbacks are not included. Downloading another selection normally keeps the previous copy until the new one is complete. If browser storage cannot hold both temporarily, the player asks before removing the old copy.
 
-The download also stores the player shell, episode configuration, cover, and chapter file needed for an offline reload. A missing optional cover or chapter file does not prevent audio from being saved. The player uses the network first whenever it is online and keeps the completed copy as a fallback. Returning online does not delete the download.
+The download also stores the player shell, book configuration, cover, and chapter file needed for an offline reload. A missing optional cover or chapter file does not prevent audio from being saved. The player uses the network first whenever it is online and keeps the completed copy as a fallback. Returning online does not delete the download.
 
 Audio is requested in sequential 8 MiB byte ranges and stored in Cache Storage. Interrupted transfers retain completed chunks and show **Resume download** on the next online visit. Explicit cancellation removes the partial copy. Playback traffic has priority while the player is loading or stalled.
 
@@ -291,11 +310,11 @@ The player never creates temporary audio elements to probe files. A successful m
 
 Only the active audio language is scanned. Changing language cancels stale probe work and starts a scan for the new selection.
 
-Results are cached for seven days. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current episode cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
+Results are cached for seven days. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current book cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
 
 ## Chapter loading
 
-The selected language's small WebVTT file starts loading after the episode configuration and before cover or availability-probe traffic. It does not assign or preload an audio source. Normal HTTP caching applies. Successful responses are also stored in guarded localStorage by episode, audio language, chapter URL, and `cacheVersion`, so repeat visits can display chapters without another request.
+The selected language's small WebVTT file starts loading after the book configuration and before cover or availability-probe traffic. It does not assign or preload an audio source. Normal HTTP caching applies. Successful responses are also stored in guarded localStorage by book, audio language, chapter URL, and `cacheVersion`, so repeat visits can display chapters without another request.
 
 Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests show a Retry action in the chapter panel and are retried after the browser reports that the connection has returned.
 
@@ -316,7 +335,7 @@ Set a language's `chapterSource` to `embedded` to read QuickTime chapter tracks 
 
 Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. QuickTime text samples are trimmed to their declared title length so trailing format records do not appear in chapter names.
 
-The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. A parser failure leaves audio playback available and can be retried from the Chapters panel. Embedded cues are cached per episode, language, cache version, and source URL.
+The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. A parser failure leaves audio playback available and can be retried from the Chapters panel. Embedded cues are cached per book, language, cache version, and source URL.
 
 ## Storage
 
@@ -324,15 +343,15 @@ All storage access is guarded. Unavailable storage, malformed JSON, obsolete val
 
 The player uses these storage keys and migrates their supported legacy forms:
 
-- `compactPlayer:<episode>`: language, quality, and progress by audio language
+- `compactPlayer:<book>`: language, quality, and progress by audio language
 - `compactPlayer:ui`: theme, text size, player language, speed, volume, and skip interval
 - `compactPlayer:lastEpisode`: last library selection
-- `compactPlayer:chapters:<episode>:<language>:<cacheVersion>`: cached WebVTT chapter text
-- `compactPlayer:chapters:<episode>:<language>:<cacheVersion>:<source>`: cached VTT or embedded chapter data for a source
+- `compactPlayer:chapters:<book>:<language>:<cacheVersion>`: cached WebVTT chapter text
+- `compactPlayer:chapters:<book>:<language>:<cacheVersion>:<source>`: cached VTT or embedded chapter data for a source
 - `compactAudioPlayer.onboardingShown.v1`: onboarding state
 - `cap_avail_*`: legacy availability cache
 
-New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:availability:<episode>:<cacheVersion>`. Chapter entries also record their source URL and timestamp. A newer `cacheVersion` removes the obsolete chapter entry for that episode and language. Reset removes current and legacy player keys.
+New objects include `schemaVersion: 2`. Availability writes use `compactPlayer:availability:<book>:<cacheVersion>`. Chapter entries also record their source URL and timestamp. A newer `cacheVersion` removes the obsolete chapter entry for that book and language. Reset removes current and legacy player keys.
 
 Progress writes are throttled and flushed when the page is hidden or left.
 
@@ -375,11 +394,12 @@ node --check player.js
 node --check sw.js
 for file in i18n.js js/*.js tests/*.mjs; do node --check "$file"; done
 node --test tests/*.test.mjs
+git diff --check
 ```
 
 The tests cover:
 
-- Configuration and legacy library normalization
+- Book configuration, legacy filename fallback, collection aliases, query precedence, request reuse, cancellation, and lazy title concurrency
 - URL and MIME handling
 - Storage migration, corruption, chapter caching, reset behavior, and availability cache compatibility
 - Offline manifest validation, size preflight, complete download promotion, interruption and resume

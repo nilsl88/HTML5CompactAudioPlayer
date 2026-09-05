@@ -1,40 +1,40 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeEpisode, normalizeLibrary, resolveLanguageAsset } from "../js/config.js";
+import { normalizeBook, normalizeLibrary, resolveLanguageAsset } from "../js/config.js";
 import { buildFallbackQueue, buildSources, chooseDefaultSource, mimeFor, visibleSources } from "../js/source-selection.js";
 
-test("normalizes the documented episode schema without changing paths", () => {
-  const episode = normalizeEpisode({
+test("normalizes the documented book schema without changing paths", () => {
+  const book = normalizeBook({
     id: "book",
     defaultLanguage: "en-US",
     languages: {
       en: { label: "English", basePath: "media/book/en/", chapters: "chapters.vtt", sources: { opus: { 96: "audio.webm" }, mp3: { 128: "audio.mp3" } } },
     },
-  }, { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
-  assert.equal(episode.defaultLanguage, "en");
-  assert.equal(episode.languages.en.chapterSource, "vtt");
-  assert.equal(resolveLanguageAsset(episode.languages.en, "audio.webm"), "https://example.test/media/book/en/audio.webm");
-  assert.equal(resolveLanguageAsset(episode.languages.en, "chapters.vtt"), "https://example.test/media/book/en/chapters.vtt");
+  }, { bookBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
+  assert.equal(book.defaultLanguage, "en");
+  assert.equal(book.languages.en.chapterSource, "vtt");
+  assert.equal(resolveLanguageAsset(book.languages.en, "audio.webm"), "https://example.test/media/book/en/audio.webm");
+  assert.equal(resolveLanguageAsset(book.languages.en, "chapters.vtt"), "https://example.test/media/book/en/chapters.vtt");
 });
 
 test("normalizes explicit embedded chapter modes", () => {
-  const episode = normalizeEpisode({
+  const book = normalizeBook({
     id: "book",
     defaultLanguage: "en",
     languages: {
       en: { label: "English", chapterSource: "embedded", sources: { aac: { 128: "book.m4b" } } },
     },
-  }, { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
-  assert.equal(episode.languages.en.chapterSource, "embedded");
-  assert.equal(episode.languages.en.chapters, "");
+  }, { bookBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" });
+  assert.equal(book.languages.en.chapterSource, "embedded");
+  assert.equal(book.languages.en.chapters, "");
 });
 
 test("normalizes cover source modes without changing legacy behavior", () => {
-  const context = { episodeBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" };
+  const context = { bookBaseUrl: "https://example.test/media/book/", documentBaseUrl: "https://example.test/" };
   const base = { id: "book", defaultLanguage: "en", languages: { en: { sources: { aac: { 128: "book.m4b" } } } } };
-  assert.equal(normalizeEpisode({ ...base, cover: "cover.webp" }, context).coverSource, "file");
-  assert.equal(normalizeEpisode({ ...base, coverSource: "embedded" }, context).coverSource, "embedded");
-  assert.equal(normalizeEpisode(base, context).coverSource, "none");
+  assert.equal(normalizeBook({ ...base, cover: "cover.webp" }, context).coverSource, "file");
+  assert.equal(normalizeBook({ ...base, coverSource: "embedded" }, context).coverSource, "embedded");
+  assert.equal(normalizeBook(base, context).coverSource, "none");
 });
 
 test("supports legacy library collection aliases", () => {
@@ -47,10 +47,15 @@ test("accepts a minimal library index and defaults folders to IDs", () => {
   const library = normalizeLibrary({ default: "one", audiofiles: [{ id: "one" }, { id: "two" }] });
   assert.equal(library.defaultId, "one");
   assert.equal(library.ui.onboardingEnabled, true);
-  assert.deepEqual(library.episodes.map(({ id, folder, title }) => ({ id, folder, title })), [
+  assert.deepEqual(library.books.map(({ id, folder, title }) => ({ id, folder, title })), [
     { id: "one", folder: "one", title: null },
     { id: "two", folder: "two", title: null },
   ]);
+});
+
+test("preserves significant whitespace in library folder paths", () => {
+  const library = normalizeLibrary({ books: [{ id: "war", folder: "The_Art_of_War " }] });
+  assert.equal(library.books[0].folder, "The_Art_of_War ");
 });
 
 test("normalizes onboarding as a library-wide setting", () => {
@@ -60,7 +65,7 @@ test("normalizes onboarding as a library-wide setting", () => {
 
 test("rejects unsafe library traversal", () => {
   const library = normalizeLibrary({ audiofiles: [{ id: "bad", folder: "../secret" }, { id: "good", folder: "good" }] });
-  assert.deepEqual(library.episodes.map((item) => item.id), ["good"]);
+  assert.deepEqual(library.books.map((item) => item.id), ["good"]);
 });
 
 test("builds MIME evidence and one visible codec family", () => {

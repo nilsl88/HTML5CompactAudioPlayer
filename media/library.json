@@ -3,7 +3,7 @@
   "ui": {
     "onboardingEnabled": true
   },
-  "audiofiles": [
+  "books": [
     {
       "id": "episode-001"
     },

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=8">
+  <link rel="stylesheet" href="./player.css?v=9">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -12,11 +12,11 @@
 
   <main class="page">
     <header class="page-header">
-      <h1 id="episodeTitle" class="episode-title">Audio</h1>
-      <p id="episodeMeta" class="episode-meta">Loading…</p>
+      <h1 id="bookTitle" class="book-title">Audio</h1>
+      <p id="bookMeta" class="book-meta">Loading…</p>
     </header>
 
-    <section id="player" class="player-card is-loading" aria-labelledby="episodeTitle" aria-busy="true">
+    <section id="player" class="player-card is-loading" aria-labelledby="bookTitle" aria-busy="true">
       <div class="skeleton" aria-hidden="true">
         <span class="skeleton-play"></span>
         <span class="skeleton-progress"></span>
@@ -66,7 +66,7 @@
         <h2 id="optionsTitle" class="sr-only">Options</h2>
         <fieldset class="settings-group">
           <legend id="audioSettingsLegend">Audio</legend>
-          <div id="episodeRow" class="setting-row" hidden><label for="episodeSelect">Audiobook</label><select id="episodeSelect"></select></div>
+          <div id="bookRow" class="setting-row" hidden><label for="bookSelect">Audiobook</label><select id="bookSelect"></select></div>
           <div class="setting-row"><label for="langSelect">Audio language</label><select id="langSelect"></select></div>
           <div class="setting-row"><label for="qualitySelect">Quality</label><select id="qualitySelect"></select></div>
           <div id="volumeRow" class="setting-row range-row"><label for="volumeRange">Volume</label><div class="range-wrap"><input id="volumeRange" type="range" min="0" max="100" value="100" step="1"><output id="volumeValue" for="volumeRange">100%</output></div></div>
@@ -117,6 +117,6 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script type="module" src="./player.js?v=8"></script>
+  <script type="module" src="./player.js?v=9"></script>
 </body>
 </html>
