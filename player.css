@@ -44,9 +44,9 @@ button { color: inherit; }
 .skip-link:focus { transform: none; }
 .page { width: min(100%, var(--page-width)); margin-inline: auto; padding: max(var(--space-4), env(safe-area-inset-top)) max(var(--space-4), env(safe-area-inset-right)) max(var(--space-4), env(safe-area-inset-bottom)) max(var(--space-4), env(safe-area-inset-left)); }
 .page-header { min-width: 0; margin-bottom: var(--space-3); }
-.episode-title { margin: 0; font-size: var(--font-lg); line-height: 1.25; overflow-wrap: anywhere; }
-.episode-meta { margin: var(--space-1) 0 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.35; overflow-wrap: anywhere; }
-.episode-meta.is-error { color: var(--danger); }
+.book-title { margin: 0; font-size: var(--font-lg); line-height: 1.25; overflow-wrap: anywhere; }
+.book-meta { margin: var(--space-1) 0 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.35; overflow-wrap: anywhere; }
+.book-meta.is-error { color: var(--danger); }
 .player-card { position: relative; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow); }
 .player-bar { display: grid; grid-template-columns: var(--control-size) minmax(0, 1fr); gap: var(--space-3); align-items: center; }
 .play-button, .icon-button, .skip-button { display: inline-flex; min-width: var(--control-size); min-height: var(--control-size); align-items: center; justify-content: center; border: 1px solid var(--border); cursor: pointer; }

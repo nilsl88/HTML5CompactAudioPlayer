@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFile } from "node:fs/promises";
+import { BookConfigStore } from "../js/book-config.js";
+import { normalizeLibrary } from "../js/config.js";
 import {
   OfflineManager,
   chunkBounds,
@@ -177,6 +179,58 @@ test("reports an unsupported server instead of accepting a full response", async
   });
   await manager.init();
   await assert.rejects(manager.inspectSource(selection()), (error) => error.code === "range");
+});
+
+for (const filename of ["book.json", "episode.json"]) test(`downloads and reloads offline with ${filename} after a shell upgrade`, async () => {
+  const baseUrl = "https://example.test/";
+  const raw = { id: "book", defaultLanguage: "en", languages: { en: { sources: { opus: { 64: "audio.webm" } } } } };
+  const library = normalizeLibrary({ books: [{ id: "book" }] });
+  const audioFetch = rangedFetch(10);
+  const fetchImpl = async (url, options) => {
+    if (url.endsWith(`/media/book/${filename}`)) return new Response(JSON.stringify(raw));
+    if (url.endsWith("/book.json")) return new Response(null, { status: 404 });
+    return audioFetch(url, options);
+  };
+  const configs = new BookConfigStore({ library, documentBaseUrl: baseUrl, fetchImpl, retries: 1 });
+  const loaded = await configs.load("book");
+  const cacheStorage = new MemoryCacheStorage();
+  const manager = new OfflineManager({ baseUrl, fetchImpl, cacheStorage, navigatorObject: navigatorStub() });
+  await manager.init();
+  const selected = { ...selection(), assets: [{ url: loaded.configUrl, required: true }] };
+  const manifest = await manager.start(selected, await manager.inspectSource(selected));
+  assert.equal(manifest.episodeId, "book");
+  assert.equal(manifest.episodeTitle, "Book");
+  assert.ok(await (await cacheStorage.open(manifest.cacheName)).match(loaded.configUrl));
+
+  await cacheStorage.open("compact-player-shell-v8");
+  await cacheStorage.open("compact-player-shell-v9");
+  const events = {};
+  const source = await readFile(new URL("../sw.js", import.meta.url), "utf8");
+  const context = vm.createContext({
+    self: { registration: { scope: baseUrl }, location: { origin: new URL(baseUrl).origin },
+      addEventListener: (name, handler) => { events[name] = handler; }, clients: { claim: async () => {} } },
+    caches: cacheStorage, fetch: async () => { throw new TypeError("Offline"); },
+    URL, Request, Response, ReadableStream,
+  });
+  vm.runInContext(source, context);
+  let activated;
+  events.activate({ waitUntil: (promise) => { activated = promise; } });
+  await activated;
+  assert.equal((await cacheStorage.keys()).includes("compact-player-shell-v8"), false);
+  assert.ok((await cacheStorage.keys()).includes(manifest.cacheName));
+
+  const offlineFetch = (url, options) => context.networkFirst(new Request(url, options));
+  const offlineNavigator = navigatorStub();
+  offlineNavigator.onLine = false;
+  const reloaded = new OfflineManager({ baseUrl, fetchImpl: offlineFetch, cacheStorage, navigatorObject: offlineNavigator });
+  await reloaded.init();
+  assert.equal(reloaded.active.episodeId, "book");
+  const offlineConfigs = new BookConfigStore({ library, documentBaseUrl: baseUrl, fetchImpl: offlineFetch, retries: 1 });
+  assert.equal((await offlineConfigs.load("book")).configUrl, loaded.configUrl);
+  const response = await offlineFetch(selected.sourceUrl, { headers: { Range: "bytes=8-9" } });
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), "bytes 8-9/10");
+  assert.equal((await response.arrayBuffer()).byteLength, 2);
 });
 
 test("service worker range parser handles open and suffix requests", async () => {

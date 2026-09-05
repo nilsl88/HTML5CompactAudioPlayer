@@ -12,12 +12,12 @@ class MemoryStorage {
   key(index) { return [...this.map.keys()][index] ?? null; }
 }
 
-test("migrates legacy episode and UI preference names", () => {
+test("migrates legacy book and UI preference names", () => {
   const memory = new MemoryStorage();
   memory.setItem("compactPlayer:book", JSON.stringify({ lang: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 }));
   memory.setItem("compactPlayer:ui", JSON.stringify({ uiLang: "sv", playbackRate: 9, volume: -2, skipSeconds: 30 }));
   const storage = new PlayerStorage(memory);
-  assert.deepEqual(storage.readEpisode("book"), { schemaVersion: 2, language: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 });
+  assert.deepEqual(storage.readBook("book"), { schemaVersion: 2, language: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 });
   assert.equal(storage.readUi().uiLanguage, "sv");
   assert.equal(storage.readUi().playbackRate, 2);
   assert.equal(storage.readUi().volume, 0);
@@ -27,8 +27,24 @@ test("corrupt storage does not block startup", () => {
   const memory = new MemoryStorage();
   memory.setItem("compactPlayer:book", "{broken");
   const storage = new PlayerStorage(memory);
-  assert.equal(storage.readEpisode("book").lastTime, 0);
-  assert.deepEqual(storage.readEpisode("book").progressByLang, {});
+  assert.equal(storage.readBook("book").lastTime, 0);
+  assert.deepEqual(storage.readBook("book").progressByLang, {});
+});
+
+test("book terminology preserves existing selection, progress, and preference keys", () => {
+  const memory = new MemoryStorage();
+  memory.setItem("compactPlayer:lastEpisode", "episode-001");
+  memory.setItem("compactPlayer:episode-001", JSON.stringify({ language: "en", quality: "aac-64", progressByLang: { en: 123, da: 456 } }));
+  const storage = new PlayerStorage(memory);
+  assert.equal(storage.getLastBook(), "episode-001");
+  assert.equal(storage.getProgress("episode-001", "en"), 123);
+  storage.setProgress("episode-001", "en", 789);
+  storage.setLastBook("next");
+  assert.equal(storage.readBook("episode-001").quality, "aac-64");
+  assert.equal(storage.getProgress("episode-001", "da"), 456);
+  assert.equal(memory.getItem("compactPlayer:lastEpisode"), "next");
+  assert.equal(memory.getItem("compactPlayer:lastBook"), null);
+  assert.equal(JSON.parse(memory.getItem("compactPlayer:episode-001")).progressByLang.en, 789);
 });
 
 test("reads legacy availability cache values", () => {
@@ -37,7 +53,7 @@ test("reads legacy availability cache values", () => {
   assert.equal(new PlayerStorage(memory).readAvailability("book", 1).en["opus-96"], true);
 });
 
-test("stores chapters by episode, language, version, and URL", () => {
+test("stores chapters by book, language, version, and URL", () => {
   const memory = new MemoryStorage();
   const storage = new PlayerStorage(memory);
   const text = "WEBVTT\n\n00:00.000 --> 00:10.000\nOpening";

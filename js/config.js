@@ -3,28 +3,29 @@ import { normalizeLanguageTag, safeUrl } from "./utils.js";
 export const CODECS = ["opus", "aac", "mp3"];
 
 export function normalizeLibrary(raw) {
-  const library = { defaultId: "", episodes: [], byId: new Map(), ui: { onboardingEnabled: true } };
+  const library = { defaultId: "", books: [], byId: new Map(), ui: { onboardingEnabled: true } };
   if (!raw || typeof raw !== "object") return library;
   library.ui.onboardingEnabled = raw.ui?.onboardingEnabled !== false;
-  const items = Array.isArray(raw.audiofiles) ? raw.audiofiles
-    : Array.isArray(raw.episodes) ? raw.episodes
-      : Array.isArray(raw.items) ? raw.items : [];
+  const items = Object.hasOwn(raw, "books") ? (Array.isArray(raw.books) ? raw.books : [])
+    : Array.isArray(raw.audiofiles) ? raw.audiofiles
+      : Array.isArray(raw.episodes) ? raw.episodes
+        : Array.isArray(raw.items) ? raw.items : [];
   for (const item of items) {
     if (!item || typeof item !== "object") continue;
     const id = String(item.id || item.episode || item.key || "").trim();
-    const folder = String(item.folder || item.path || id).trim();
-    if (!id || !folder || /(?:^|\/)\.\.(?:\/|$)/.test(folder)) continue;
+    const folder = String(item.folder ?? item.path ?? id);
+    if (!id || !folder.trim() || /(?:^|\/)\.\.(?:\/|$)/.test(folder)) continue;
     const record = {
       id,
       folder,
       title: item.title && typeof item.title === "object" ? { ...item.title } : null,
       label: String(item.label || ""),
     };
-    library.episodes.push(record);
+    library.books.push(record);
     library.byId.set(id, record);
   }
   const requestedDefault = String(raw.default || raw.defaultId || "").trim();
-  library.defaultId = library.byId.has(requestedDefault) ? requestedDefault : (library.episodes[0]?.id || "");
+  library.defaultId = library.byId.has(requestedDefault) ? requestedDefault : (library.books[0]?.id || "");
   return library;
 }
 
@@ -33,13 +34,13 @@ export function parseJson(text, fileName) {
   catch (error) { throw new Error(`Invalid JSON in ${fileName}: ${error.message}`); }
 }
 
-export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Episode configuration must be an object.");
+export function normalizeBook(raw, { bookBaseUrl, documentBaseUrl }) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Book configuration must be an object.");
   const id = String(raw.id || "").trim();
   const defaultLanguage = normalizeLanguageTag(raw.defaultLanguage);
-  if (!id) throw new Error("Episode configuration is missing id.");
-  if (!defaultLanguage) throw new Error("Episode configuration is missing defaultLanguage.");
-  if (!raw.languages || typeof raw.languages !== "object" || Array.isArray(raw.languages)) throw new Error("Episode configuration is missing languages.");
+  if (!id) throw new Error("Book configuration is missing id.");
+  if (!defaultLanguage) throw new Error("Book configuration is missing defaultLanguage.");
+  if (!raw.languages || typeof raw.languages !== "object" || Array.isArray(raw.languages)) throw new Error("Book configuration is missing languages.");
 
   const languages = {};
   for (const [rawCode, value] of Object.entries(raw.languages)) {
@@ -61,7 +62,7 @@ export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
     if (!Object.keys(sources).length) continue;
     const baseUrl = value.basePath
       ? safeUrl(value.basePath, documentBaseUrl)
-      : episodeBaseUrl;
+      : bookBaseUrl;
     if (!baseUrl) continue;
     languages[code] = {
       code,
@@ -74,7 +75,7 @@ export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
       sources,
     };
   }
-  if (!Object.keys(languages).length) throw new Error("Episode configuration has no usable languages or audio sources.");
+  if (!Object.keys(languages).length) throw new Error("Book configuration has no usable languages or audio sources.");
 
   return {
     id,
@@ -88,7 +89,7 @@ export function normalizeEpisode(raw, { episodeBaseUrl, documentBaseUrl }) {
     cacheVersion: raw.cacheVersion == null ? 1 : String(raw.cacheVersion),
     debug: { showAllQualities: Boolean(raw.debug?.showAllQualities) },
     languages,
-    episodeBaseUrl,
+    bookBaseUrl,
     documentBaseUrl,
   };
 }
@@ -97,8 +98,8 @@ export function resolveLanguageAsset(language, value) {
   return safeUrl(value, language?.baseUrl || "");
 }
 
-export function resolveCover(episode) {
-  return safeUrl(episode?.cover, episode?.episodeBaseUrl, { allowImageData: true });
+export function resolveCover(book) {
+  return safeUrl(book?.cover, book?.bookBaseUrl, { allowImageData: true });
 }
 
 export function localizedValue(values, locale, fallback = "") {

@@ -14,6 +14,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `sw.js`: network-first application shell and byte-range responses from downloaded audio chunks.
 - `i18n.js`: interface strings for English, Danish, Norwegian Bokmål, and Swedish.
 - `js/config.js`: configuration parsing, validation, URL resolution, and localization helpers.
+- `js/book-config.js`: cached book configuration loading, legacy filename fallback, query selection, and bounded title lookups.
 - `js/media-controller.js`: the only owner of audio source changes, loading, seeking, play/pause state, and fallback transitions.
 - `js/offline.js`: service-worker registration, storage preflight, chunk downloads, resume state, and offline manifests.
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
@@ -24,7 +25,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/vtt.js`: safe WebVTT chapter parsing.
 - `js/dialogs.js`: panel and dialog focus behavior, Escape handling, and focus restoration.
 - `js/utils.js`: shared formatting, URL checks, abort errors, and fetch retries.
-- `media/`: example library, episode JSON, cover image, and chapter files.
+- `media/`: example library, book JSON, cover image, and chapter files.
 - `skills/create-audiobook/SKILL.md`: workflow for encoding new books and generating compatible configuration.
 - `tests/`: dependency-free Node test files.
 
@@ -36,7 +37,7 @@ Run the player through HTTP because ES modules and runtime `fetch()` are not rel
 python3 -m http.server 8080
 ```
 
-Then open `http://localhost:8080/`. Example audio binaries are not committed; add the files named by the episode configuration under the matching `media/` directories.
+Then open `http://localhost:8080/`. Example audio binaries are not committed; add the files named by the book configuration under the matching `media/` directories.
 
 Run checks before handing off a change:
 
@@ -52,7 +53,7 @@ Do not claim physical iPhone, iPad, or Android testing unless it was actually pe
 
 ## Creating new audiobooks
 
-Use `skills/create-audiobook/SKILL.md` when a user asks to add a book from source audio. It creates 64, 96, 128, and 256 kbps Opus WebM, AAC/M4A, and MP3 variants, then writes a compatible `episode.json` and minimal `library.json` entry. It supports embedded or WebVTT chapters and embedded or external cover art. Require `ffmpeg` and `ffprobe`, keep source files unchanged, validate every output, and never overwrite an existing episode directory without confirmation. Do not commit or push unless the user explicitly asks.
+Use `skills/create-audiobook/SKILL.md` when a user asks to add a book from source audio. It normally creates 64, 96, 128, and 256 kbps Opus WebM, AAC/M4A, and MP3 variants, then writes a compatible `book.json` and minimal `books` entry in `library.json`. Configuration-only or original-audio requests must not trigger encoding or extra media files. It supports embedded or WebVTT chapters and embedded or external cover art. Require `ffmpeg` and `ffprobe`, keep source files unchanged, validate every output, and never overwrite an existing book directory without confirmation. Do not commit or push unless the user explicitly asks.
 
 ## Audio architecture
 
@@ -60,7 +61,7 @@ All media operations must go through `MediaController`.
 
 - Do not assign `audio.src`, call `audio.load()`, call `audio.play()`, call `audio.pause()`, or set `audio.currentTime` from unrelated coordinator code.
 - Treat `play()` as asynchronous and handle its Promise. `NotAllowedError` means the user must press Play again; it must not start another fallback attempt.
-- Use generation checks and abort controllers so old episode, language, quality, chapter, probe, and play operations cannot update newer state.
+- Use generation checks and abort controllers so old book, language, quality, chapter, probe, and play operations cannot update newer state.
 - Base codec choice on `canPlayType()` evidence and runtime results. The preference order is Opus, AAC/M4A, then MP3. Do not add browser-version or user-agent rules without a documented, verified reason.
 - Keep fallback queues finite and deterministic. Preserve playback position, playback rate, selected language, and playback intent where appropriate.
 - Initial buffering before the first `playing` event is `loading`. A network warning is reserved for a sustained stall after playback has started.
@@ -68,25 +69,30 @@ All media operations must go through `MediaController`.
 
 ## Configuration compatibility
 
-Episode files live at `media/<folder>/episode.json`. Preserve these fields and aliases:
+Each book has one configuration at `media/<folder>/book.json`; `media/library.json` is the catalog. Use `book`, `normalizeBook`, and `library.books` in application code. Preserve these fields and aliases:
 
 - `id`, `defaultLanguage`, `title`, `cover`, `coverSource`, `duration`, `cacheVersion`, and `debug.showAllQualities`.
 - `languages.<code>.label`, `basePath`, `chapterSource`, `chapters`, and `sources`.
-- Library collections named `audiofiles`, `episodes`, or `items`, plus existing `default`, `defaultId`, `folder`, `path`, and `label` aliases.
+- The preferred library collection is `books`. When absent, accept `audiofiles`, `episodes`, and `items` in that order. A present empty or invalid `books` collection must not reveal a legacy collection.
+- Preserve library entry aliases `episode`, `key`, `folder`, `path`, and `label`, plus `default` and `defaultId`.
 
-Keep new `library.json` entries minimal: `id` is required and `folder` is needed only when it differs from the ID. Episode titles belong in `episode.json`. The player may still read legacy library titles as fallback labels.
+Keep new `library.json` entries minimal: `id` is required and `folder` is needed only when it differs from the ID. Book titles belong in `book.json`. The player may still read legacy library titles as fallback labels.
 
-`library.ui.onboardingEnabled` controls the first-visit help dialog for the whole player and defaults to `true`. Do not read onboarding policy from individual episodes; the saved onboarding state is library-wide.
+`library.ui.onboardingEnabled` controls the first-visit help dialog for the whole player and defaults to `true`. Do not read onboarding policy from individual books; the saved onboarding state is library-wide.
 
-Load the active episode configuration at startup. Load remaining library titles only after Options opens, limit title lookups to two concurrent requests, and reuse the normalized configurations from the in-memory cache. A failed background lookup must leave the ID fallback visible and must not affect playback.
+Prefer `book.json`; try `episode.json` only after HTTP 404/410 or a network failure, including a timeout or interrupted response body. Do not fall back after invalid JSON, invalid configuration, or other HTTP errors. Cache the normalized configuration and the URL actually loaded. Share in-flight selection/title work, keep consumer cancellation independent, and prevent stale selections from restoring an older book.
+
+Prefer `?book=<id>` while accepting `?episode=<id>`. A non-empty `book` parameter takes precedence, even when invalid; keep safe-ID validation. Preserve startup priority: downloaded book while offline, valid query, saved library selection, library default, then `episode-001`.
+
+Load the active book configuration at startup. Load remaining library titles only after Options opens, limit title lookups to two concurrent requests, and reuse the normalized configurations from the in-memory cache. A failed background lookup must leave the ID fallback visible and must not affect playback.
 
 Supported codec keys are `opus`, `aac`, and `mp3`. AAC sources support AAC-LC (`mp4a.40.2`), HE-AAC v1 (`mp4a.40.5`), and HE-AAC v2 (`mp4a.40.29`) MIME evidence, followed by generic `audio/mp4`; runtime decoding remains authoritative. Keep relative URL behavior and reject unsafe schemes and traversal without changing valid relative media paths.
 
 `chapterSource` is `vtt`, `embedded`, `auto`, or `none`. A legacy language with a non-empty `chapters` value and no mode normalizes to `vtt`. Embedded mode reads the active AAC/M4A/M4B source; auto mode tries WebVTT first and then embedded metadata.
 
-`coverSource` is `file`, `embedded`, `auto`, or `none`. A legacy episode with a non-empty `cover` value and no mode normalizes to `file`. Auto mode tries the configured cover before inspecting MP4 metadata. Embedded cover loading must remain asynchronous, abortable, limited to JPEG/PNG metadata no larger than 10 MB, and independent of audio-element loading. Revoke replaced Blob URLs.
+`coverSource` is `file`, `embedded`, `auto`, or `none`. A legacy book with a non-empty `cover` value and no mode normalizes to `file`. Auto mode tries the configured cover before inspecting MP4 metadata. Embedded cover loading must remain asynchronous, abortable, limited to JPEG/PNG metadata no larger than 10 MB, and independent of audio-element loading. Revoke replaced Blob URLs.
 
-Chapter and cover parsing for the same MP4 source must share an in-flight `moov` request. Keep consumer cancellation independent, abort the network request when every consumer leaves, and retain successful metadata only briefly so large buffers do not accumulate across episode changes.
+Chapter and cover parsing for the same MP4 source must share an in-flight `moov` request. Keep consumer cancellation independent, abort the network request when every consumer leaves, and retain successful metadata only briefly so large buffers do not accumulate across book changes.
 
 ## UI and accessibility
 
@@ -104,28 +110,30 @@ Chapter and cover parsing for the same MP4 source must share an in-flight `moov`
 
 ## Storage and network
 
+Keep stable book IDs and media paths when renaming configuration files. Preserve serialized storage keys, including `compactPlayer:lastEpisode`, and offline manifest fields such as `episodeId` and `episodeTitle`. These legacy names are intentional compatibility boundaries, not terminology to replace.
+
 All `localStorage` access goes through `PlayerStorage`. `OfflineManager` owns Cache Storage media and manifests. Corrupt JSON, unavailable storage, quota errors, obsolete values, and private-browsing restrictions must degrade safely. Migrate old keys instead of discarding valid preferences.
 
 Reset must block progress writes before clearing storage. Cancel pending progress timers and stop media before deleting saved state so `pagehide`, visibility, or pause events cannot recreate progress during reload.
 
-Cached chapter text is keyed by episode, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same episode and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
+Cached chapter text is keyed by book, audio language, chapter URL, and `cacheVersion`. Each entry is limited to 512 KB. A new version replaces the obsolete entry for the same book and language. Reset must remove chapter entries. Render parsed titles as text and document that chapter changes require a `cacheVersion` update.
 
 Embedded chapter cues use the same cache namespace with the active source URL included in the key. Validate cue timestamps and titles before using cached data. Embedded metadata parsing must use bounded Range requests, support QuickTime chapter tracks and Nero `chpl`, and never block audio playback. Traverse top-level atom headers and skip `mdat` by its declared size; a tail buffer can begin inside media data and must not be parsed as an atom boundary.
 
 Availability probes are advisory. They must be abortable, must not download full media, and must never override a source that the media pipeline successfully plays. Do not probe every language or quality unnecessarily.
 
-Chapter loading must never block basic playback or assign an audio source. Start the selected language's VTT request after episode configuration and ahead of cover and availability probes. Reuse one in-flight request, use the persistent cache before the network, allow normal HTTP caching, and keep the request timeout at 20 seconds unless evidence supports another value.
+Chapter loading must never block basic playback or assign an audio source. Start the selected language's VTT request after book configuration and ahead of cover and availability probes. Reuse one in-flight request, use the persistent cache before the network, allow normal HTTP caching, and keep the request timeout at 20 seconds unless evidence supports another value.
 
 Availability scans wait until chapter loading completes and the browser is idle. Opening Options may request a scan sooner, but it must still wait for an active chapter request. A chapter failure must remain retryable from the panel and after the browser reports that connectivity has returned.
 
 Offline download is optional and must not change online playback behavior.
 
 - Keep online requests network-first. A completed download is a fallback, not a saved offline-mode preference.
-- Download only the selected episode, audio language, and source. Keep one completed audiobook and one resumable staging download.
+- Download only the selected book, audio language, and source. Keep one completed audiobook and one resumable staging download.
 - Require same-origin audio with a valid total size and HTTP byte-range support. Do not accept a full `200` response for a requested chunk.
 - Store media as sequential 8 MiB Cache Storage chunks. Only a `ready` manifest may serve audio.
 - Serve correct `200`, `206`, `416`, `Content-Length`, and `Content-Range` responses without assembling the full audiobook in memory.
-- Keep episode configuration in the offline cache. Cover, chapter, and library files are optional supporting assets.
+- Keep the actual loaded configuration URL (`book.json` or `episode.json`) in the offline cache. Existing legacy-only downloads must still reload offline. Cover, chapter, and library files are optional supporting assets.
 - Check estimated quota, handle `QuotaExceededError`, request persistence where available, and explain that browser storage can still be evicted.
 - Let interrupted transfers resume, but explicit cancellation and Reset Player must remove partial chunks.
 - Increment the service-worker shell version when its cached file list or versioned entry points change.
@@ -145,13 +153,15 @@ Use inline SVG or CSS for platform-independent icons. Avoid Unicode symbols for 
 
 ## Verification checklist
 
-For media changes, check first Play, Pause, resume, seek before metadata, quality/language/episode switching while paused and playing, codec fallback, rejected `play()`, offline recovery, and stale async results.
+For configuration changes, check new-only, legacy-only, and mixed libraries; filename and collection precedence; missing and invalid files; network failure; cancellation; request reuse; two-worker title loading; old query links; unchanged progress; and legacy offline reloads.
 
-For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/episode requests, current-title updates, and the no-chapter case.
+For media changes, check first Play, Pause, resume, seek before metadata, quality/language/book switching while paused and playing, codec fallback, rejected `play()`, offline recovery, and stale async results.
+
+For chapter changes, check cache miss, cache hit, corrupt storage, URL and `cacheVersion` invalidation, Retry, online recovery, stale language/book requests, current-title updates, and the no-chapter case.
 
 For embedded chapters, check QuickTime and Nero metadata, a `moov` atom after a large `mdat`, unsupported ranges, malformed atoms, declared title lengths with trailing format data, UTF-8/UTF-16 titles, quality/source fallback changes, and playback continuing while parsing fails.
 
-For embedded covers, check JPEG and PNG metadata, missing or malformed `covr` atoms, external-file fallback, stale episode and language work, Blob URL cleanup, unsupported ranges, offline downloaded M4A/M4B files, shared `moov` requests with independent cancellation, and playback continuing while parsing fails.
+For embedded covers, check JPEG and PNG metadata, missing or malformed `covr` atoms, external-file fallback, stale book and language work, Blob URL cleanup, unsupported ranges, offline downloaded M4A/M4B files, shared `moov` requests with independent cancellation, and playback continuing while parsing fails.
 
 For offline changes, check unsupported browsers, invalid range servers, insufficient quota, complete download, cancellation, interrupted resume, offline reload, seeking near both ends, online reconnect, source replacement, cache-version mismatch, eviction, and reset cleanup.
 
