@@ -276,6 +276,8 @@ The audio element starts with `preload="none"` and no `src`.
 - The first Play action assigns the source and calls `play()` within the same user gesture.
 - Source changes while playing preserve position, playback rate, and playback intent.
 
+The pending position survives zero-time events during source reloads. A chapter seek made before metadata arrives, or followed by a source fallback, is applied when the new source is ready.
+
 Browsers control actual buffering and may treat `preload` as a hint after a source is assigned.
 
 ## Offline downloads
@@ -294,6 +296,8 @@ Offline download requires:
 - enough browser-managed storage for the selected source
 
 The player checks `navigator.storage.estimate()` before starting and requests persistent storage where supported. Quota values are estimates, persistence can be refused, and browsers may evict site data later. Keep the page open while downloading; iOS and other mobile browsers can suspend page work in the background.
+
+Online audio requests go directly through the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt chapter seeking. When the browser reports that it is offline, the service worker serves the downloaded audio's byte ranges. Other requests, including chapter and cover metadata, remain network-first with cached fallback. If the browser still reports an online connection during an outage, native audio requests cannot use the saved copy until it detects the offline state.
 
 Only a complete manifest is eligible for playback. The service worker reconstructs audio range responses from cached chunks, so offline seeking does not load the entire audiobook into memory. Change `cacheVersion` when replacing an audio file. An older completed copy remains usable offline until the user replaces or removes it.
 

@@ -1,4 +1,4 @@
-import { UI_STRINGS } from "./i18n.js?v=9";
+import { UI_STRINGS } from "./i18n.js?v=10";
 import { BookConfigStore, queryBookId } from "./js/book-config.js";
 import { scanSources } from "./js/availability.js";
 import { loadChapters, parseChapterText } from "./js/chapters.js";

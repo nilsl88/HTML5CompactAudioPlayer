@@ -141,3 +141,43 @@ test("offline media errors preserve the active source for recovery", async () =>
   online = true;
   media.destroy();
 });
+
+test("source reload time updates cannot erase a pending chapter seek", async () => {
+  const audio = new FakeAudio();
+  const media = new MediaController(audio, {}, { sourceTimeoutMs: 1000 });
+  try {
+    await media.setSelection(sources, "opus-128", 0, true);
+    audio.duration = 7200;
+    audio.emit("loadedmetadata");
+    audio.emit("playing");
+    media.seek(1873.685);
+    audio.load = () => {
+      audio.currentTime = 0;
+      audio.duration = Number.NaN;
+      audio.emit("timeupdate");
+      audio.emit("loadstart");
+    };
+    await media.failCurrent(new Error("Range request failed"));
+    assert.equal(media.position(), 1873.685);
+    assert.equal(media.loaded, false);
+    audio.duration = 7200;
+    audio.emit("loadedmetadata");
+    assert.equal(audio.currentTime, 1873.685);
+    assert.equal(media.playbackIntent, true);
+  } finally { media.destroy(); }
+});
+
+test("paused chapter seeks survive zero-time events before the first Play", async () => {
+  const audio = new FakeAudio();
+  const media = new MediaController(audio, {}, { sourceTimeoutMs: 1000 });
+  try {
+    await media.setSelection(sources, "aac-128", 0, false);
+    media.seek(2193.255);
+    audio.emit("timeupdate");
+    assert.equal(media.position(), 2193.255);
+    await media.requestPlay();
+    audio.duration = 7200;
+    audio.emit("loadedmetadata");
+    assert.equal(audio.currentTime, 2193.255);
+  } finally { media.destroy(); }
+});

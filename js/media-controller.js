@@ -53,6 +53,8 @@ export class MediaController {
     this.audio.addEventListener("stalled", handleBuffering);
     this.audio.addEventListener("ended", () => { this.playbackIntent = false; this.setState("ended"); this.callbacks.onEnded?.(); });
     this.audio.addEventListener("timeupdate", () => {
+      // Reloading a source can emit timeupdate at zero before metadata arrives.
+      if (!this.loaded || this.audio.seeking) return;
       if (this.state === "stalled" && !this.audio.paused) { this.clearTimeout(); this.setState("playing"); }
       if (Number.isFinite(this.audio.currentTime)) {
         this.desiredTime = this.audio.currentTime;
@@ -98,14 +100,14 @@ export class MediaController {
   }
 
   clearSource() {
+    this.loaded = false;
+    this.hasStarted = false;
     this.internalPause = true;
     try { this.audio.pause(); } catch {}
     this.audio.removeAttribute("src");
     this.audio.preload = "none";
     try { this.audio.load(); } catch {}
     this.internalPause = false;
-    this.loaded = false;
-    this.hasStarted = false;
     this.setState("idle");
   }
 
@@ -116,11 +118,12 @@ export class MediaController {
     if (!source || this.attempted.has(source.url)) return false;
     const generation = this.generation;
     this.attempted.add(source.url);
+    this.loaded = false;
+    this.hasStarted = false;
     this.internalPause = true;
     try { this.audio.pause(); } catch {}
     this.internalPause = false;
     this.audio.preload = shouldPlay ? "auto" : "metadata";
-    this.hasStarted = false;
     this.audio.src = source.url;
     this.applyMediaSettings();
     this.setState("loading");
@@ -197,7 +200,7 @@ export class MediaController {
     try { this.audio.defaultPlaybackRate = this.playbackRate; this.audio.playbackRate = this.playbackRate; } catch {}
     try { this.audio.volume = this.volume; } catch {}
   }
-  position() { return Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : this.desiredTime; }
+  position() { return this.loaded && !this.audio.seeking && Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : this.desiredTime; }
   duration() { return Number.isFinite(this.audio.duration) && this.audio.duration > 0 ? this.audio.duration : 0; }
   setState(state) { if (state !== this.state) { this.state = state; this.callbacks.onState?.(state); } }
   armTimeout(generation, url, includeStall = false) {

@@ -185,11 +185,11 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("player.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(html, /player\.css\?v=9/);
-  assert.match(html, /player\.js\?v=9/);
-  assert.match(source, /i18n\.js\?v=9/);
-  assert.match(worker, /const SHELL_VERSION = "v9"/);
-  for (const path of ["player.css?v=9", "player.js?v=9", "i18n.js?v=9", "js/book-config.js", "js/offline.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
+  assert.match(html, /player\.css\?v=10/);
+  assert.match(html, /player\.js\?v=10/);
+  assert.match(source, /i18n\.js\?v=10/);
+  assert.match(worker, /const SHELL_VERSION = "v10"/);
+  for (const path of ["player.css?v=10", "player.js?v=10", "i18n.js?v=10", "js/book-config.js", "js/offline.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
 });
 
 test("offline lifecycle is optional and reset clears downloaded media", async () => {
