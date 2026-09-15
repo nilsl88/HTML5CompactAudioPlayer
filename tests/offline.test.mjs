@@ -202,8 +202,8 @@ for (const filename of ["book.json", "episode.json"]) test(`downloads and reload
   assert.equal(manifest.episodeTitle, "Book");
   assert.ok(await (await cacheStorage.open(manifest.cacheName)).match(loaded.configUrl));
 
-  await cacheStorage.open("compact-player-shell-v8");
   await cacheStorage.open("compact-player-shell-v9");
+  await cacheStorage.open("compact-player-shell-v10");
   const events = {};
   const source = await readFile(new URL("../sw.js", import.meta.url), "utf8");
   const context = vm.createContext({
@@ -216,7 +216,7 @@ for (const filename of ["book.json", "episode.json"]) test(`downloads and reload
   let activated;
   events.activate({ waitUntil: (promise) => { activated = promise; } });
   await activated;
-  assert.equal((await cacheStorage.keys()).includes("compact-player-shell-v8"), false);
+  assert.equal((await cacheStorage.keys()).includes("compact-player-shell-v9"), false);
   assert.ok((await cacheStorage.keys()).includes(manifest.cacheName));
 
   const offlineFetch = (url, options) => context.networkFirst(new Request(url, options));
@@ -277,4 +277,52 @@ test("service worker range parser handles open and suffix requests", async () =>
   assert.equal(response.status, 206);
   assert.equal(response.headers.get("content-range"), "bytes 3-7/10");
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [3, 4, 5, 6, 7]);
+});
+
+test("online audio ranges use the native browser network path", async () => {
+  const events = {};
+  let intercepted = false;
+  let fetched = false;
+  const context = vm.createContext({
+    self: {
+      registration: { scope: "https://example.test/" },
+      location: { origin: "https://example.test" },
+      navigator: { onLine: true },
+      addEventListener: (name, handler) => { events[name] = handler; },
+    },
+    fetch: async () => { fetched = true; return new Response(); },
+    URL, Request, Response,
+  });
+  vm.runInContext(await readFile(new URL("../sw.js", import.meta.url), "utf8"), context);
+  const request = new Request("https://example.test/book.m4b", { headers: { Range: "bytes=12000000-" } });
+  Object.defineProperty(request, "destination", { value: "audio" });
+  events.fetch({ request, respondWith: () => { intercepted = true; } });
+  assert.equal(intercepted, false);
+  assert.equal(fetched, false);
+});
+
+test("offline audio still serves downloaded ranges through the worker", async () => {
+  const events = {};
+  const context = vm.createContext({
+    self: {
+      registration: { scope: "https://example.test/" },
+      location: { origin: "https://example.test" },
+      navigator: { onLine: false },
+      addEventListener: (name, handler) => { events[name] = handler; },
+    },
+    fetch: async () => { throw new TypeError("Offline"); },
+    URL, Request, Response,
+  });
+  vm.runInContext(await readFile(new URL("../sw.js", import.meta.url), "utf8"), context);
+  context.cachedFallback = async () => new Response(new Uint8Array([7, 8]), {
+    status: 206, headers: { "content-range": "bytes 7-8/10" },
+  });
+  const request = new Request("https://example.test/book.m4b", { headers: { Range: "bytes=7-8" } });
+  Object.defineProperty(request, "destination", { value: "audio" });
+  let responsePromise;
+  events.fetch({ request, respondWith: (promise) => { responsePromise = promise; } });
+  const response = await responsePromise;
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), "bytes 7-8/10");
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [7, 8]);
 });

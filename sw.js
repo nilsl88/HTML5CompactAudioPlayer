@@ -1,13 +1,13 @@
-const SHELL_VERSION = "v9";
+const SHELL_VERSION = "v10";
 const SHELL_CACHE = `compact-player-shell-${SHELL_VERSION}`;
 const META_CACHE = "compact-player-offline-meta-v1";
 const DOWNLOAD_HEADER = "x-compact-player-download";
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=9",
-  "./player.js?v=9",
-  "./i18n.js?v=9",
+  "./player.css?v=10",
+  "./player.js?v=10",
+  "./i18n.js?v=10",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/config.js",
@@ -160,5 +160,8 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (!["GET", "HEAD"].includes(request.method) || request.headers.get(DOWNLOAD_HEADER) === "1") return;
   if (new URL(request.url).origin !== self.location.origin) return;
+  // Firefox can fail media seeks when a worker forwards the streaming response.
+  // Let the browser own online audio; offline requests still use saved chunks.
+  if (request.destination === "audio" && self.navigator?.onLine !== false) return;
   event.respondWith(networkFirst(request));
 });
