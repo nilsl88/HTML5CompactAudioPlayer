@@ -66,12 +66,12 @@
         <h2 id="optionsTitle" class="sr-only">Options</h2>
         <fieldset class="settings-group">
           <legend id="audioSettingsLegend">Audio</legend>
-          <div id="bookRow" class="setting-row" hidden><label for="bookSelect">Audiobook</label><select id="bookSelect"></select></div>
-          <div class="setting-row"><label for="langSelect">Audio language</label><select id="langSelect"></select></div>
-          <div class="setting-row"><label for="qualitySelect">Quality</label><select id="qualitySelect"></select></div>
+          <div id="bookRow" class="setting-row" hidden><label for="bookSelect">Audiobook</label><div class="select-wrap"><select id="bookSelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
+          <div class="setting-row"><label for="langSelect">Audio language</label><div class="select-wrap"><select id="langSelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
+          <div class="setting-row"><label for="qualitySelect">Quality</label><div class="select-wrap"><select id="qualitySelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
           <div id="volumeRow" class="setting-row range-row"><label for="volumeRange">Volume</label><div class="range-wrap"><input id="volumeRange" type="range" min="0" max="100" value="100" step="1"><output id="volumeValue" for="volumeRange">100%</output></div></div>
           <div class="setting-row range-row"><label for="speedRange">Playback speed</label><div class="range-wrap"><input id="speedRange" type="range" min="0.5" max="2" value="1" step="0.05"><output id="speedValue" for="speedRange">1×</output></div></div>
-          <div class="setting-row"><label for="skipSelect">Skip interval</label><select id="skipSelect"><option value="5">5 s</option><option value="10">10 s</option><option value="15">15 s</option><option value="30">30 s</option><option value="60">60 s</option></select></div>
+          <div class="setting-row"><label for="skipSelect">Skip interval</label><div class="select-wrap"><select id="skipSelect"><option value="5">5 s</option><option value="10">10 s</option><option value="15">15 s</option><option value="30">30 s</option><option value="60">60 s</option></select><span class="select-arrow" aria-hidden="true"></span></div></div>
           <section id="offlineRow" class="offline-setting" aria-labelledby="offlineLabel" hidden>
             <div class="offline-heading">
               <span id="offlineLabel">Offline</span>
@@ -87,9 +87,9 @@
         </fieldset>
         <fieldset class="settings-group">
           <legend id="appearanceLegend">Appearance</legend>
-          <div class="setting-row"><label for="themeSelect">Mode</label><select id="themeSelect"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
-          <div class="setting-row"><label for="fontSizeSelect">Text size</label><select id="fontSizeSelect"><option value="s">Small</option><option value="m">Medium</option><option value="l">Large</option></select></div>
-          <div class="setting-row"><label for="uiLangSelect">Player language</label><select id="uiLangSelect"></select></div>
+          <div class="setting-row"><label for="themeSelect">Mode</label><div class="select-wrap"><select id="themeSelect"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select><span class="select-arrow" aria-hidden="true"></span></div></div>
+          <div class="setting-row"><label for="fontSizeSelect">Text size</label><div class="select-wrap"><select id="fontSizeSelect"><option value="s">Small</option><option value="m">Medium</option><option value="l">Large</option></select><span class="select-arrow" aria-hidden="true"></span></div></div>
+          <div class="setting-row"><label for="uiLangSelect">Player language</label><div class="select-wrap"><select id="uiLangSelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
         </fieldset>
         <div class="reset-row"><button id="resetBtn" class="text-button" type="button">Reset player</button></div>
       </form>

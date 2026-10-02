@@ -85,6 +85,39 @@ test("control tooltips support mouse and keyboard users", async () => {
   }
 });
 
+test("select controls use aligned custom arrows", async () => {
+  const html = await readFile(new URL("index.html", root), "utf8");
+  const css = await readFile(new URL("player.css", root), "utf8");
+  const source = await readFile(new URL("player.js", root), "utf8");
+  for (const id of ["bookSelect", "langSelect", "qualitySelect", "skipSelect", "themeSelect", "fontSizeSelect", "uiLangSelect"]) {
+    assert.match(html, new RegExp(`<div class="select-wrap"><select id="${id}"[\\s\\S]*?</select><span class="select-arrow" aria-hidden="true"><\\/span><\\/div>`));
+  }
+  assert.match(css, /\.select-wrap\s*{[^}]*position:\s*relative;/s);
+  assert.match(css, /select\s*{[^}]*appearance:\s*none;[^}]*-webkit-appearance:\s*none;/s);
+  assert.match(css, /\.select-arrow\s*{[^}]*top:\s*50%;[^}]*right:\s*var\(--space-3\);/s);
+  assert.match(css, /\.select-arrow\s*{[^}]*transform:\s*translateY\(-50%\) rotate\(45deg\);/s);
+  assert.match(css, /\.select-button::after\s*{[^}]*transform:\s*translateY\(-50%\) rotate\(45deg\);/s);
+  assert.match(css, /\.select-wrap select:disabled \+ \.select-arrow\s*{[^}]*opacity:\s*\.55;/s);
+  assert.match(source, /function selectWithArrow\(select\)/);
+  assert.match(source, /uiRow\.append\(uiLabel, selectWithArrow\(onboardingUiSelect\)\)/);
+  assert.match(source, /audioRow\.append\(audioLabel, selectWithArrow\(onboardingAudioSelect\)\)/);
+});
+
+test("select controls use styled accessible popups", async () => {
+  const css = await readFile(new URL("player.css", root), "utf8");
+  const source = await readFile(new URL("player.js", root), "utf8");
+  assert.match(css, /\.select-button\s*{[^}]*min-height:\s*var\(--control-size\);[^}]*justify-content:\s*space-between;/s);
+  assert.match(css, /\.select-button::after\s*{[^}]*border-right:[^;]+;[^}]*border-bottom:[^;]+;/s);
+  assert.match(css, /\.select-menu\s*{[^}]*position:\s*absolute;[^}]*max-height:[^;]+;[^}]*overflow:\s*auto;/s);
+  assert.match(css, /\.select-wrap\.opens-up \.select-menu\s*{/);
+  assert.match(source, /function enhanceCustomSelect\(select\)/);
+  assert.match(source, /button\.setAttribute\("role", "combobox"\)/);
+  assert.match(source, /menu\.setAttribute\("role", "listbox"\)/);
+  assert.match(source, /button\.setAttribute\("role", "option"\)/);
+  assert.match(source, /function handleCustomSelectKeydown\(event, state\)/);
+  assert.match(source, /state\.select\.dispatchEvent\(new Event\("change", \{ bubbles: true \}\)\)/);
+});
+
 test("CSS custom properties are defined", async () => {
   const css = await readFile(new URL("player.css", root), "utf8");
   const definitions = new Set([...css.matchAll(/(--[\w-]+)\s*:/g)].map((match) => match[1]));
