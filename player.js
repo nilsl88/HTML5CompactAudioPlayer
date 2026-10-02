@@ -89,6 +89,8 @@ let onboardingUiSelect = null;
 let onboardingAudioSelect = null;
 const toastTimes = new Map();
 const errorTimes = new Map();
+const customSelectStates = new Map();
+let openCustomSelect = null;
 let focusOfflineCancel = false;
 const offline = new OfflineManager({
   baseUrl: documentBaseUrl,
@@ -168,6 +170,10 @@ function updateSelectionControlState() {
   els.bookSelect.disabled = uiBusy || offlineLocked;
   els.langSelect.disabled = uiBusy || offlineLocked;
   els.qualitySelect.disabled = uiBusy || offlineLocked || (book ? qualityOptionsForCurrentLanguage().length <= 1 : true);
+  for (const select of customSelectStates.keys()) {
+    syncCustomSelect(select);
+    if (select.disabled) closeCustomSelect(customSelectStates.get(select));
+  }
 }
 
 function setMeta(message, error = false) {
@@ -389,7 +395,210 @@ function optionsFrom(select, records, selected, label) {
     option.selected = record.value === selected;
     select.appendChild(option);
   }
+  syncCustomSelect(select);
 }
+
+function selectWithArrow(select) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "select-wrap";
+  const arrow = document.createElement("span");
+  arrow.className = "select-arrow";
+  arrow.setAttribute("aria-hidden", "true");
+  wrapper.append(select, arrow);
+  return wrapper;
+}
+
+function selectFocusTarget(select) {
+  return customSelectStates.get(select)?.button || select;
+}
+
+function setSelectValue(select, value) {
+  select.value = String(value);
+  syncCustomSelect(select);
+}
+
+function closeCustomSelect(state, restoreFocus = false) {
+  if (!state) return;
+  state.menu.hidden = true;
+  state.button.setAttribute("aria-expanded", "false");
+  state.button.removeAttribute("aria-activedescendant");
+  state.wrapper.classList.remove("opens-up");
+  if (openCustomSelect === state) openCustomSelect = null;
+  if (restoreFocus) state.button.focus();
+}
+
+function closeAllCustomSelects(restoreFocus = false) {
+  const active = openCustomSelect;
+  for (const state of customSelectStates.values()) closeCustomSelect(state, restoreFocus && state === active);
+}
+
+function setCustomSelectActive(state, index) {
+  if (!state.options.length) return;
+  state.activeIndex = index;
+  for (const [optionIndex, option] of state.options.entries()) option.classList.toggle("is-active", optionIndex === index);
+  const active = state.options[index];
+  if (!active) state.button.removeAttribute("aria-activedescendant");
+  else {
+    state.button.setAttribute("aria-activedescendant", active.id);
+    const optionTop = active.offsetTop;
+    const optionBottom = optionTop + active.offsetHeight;
+    if (optionTop < state.menu.scrollTop) state.menu.scrollTop = optionTop;
+    else if (optionBottom > state.menu.scrollTop + state.menu.clientHeight) state.menu.scrollTop = optionBottom - state.menu.clientHeight;
+  }
+}
+
+function moveCustomSelectActive(state, direction) {
+  if (!state.options.length) return;
+  let index = state.activeIndex;
+  if (index < 0) index = direction > 0 ? -1 : state.options.length;
+  for (let count = 0; count < state.options.length; count += 1) {
+    index = (index + direction + state.options.length) % state.options.length;
+    if (!state.options[index].disabled) { setCustomSelectActive(state, index); return; }
+  }
+}
+
+function positionCustomSelect(state) {
+  const rect = state.button.getBoundingClientRect();
+  const menuHeight = state.menu.getBoundingClientRect().height || Math.min(288, state.options.length * 44 + 8);
+  const opensUp = rect.bottom + menuHeight > window.innerHeight - 8 && rect.top > menuHeight;
+  state.wrapper.classList.toggle("opens-up", opensUp);
+}
+
+function chooseCustomSelectOption(state, index) {
+  const option = state.select.options[index];
+  if (!option || option.disabled) return;
+  const changed = state.select.value !== option.value;
+  state.select.value = option.value;
+  syncCustomSelect(state.select);
+  closeCustomSelect(state, true);
+  if (changed) state.select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function openCustomSelectMenu(state) {
+  if (!state || state.select.disabled) return;
+  closeAllCustomSelects();
+  syncCustomSelect(state.select);
+  state.menu.hidden = false;
+  state.button.setAttribute("aria-expanded", "true");
+  openCustomSelect = state;
+  const selectedIndex = state.select.selectedIndex >= 0 && !state.options[state.select.selectedIndex]?.disabled
+    ? state.select.selectedIndex
+    : state.options.findIndex((option) => !option.disabled);
+  if (selectedIndex >= 0) setCustomSelectActive(state, selectedIndex);
+  positionCustomSelect(state);
+}
+
+function handleCustomSelectKeydown(event, state) {
+  if (state.select.disabled) return;
+  const isOpen = !state.menu.hidden;
+  if (event.key === "Escape" && isOpen) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCustomSelect(state, true);
+    return;
+  }
+  if (event.key === "Tab" && isOpen) { closeCustomSelect(state); return; }
+  if (!isOpen) {
+    if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    openCustomSelectMenu(state);
+    if (event.key === "ArrowDown") moveCustomSelectActive(state, 1);
+    if (event.key === "ArrowUp") moveCustomSelectActive(state, -1);
+    return;
+  }
+  if (event.key === "ArrowDown") { event.preventDefault(); moveCustomSelectActive(state, 1); }
+  else if (event.key === "ArrowUp") { event.preventDefault(); moveCustomSelectActive(state, -1); }
+  else if (event.key === "Home") { event.preventDefault(); setCustomSelectActive(state, state.options.findIndex((option) => !option.disabled)); }
+  else if (event.key === "End") {
+    event.preventDefault();
+    let lastIndex = -1;
+    for (let index = state.options.length - 1; index >= 0; index -= 1) {
+      if (!state.options[index].disabled) { lastIndex = index; break; }
+    }
+    setCustomSelectActive(state, lastIndex);
+  }
+  else if (event.key === "Enter" || event.key === " ") { event.preventDefault(); chooseCustomSelectOption(state, state.activeIndex); }
+}
+
+function syncCustomSelect(select) {
+  const state = customSelectStates.get(select);
+  if (!state) return;
+  const options = [...select.options];
+  clearChildren(state.menu);
+  state.options = options.map((option, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "select-option";
+    button.id = `${select.id}-option-${index}`;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(option.value === select.value));
+    button.disabled = select.disabled || option.disabled;
+    button.textContent = option.textContent;
+    button.addEventListener("click", () => chooseCustomSelectOption(state, index));
+    state.menu.appendChild(button);
+    return button;
+  });
+  const selected = options[select.selectedIndex];
+  state.button.textContent = selected?.textContent || "";
+  state.button.disabled = select.disabled;
+  if (state.menu.hidden) state.button.setAttribute("aria-expanded", "false");
+  if (state.menu.hidden) state.button.removeAttribute("aria-activedescendant");
+}
+
+function destroyCustomSelect(select) {
+  const state = customSelectStates.get(select);
+  if (!state) return;
+  closeCustomSelect(state);
+  state.button.remove();
+  state.menu.remove();
+  select.classList.remove("select-native");
+  select.removeAttribute("aria-hidden");
+  select.removeAttribute("tabindex");
+  state.wrapper.classList.remove("is-custom", "opens-up");
+  customSelectStates.delete(select);
+}
+
+function enhanceCustomSelect(select) {
+  if (!select || customSelectStates.has(select)) return customSelectStates.get(select);
+  const wrapper = select.closest(".select-wrap");
+  if (!wrapper) return null;
+  const label = document.querySelector(`label[for="${select.id}"]`);
+  if (label) label.id ||= `${select.id}-label`;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "select-button";
+  button.id = `${select.id}-button`;
+  button.setAttribute("role", "combobox");
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  if (label) button.setAttribute("aria-labelledby", label.id);
+  const menu = document.createElement("div");
+  menu.className = "select-menu";
+  menu.id = `${select.id}-menu`;
+  menu.setAttribute("role", "listbox");
+  if (label) menu.setAttribute("aria-labelledby", label.id);
+  menu.hidden = true;
+  button.setAttribute("aria-controls", menu.id);
+  const state = { select, wrapper, button, menu, options: [], activeIndex: -1 };
+  customSelectStates.set(select, state);
+  select.classList.add("select-native");
+  select.setAttribute("aria-hidden", "true");
+  select.setAttribute("tabindex", "-1");
+  wrapper.classList.add("is-custom");
+  wrapper.insertBefore(button, select);
+  wrapper.appendChild(menu);
+  if (label) label.addEventListener("click", (event) => { event.preventDefault(); state.button.focus(); });
+  button.addEventListener("click", () => (state.menu.hidden ? openCustomSelectMenu(state) : closeCustomSelect(state, true)));
+  button.addEventListener("keydown", (event) => handleCustomSelectKeydown(event, state));
+  syncCustomSelect(select);
+  return state;
+}
+
+function initializeCustomSelects() {
+  for (const select of [els.bookSelect, els.langSelect, els.qualitySelect, els.skipSelect, els.themeSelect, els.fontSizeSelect, els.uiLangSelect]) enhanceCustomSelect(select);
+}
+
+initializeCustomSelects();
 
 function populateLibrarySelect() {
   optionsFrom(els.bookSelect, library.books.map((item) => ({ ...item, value: item.id })), bookId, (item) => localizedValue(item.title, locale, item.label || item.id));
@@ -412,6 +621,7 @@ function populateQualitySelect(forceSource = null) {
   const visible = qualityOptionsForCurrentLanguage(forceSource);
   optionsFrom(els.qualitySelect, visible.map((source) => ({ ...source, value: source.id })), forceSource?.id || selectedSourceId, (source) => book.debug.showAllQualities ? sourceLabel(source, true) : sourceLabel(source, false));
   els.qualitySelect.disabled = uiBusy || navigator.onLine === false || visible.length <= 1;
+  syncCustomSelect(els.qualitySelect);
 }
 
 function updateTitle() {
@@ -1026,8 +1236,8 @@ function setAppearance() {
   else document.documentElement.dataset.theme = uiPrefs.theme;
   if (uiPrefs.fontSize === "m") document.documentElement.removeAttribute("data-font");
   else document.documentElement.dataset.font = uiPrefs.fontSize;
-  els.themeSelect.value = uiPrefs.theme;
-  els.fontSizeSelect.value = uiPrefs.fontSize;
+  setSelectValue(els.themeSelect, uiPrefs.theme);
+  setSelectValue(els.fontSizeSelect, uiPrefs.fontSize);
 }
 
 // WebKit exposes audio.volume on iOS but ignores programmatic changes.
@@ -1054,7 +1264,7 @@ function applyUiPreferences() {
 function applySkipInterval(seconds) {
   const value = [5, 10, 15, 30, 60].includes(Number(seconds)) ? Number(seconds) : 15;
   uiPrefs.skipSeconds = value;
-  els.skipSelect.value = String(value);
+  setSelectValue(els.skipSelect, String(value));
   setText(els.skipBackBtn.querySelector("[aria-hidden]"), `−${value}`);
   setText(els.skipForwardBtn.querySelector("[aria-hidden]"), `+${value}`);
   const backLabel = t("skipBackAria", { s: value });
@@ -1148,6 +1358,8 @@ function renderResetBody() {
 function renderOnboarding(uiValue = uiPrefs.uiLanguage, audioValue = languageCode) {
   const previewLocale = resolveUiLocale(uiValue);
   const ot = (key, variables = {}) => translateAt(previewLocale, key, variables);
+  destroyCustomSelect(onboardingUiSelect);
+  destroyCustomSelect(onboardingAudioSelect);
   clearChildren(els.onboardingBody);
   const intro = document.createElement("p");
   const strong = document.createElement("strong");
@@ -1167,12 +1379,14 @@ function renderOnboarding(uiValue = uiPrefs.uiLanguage, audioValue = languageCod
   onboardingUiSelect = document.createElement("select"); onboardingUiSelect.id = "onboardingUiLanguage";
   const uiRecords = [{ value: "auto", label: ot("uiLanguageAuto") }, ...Object.keys(UI_STRINGS).map((code) => ({ value: code, label: uiLanguageNames[code] || code }))];
   optionsFrom(onboardingUiSelect, uiRecords, uiValue, (item) => item.label);
-  uiRow.append(uiLabel, onboardingUiSelect);
+  uiRow.append(uiLabel, selectWithArrow(onboardingUiSelect));
+  enhanceCustomSelect(onboardingUiSelect);
   const audioRow = document.createElement("div"); audioRow.className = "onboard-row";
   const audioLabel = document.createElement("label"); audioLabel.htmlFor = "onboardingAudioLanguage"; audioLabel.textContent = ot("languageLabel");
   onboardingAudioSelect = document.createElement("select"); onboardingAudioSelect.id = "onboardingAudioLanguage";
   optionsFrom(onboardingAudioSelect, Object.values(book.languages).map((language) => ({ value: language.code, label: language.label })), audioValue, (item) => item.label);
-  audioRow.append(audioLabel, onboardingAudioSelect);
+  audioRow.append(audioLabel, selectWithArrow(onboardingAudioSelect));
+  enhanceCustomSelect(onboardingAudioSelect);
   controls.append(uiRow, audioRow);
   els.onboardingBody.append(intro, list, controls);
   setText(els.onboardingTitle, ot("onboardTitle"));
@@ -1288,7 +1502,7 @@ function updateSleepButton() {
 
 async function changeLanguage(nextCode) {
   if (navigator.onLine === false) {
-    els.langSelect.value = languageCode;
+    setSelectValue(els.langSelect, languageCode);
     showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
     return;
   }
@@ -1319,7 +1533,7 @@ async function changeLanguage(nextCode) {
 
 async function changeQuality(nextId) {
   if (navigator.onLine === false) {
-    els.qualitySelect.value = selectedSourceId;
+    setSelectValue(els.qualitySelect, selectedSourceId);
     showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
     return;
   }
@@ -1400,7 +1614,7 @@ els.sleepBtn.addEventListener("click", () => {
 els.optionsBtn.addEventListener("click", () => {
   if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
   closeAllPanels(els.optionsPanel);
-  openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? els.langSelect : els.bookSelect);
+  openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? selectFocusTarget(els.langSelect) : selectFocusTarget(els.bookSelect));
   void loadLibraryTitles();
   requestAvailabilityScan(bookGeneration, languageCode, true);
 });
@@ -1408,7 +1622,7 @@ els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPane
 els.closeSleepBtn.addEventListener("click", () => closePanel(els.sleepPanel, els.sleepBtn, true));
 els.bookSelect.addEventListener("change", async () => {
   if (navigator.onLine === false) {
-    els.bookSelect.value = bookId;
+    setSelectValue(els.bookSelect, bookId);
     showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
     return;
   }
@@ -1490,9 +1704,12 @@ els.resetOk.addEventListener("click", async () => {
   location.reload();
 });
 
-document.addEventListener("click", (event) => { if (!els.player.contains(event.target)) closeAllPanels(); });
+document.addEventListener("click", (event) => {
+  if (!openCustomSelect?.wrapper.contains(event.target)) closeAllCustomSelects();
+  if (!els.player.contains(event.target)) closeAllPanels();
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") { closeAllPanels(null, true); return; }
+  if (event.key === "Escape") { closeAllCustomSelects(true); closeAllPanels(null, true); return; }
   if (event.ctrlKey || event.metaKey || event.altKey || event.target.closest("button, input, select, textarea, a, dialog")) return;
   if (event.code === "Space") {
     event.preventDefault();

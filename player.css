@@ -127,7 +127,21 @@ button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity:
 .offline-setting progress { width: 100%; height: .75rem; accent-color: var(--accent); }
 .offline-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .offline-actions button { flex: 1 1 12rem; }
-select { width: 100%; min-height: var(--control-size); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text); }
+.select-wrap { position: relative; min-width: 0; }
+select { width: 100%; min-height: var(--control-size); padding: var(--space-2) calc(var(--space-4) + var(--space-3)) var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text); appearance: none; -webkit-appearance: none; }
+.select-arrow { position: absolute; top: 50%; right: var(--space-3); width: .5rem; height: .5rem; border-right: .125rem solid currentColor; border-bottom: .125rem solid currentColor; pointer-events: none; transform: translateY(-50%) rotate(45deg); }
+.select-wrap select:disabled + .select-arrow { opacity: .55; }
+.select-wrap.is-custom .select-arrow { display: none; }
+.select-native { position: absolute; width: 1px; height: 1px; min-height: 1px; margin: -1px; padding: 0; overflow: hidden; border: 0; background: transparent; clip-path: inset(50%); white-space: nowrap; }
+.select-button { display: flex; width: 100%; min-height: var(--control-size); gap: var(--space-3); align-items: center; justify-content: space-between; padding: var(--space-2) calc(var(--space-4) + var(--space-3)) var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text); text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.select-button::after { flex: 0 0 auto; width: .5rem; height: .5rem; border-right: .125rem solid currentColor; border-bottom: .125rem solid currentColor; content: ""; transform: translateY(-50%) rotate(45deg); }
+.select-button[aria-expanded="true"] { border-color: var(--focus); box-shadow: 0 0 0 .2rem color-mix(in srgb, var(--focus) 24%, transparent); }
+.select-menu { position: absolute; top: calc(100% + var(--space-1)); right: 0; left: 0; z-index: 40; display: grid; max-height: min(18rem, 45dvh); gap: var(--space-1); overflow: auto; padding: var(--space-1); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-raised); box-shadow: var(--shadow); }
+.select-menu[hidden] { display: none; }
+.select-wrap.opens-up .select-menu { top: auto; bottom: calc(100% + var(--space-1)); }
+.select-option { width: 100%; min-height: var(--control-size); padding: var(--space-2) var(--space-3); border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text); text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.select-option[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 16%, var(--surface-raised)); font-weight: 700; }
+.select-option.is-active, .select-option:hover:not(:disabled), .select-option:focus-visible { background: color-mix(in srgb, var(--accent) 24%, var(--surface-raised)); }
 .range-wrap { display: flex; min-width: 0; gap: var(--space-2); align-items: center; }
 .range-wrap input { min-width: 0; width: 100%; accent-color: var(--accent); }
 .range-wrap output { min-width: 3.5rem; text-align: right; font-variant-numeric: tabular-nums; }
@@ -197,4 +211,5 @@ dialog::backdrop { background: rgb(0 0 0 / 65%); }
   :root { --border: CanvasText; --focus: Highlight; }
   .play-button, .primary-button, .panel-close { forced-color-adjust: none; background: ButtonText; color: ButtonFace; }
   .chapter-button[aria-current="true"], .sleep-option[aria-pressed="true"] { outline: 2px solid Highlight; }
+  .select-option[aria-selected="true"], .select-option.is-active { background: Highlight; color: HighlightText; }
 }
