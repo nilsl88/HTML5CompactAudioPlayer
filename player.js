@@ -1,13 +1,19 @@
-import { UI_STRINGS } from "./i18n.js?v=12";
+import { UI_STRINGS } from "./i18n.js?v=13";
 import { BookConfigStore, queryBookId } from "./js/book-config.js";
 import { scanSources } from "./js/availability.js";
-import { loadChapters, parseChapterText } from "./js/chapters.js";
-import { localizedValue, normalizeLibrary, parseJson, resolveCover, resolveLanguageAsset } from "./js/config.js";
+import { createCustomSelects } from "./js/custom-select.js";
+import { isMp4Audio, qualityLabelKey } from "./js/codecs.js";
+import { ChapterSession } from "./js/chapter-session.js";
+import { localizedValue, normalizeLibrary, parseJson, resolveCover } from "./js/config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./js/dialogs.js";
+import { createMediaSession } from "./js/media-session.js";
 import { MediaController } from "./js/media-controller.js";
-import { loadEmbeddedMp4Cover } from "./js/mp4-chapters.js";
-import { OfflineManager, manifestMatchesSelection } from "./js/offline.js";
+import { createCoverView } from "./js/cover.js";
+import { OfflineManager, manifestMatchesSelection, sameOfflineSelection } from "./js/offline.js";
 import { buildSources, chooseDefaultSource, visibleSources } from "./js/source-selection.js";
+import { SKIP_INTERVALS, skipInterval } from "./js/preferences.js";
+import { ProgressWriter } from "./js/progress-writer.js";
+import { SleepTimer } from "./js/sleep-timer.js";
 import { PlayerStorage } from "./js/storage.js";
 import { clearChildren, clamp, fetchTextWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./js/utils.js";
 
@@ -55,16 +61,23 @@ let sourcesByLanguage = new Map();
 let playedSourceUrls = new Set();
 let selectedSourceId = "";
 let currentSource = null;
-let cues = [];
-let activeCueIndex = -1;
-let chapterUrl = "";
-let chapterMode = "none";
-let chapterSourceKey = "";
-let chaptersLoaded = false;
-let chaptersFailed = false;
-let chapterController = null;
-let chapterLoadPromise = null;
-let chapterLoadShouldNotify = false;
+const chapters = new ChapterSession({
+  readCache: storage.readChapterData.bind(storage),
+  writeCache: storage.writeChapterData.bind(storage),
+  onStart() {
+    cancelAvailabilityWork();
+    els.chaptersList.setAttribute("aria-busy", "true");
+  },
+  onLoaded: applyChapterData,
+  onFailure(error, notify) {
+    els.chaptersList.setAttribute("aria-busy", "false");
+    reportError("chapter load", error);
+    if (notify) showToast(t("chaptersLoadFailed"), "warning", 5000);
+    renderChapterFailure();
+    updateChapterButtons();
+    markActiveChapter(media.position());
+  },
+});
 let bookController = null;
 let probeController = null;
 let probeLanguageCode = "";
@@ -72,34 +85,24 @@ let probeScheduleHandle = null;
 let probeScheduleUsesIdleCallback = false;
 let scannedAvailabilityLanguages = new Set();
 let bookGeneration = 0;
-let chapterGeneration = 0;
 let durationUnlocked = false;
 let seekDragging = false;
 let uiBusy = false;
-let progressTimer = null;
-let pendingProgress = null;
-let lastProgressWrite = 0;
-let resetInProgress = false;
+const progress = new ProgressWriter(storage);
 let resetRemaining = null;
 let mediaMetadataTitle = "";
-let coverGeneration = 0;
-let coverController = null;
-let coverObjectUrl = "";
 let trackObjectUrl = "";
-let sleepGeneration = 0;
-let sleepState = { mode: "off", minutes: 0, endAt: 0, chapterEnd: null, timeout: null, ticker: null, completing: false };
 let stallNoticeTimer = null;
 let onboardingUiSelect = null;
 let onboardingAudioSelect = null;
 const toastTimes = new Map();
 const errorTimes = new Map();
-const customSelectStates = new Map();
-let openCustomSelect = null;
+const mediaSession = createMediaSession(navigator, globalThis.MediaMetadata, reportError);
 let focusOfflineCancel = false;
 const offline = new OfflineManager({
   baseUrl: documentBaseUrl,
   onChange: (snapshot) => {
-    renderOfflineUi();
+    renderOfflineUi(snapshot);
     if (focusOfflineCancel && snapshot.phase === "preparing") {
       focusOfflineCancel = false;
       requestAnimationFrame(() => els.offlineCancelBtn.focus());
@@ -174,10 +177,7 @@ function updateSelectionControlState() {
   els.bookSelect.disabled = uiBusy || offlineLocked;
   els.langSelect.disabled = uiBusy || offlineLocked;
   els.qualitySelect.disabled = uiBusy || offlineLocked || (book ? qualityOptionsForCurrentLanguage().length <= 1 : true);
-  for (const select of customSelectStates.keys()) {
-    syncCustomSelect(select);
-    if (select.disabled) closeCustomSelect(customSelectStates.get(select));
-  }
+  syncSelectionControls();
 }
 
 function setMeta(message, error = false) {
@@ -191,9 +191,7 @@ function displayTitle() {
 
 function sourceLabel(source, includeDetails = true) {
   if (!source) return "";
-  let quality;
-  if (source.codec === "mp3") quality = source.bitrate >= 128 ? t("qLegacyFair") : source.bitrate >= 96 ? t("qLegacyLow") : t("qLegacyUltraLow");
-  else quality = source.bitrate >= 256 ? t("qPremium") : source.bitrate >= 128 ? t("qHigh") : source.bitrate >= 96 ? t("qLow") : t("qUltraLow");
+  const quality = t(qualityLabelKey(source.codec, source.bitrate));
   return includeDetails ? `${quality} · ${source.bitrate} kb/s · ${source.codec.toUpperCase()}` : quality;
 }
 
@@ -226,28 +224,11 @@ function currentOfflineSelection() {
       { url: libraryUrl, required: false },
       { url: bookConfigUrl, required: true },
       { url: ["file", "auto"].includes(book.coverSource) ? resolveCover(book) : "", required: false },
-      { url: chapterUrl, required: false },
+      { url: chapters.url, required: false },
     ].filter((asset) => {
       try { return asset.url && new URL(asset.url).origin === new URL(documentBaseUrl).origin; }
       catch { return false; }
     }),
-  };
-}
-
-function selectionFromManifest(manifest) {
-  if (!manifest) return null;
-  return {
-    episodeId: manifest.episodeId,
-    configBookId: manifest.configBookId,
-    episodeTitle: manifest.episodeTitle,
-    languageCode: manifest.languageCode,
-    languageLabel: manifest.languageLabel,
-    sourceId: manifest.sourceId,
-    sourceLabel: manifest.sourceLabel,
-    sourceUrl: manifest.sourceUrl,
-    mime: manifest.mime,
-    cacheVersion: manifest.cacheVersion,
-    assets: manifest.assets || [],
   };
 }
 
@@ -260,47 +241,47 @@ function manifestDescription(manifest) {
   });
 }
 
-function renderOfflineUi() {
+function renderOfflineUi(state = offline.snapshot()) {
   if (!els.offlineRow) return;
   updateSelectionControlState();
-  els.offlineRow.hidden = !offline.supported;
-  if (!offline.supported) return;
+  els.offlineRow.hidden = !state.supported;
+  if (!state.supported) return;
   setText(els.offlineLabel, t("offlineLabel"));
   const selection = currentOfflineSelection();
-  const activeMatches = selection && manifestMatchesSelection(offline.active, selection);
-  const busy = ["preparing", "downloading", "finalizing"].includes(offline.phase);
-  const percent = Math.round(offline.progress * 100);
+  const activeMatches = selection && manifestMatchesSelection(state.active, selection);
+  const busy = ["preparing", "downloading", "finalizing"].includes(state.phase);
+  const percent = Math.round(state.progress * 100);
   let status = "";
   let action = t("offlineDownload");
   let showDownload = true;
   let showCancel = false;
-  const showRemove = Boolean(offline.active || offline.repairable) && !busy;
+  const showRemove = Boolean(state.active || state.repairable) && !busy;
 
   els.offlineProgress.hidden = true;
-  if (offline.phase === "preparing") {
+  if (state.phase === "preparing") {
     status = t("offlinePreparing");
     showDownload = false;
     showCancel = true;
-  } else if (["downloading", "finalizing"].includes(offline.phase) && offline.staging) {
-    status = t("offlineDownloading", { percent, size: formatBytes(offline.progress * offline.staging.totalSize), total: formatBytes(offline.staging.totalSize) });
+  } else if (["downloading", "finalizing"].includes(state.phase) && state.staging) {
+    status = t("offlineDownloading", { percent, size: formatBytes(state.progress * state.staging.totalSize), total: formatBytes(state.staging.totalSize) });
     els.offlineProgress.hidden = false;
     showDownload = false;
-    showCancel = offline.phase === "downloading";
-  } else if (offline.staging) {
-    status = `${manifestDescription(offline.staging)} · ${t("offlinePaused", { percent })}`;
+    showCancel = state.phase === "downloading";
+  } else if (state.staging) {
+    status = `${manifestDescription(state.staging)} · ${t("offlinePaused", { percent })}`;
     action = t("offlineResume");
     showCancel = true;
     els.offlineProgress.hidden = false;
   } else if (activeMatches) {
-    status = t("offlineReady", { size: formatBytes(offline.active.totalSize) });
+    status = t("offlineReady", { size: formatBytes(state.active.totalSize) });
     showDownload = false;
-  } else if (offline.active) {
-    status = manifestDescription(offline.active);
+  } else if (state.active) {
+    status = manifestDescription(state.active);
     action = t("offlineReplace");
-  } else if (offline.repairable) {
-    status = t("offlineNeedsConfig", { book: offline.repairable.episodeTitle });
+  } else if (state.repairable) {
+    status = t("offlineNeedsConfig", { book: state.repairable.episodeTitle });
     showDownload = Boolean(selection);
-    action = t("offlineReplace");
+    action = sameOfflineSelection(state.repairable, selection) ? t("offlineDownload") : t("offlineReplace");
   }
 
   els.offlineProgress.value = percent;
@@ -309,10 +290,10 @@ function renderOfflineUi() {
   setText(els.offlineCancelBtn, t("offlineCancel"));
   setText(els.offlineRemoveBtn, t("offlineRemove"));
   setText(els.offlineRepairBtn, t("offlineRepair"));
-  els.offlineRepairBtn.hidden = !offline.repairable || busy;
+  els.offlineRepairBtn.hidden = !state.repairable || busy;
   els.offlineRepairBtn.disabled = navigator.onLine === false;
   els.offlineDownloadBtn.hidden = !showDownload;
-  els.offlineDownloadBtn.disabled = busy || (!selection && !offline.staging) || navigator.onLine === false;
+  els.offlineDownloadBtn.disabled = busy || (!selection && !state.staging) || navigator.onLine === false;
   els.offlineCancelBtn.hidden = !showCancel;
   els.offlineRemoveBtn.hidden = !showRemove;
 }
@@ -342,23 +323,26 @@ async function waitForPlaybackPriority(signal) {
 }
 
 async function downloadOfflineSelection() {
-  const selection = offline.staging ? selectionFromManifest(offline.staging) : currentOfflineSelection();
-  if (!selection) return;
+  const { staging } = offline.snapshot();
+  const selection = currentOfflineSelection();
+  if (!selection && !staging) return;
   focusOfflineCancel = true;
   let persisted;
   try {
-    const ready = await offline.start(selection, undefined, {
+    const options = {
       waitForPriority: waitForPlaybackPriority,
       onPersistence: (granted) => { persisted = granted; },
-      confirmDownload(check) {
+      confirmDownload(check, candidate) {
         if (check.canResume) return true;
-        const saved = offline.active || offline.repairable;
-        if (saved && !manifestMatchesSelection(saved, selection)
+        const { active, repairable } = offline.snapshot();
+        const saved = active || repairable;
+        if (saved && !sameOfflineSelection(saved, candidate)
           && !confirm(t("offlineReplaceConfirm", { book: saved.episodeTitle || saved.episodeId }))) return false;
-        return confirm(t("offlineConfirm", { book: selection.episodeTitle, language: selection.languageLabel,
-          quality: selection.sourceLabel, size: formatBytes(check.totalSize) }));
+        return confirm(t("offlineConfirm", { book: candidate.episodeTitle, language: candidate.languageLabel,
+          quality: candidate.sourceLabel, size: formatBytes(check.totalSize) }));
       },
-    });
+    };
+    const ready = staging ? await offline.resume(options) : await offline.start(selection, undefined, options);
     if (!ready) return;
     showToast(t("offlineComplete"), "success", 6000, "offline-complete");
     if (persisted === false) showToast(t("offlinePersistenceWarning"), "warning", 7000, "offline-persistence");
@@ -371,7 +355,7 @@ async function downloadOfflineSelection() {
 function updateMeta() {
   const language = book?.languages?.[languageCode];
   const source = currentSource || sourcesByLanguage.get(languageCode)?.find((item) => item.id === selectedSourceId);
-  const chapterTitle = cues[activeCueIndex]?.title || "";
+  const chapterTitle = chapters.activeTitle;
   setMeta([language?.label || languageCode, sourceLabel(source, false), chapterTitle].filter(Boolean).join(" • "));
 }
 
@@ -383,215 +367,12 @@ function guessLanguage(codes, fallback) {
   return codes.includes(fallback) ? fallback : codes[0];
 }
 
-function optionsFrom(select, records, selected, label) {
-  clearChildren(select);
-  for (const record of records) {
-    const option = document.createElement("option");
-    option.value = record.value;
-    option.textContent = label(record);
-    option.selected = record.value === selected;
-    select.appendChild(option);
-  }
-  syncCustomSelect(select);
-}
-
-function selectWithArrow(select) {
-  const wrapper = document.createElement("div");
-  wrapper.className = "select-wrap";
-  const arrow = document.createElement("span");
-  arrow.className = "select-arrow";
-  arrow.setAttribute("aria-hidden", "true");
-  wrapper.append(select, arrow);
-  return wrapper;
-}
-
-function selectFocusTarget(select) {
-  return customSelectStates.get(select)?.button || select;
-}
-
-function setSelectValue(select, value) {
-  select.value = String(value);
-  syncCustomSelect(select);
-}
-
-function closeCustomSelect(state, restoreFocus = false) {
-  if (!state) return;
-  state.menu.hidden = true;
-  state.button.setAttribute("aria-expanded", "false");
-  state.button.removeAttribute("aria-activedescendant");
-  state.wrapper.classList.remove("opens-up");
-  if (openCustomSelect === state) openCustomSelect = null;
-  if (restoreFocus) state.button.focus();
-}
-
-function closeAllCustomSelects(restoreFocus = false) {
-  const active = openCustomSelect;
-  for (const state of customSelectStates.values()) closeCustomSelect(state, restoreFocus && state === active);
-}
-
-function setCustomSelectActive(state, index) {
-  if (!state.options.length) return;
-  state.activeIndex = index;
-  for (const [optionIndex, option] of state.options.entries()) option.classList.toggle("is-active", optionIndex === index);
-  const active = state.options[index];
-  if (!active) state.button.removeAttribute("aria-activedescendant");
-  else {
-    state.button.setAttribute("aria-activedescendant", active.id);
-    const optionTop = active.offsetTop;
-    const optionBottom = optionTop + active.offsetHeight;
-    if (optionTop < state.menu.scrollTop) state.menu.scrollTop = optionTop;
-    else if (optionBottom > state.menu.scrollTop + state.menu.clientHeight) state.menu.scrollTop = optionBottom - state.menu.clientHeight;
-  }
-}
-
-function moveCustomSelectActive(state, direction) {
-  if (!state.options.length) return;
-  let index = state.activeIndex;
-  if (index < 0) index = direction > 0 ? -1 : state.options.length;
-  for (let count = 0; count < state.options.length; count += 1) {
-    index = (index + direction + state.options.length) % state.options.length;
-    if (!state.options[index].disabled) { setCustomSelectActive(state, index); return; }
-  }
-}
-
-function positionCustomSelect(state) {
-  const rect = state.button.getBoundingClientRect();
-  const menuHeight = state.menu.getBoundingClientRect().height || Math.min(288, state.options.length * 44 + 8);
-  const opensUp = rect.bottom + menuHeight > window.innerHeight - 8 && rect.top > menuHeight;
-  state.wrapper.classList.toggle("opens-up", opensUp);
-}
-
-function chooseCustomSelectOption(state, index) {
-  const option = state.select.options[index];
-  if (!option || option.disabled) return;
-  const changed = state.select.value !== option.value;
-  state.select.value = option.value;
-  syncCustomSelect(state.select);
-  closeCustomSelect(state, true);
-  if (changed) state.select.dispatchEvent(new Event("change", { bubbles: true }));
-}
-
-function openCustomSelectMenu(state) {
-  if (!state || state.select.disabled) return;
-  closeAllCustomSelects();
-  syncCustomSelect(state.select);
-  state.menu.hidden = false;
-  state.button.setAttribute("aria-expanded", "true");
-  openCustomSelect = state;
-  const selectedIndex = state.select.selectedIndex >= 0 && !state.options[state.select.selectedIndex]?.disabled
-    ? state.select.selectedIndex
-    : state.options.findIndex((option) => !option.disabled);
-  if (selectedIndex >= 0) setCustomSelectActive(state, selectedIndex);
-  positionCustomSelect(state);
-}
-
-function handleCustomSelectKeydown(event, state) {
-  if (state.select.disabled) return;
-  const isOpen = !state.menu.hidden;
-  if (event.key === "Escape" && isOpen) {
-    event.preventDefault();
-    event.stopPropagation();
-    closeCustomSelect(state, true);
-    return;
-  }
-  if (event.key === "Tab" && isOpen) { closeCustomSelect(state); return; }
-  if (!isOpen) {
-    if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
-    event.preventDefault();
-    openCustomSelectMenu(state);
-    if (event.key === "ArrowDown") moveCustomSelectActive(state, 1);
-    if (event.key === "ArrowUp") moveCustomSelectActive(state, -1);
-    return;
-  }
-  if (event.key === "ArrowDown") { event.preventDefault(); moveCustomSelectActive(state, 1); }
-  else if (event.key === "ArrowUp") { event.preventDefault(); moveCustomSelectActive(state, -1); }
-  else if (event.key === "Home") { event.preventDefault(); setCustomSelectActive(state, state.options.findIndex((option) => !option.disabled)); }
-  else if (event.key === "End") {
-    event.preventDefault();
-    let lastIndex = -1;
-    for (let index = state.options.length - 1; index >= 0; index -= 1) {
-      if (!state.options[index].disabled) { lastIndex = index; break; }
-    }
-    setCustomSelectActive(state, lastIndex);
-  }
-  else if (event.key === "Enter" || event.key === " ") { event.preventDefault(); chooseCustomSelectOption(state, state.activeIndex); }
-}
-
-function syncCustomSelect(select) {
-  const state = customSelectStates.get(select);
-  if (!state) return;
-  const options = [...select.options];
-  clearChildren(state.menu);
-  state.options = options.map((option, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "select-option";
-    button.id = `${select.id}-option-${index}`;
-    button.setAttribute("role", "option");
-    button.setAttribute("aria-selected", String(option.value === select.value));
-    button.disabled = select.disabled || option.disabled;
-    button.textContent = option.textContent;
-    button.addEventListener("click", () => chooseCustomSelectOption(state, index));
-    state.menu.appendChild(button);
-    return button;
-  });
-  const selected = options[select.selectedIndex];
-  state.button.textContent = selected?.textContent || "";
-  state.button.disabled = select.disabled;
-  if (state.menu.hidden) state.button.setAttribute("aria-expanded", "false");
-  if (state.menu.hidden) state.button.removeAttribute("aria-activedescendant");
-}
-
-function destroyCustomSelect(select) {
-  const state = customSelectStates.get(select);
-  if (!state) return;
-  closeCustomSelect(state);
-  state.button.remove();
-  state.menu.remove();
-  select.classList.remove("select-native");
-  select.removeAttribute("aria-hidden");
-  select.removeAttribute("tabindex");
-  state.wrapper.classList.remove("is-custom", "opens-up");
-  customSelectStates.delete(select);
-}
-
-function enhanceCustomSelect(select) {
-  if (!select || customSelectStates.has(select)) return customSelectStates.get(select);
-  const wrapper = select.closest(".select-wrap");
-  if (!wrapper) return null;
-  const label = document.querySelector(`label[for="${select.id}"]`);
-  if (label) label.id ||= `${select.id}-label`;
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "select-button";
-  button.id = `${select.id}-button`;
-  button.setAttribute("role", "combobox");
-  button.setAttribute("aria-haspopup", "listbox");
-  button.setAttribute("aria-expanded", "false");
-  if (label) button.setAttribute("aria-labelledby", label.id);
-  const menu = document.createElement("div");
-  menu.className = "select-menu";
-  menu.id = `${select.id}-menu`;
-  menu.setAttribute("role", "listbox");
-  if (label) menu.setAttribute("aria-labelledby", label.id);
-  menu.hidden = true;
-  button.setAttribute("aria-controls", menu.id);
-  const state = { select, wrapper, button, menu, options: [], activeIndex: -1 };
-  customSelectStates.set(select, state);
-  select.classList.add("select-native");
-  select.setAttribute("aria-hidden", "true");
-  select.setAttribute("tabindex", "-1");
-  wrapper.classList.add("is-custom");
-  wrapper.insertBefore(button, select);
-  wrapper.appendChild(menu);
-  if (label) label.addEventListener("click", (event) => { event.preventDefault(); state.button.focus(); });
-  button.addEventListener("click", () => (state.menu.hidden ? openCustomSelectMenu(state) : closeCustomSelect(state, true)));
-  button.addEventListener("keydown", (event) => handleCustomSelectKeydown(event, state));
-  syncCustomSelect(select);
-  return state;
-}
+const { optionsFrom, selectWithArrow, selectFocusTarget, setSelectValue, closeAllCustomSelects,
+  syncCustomSelect, destroyCustomSelect, enhanceCustomSelect, syncSelectionControls, closeSelectOutside } = createCustomSelects(document, window);
 
 function initializeCustomSelects() {
+  optionsFrom(els.skipSelect, SKIP_INTERVALS.map((seconds) => ({ value: String(seconds) })),
+    String(uiPrefs.skipSeconds), (record) => record.value + " s");
   for (const select of [els.bookSelect, els.langSelect, els.qualitySelect, els.skipSelect, els.themeSelect, els.fontSizeSelect, els.uiLangSelect]) enhanceCustomSelect(select);
 }
 
@@ -631,84 +412,24 @@ function updateTitle() {
   updateMediaSessionMetadata();
 }
 
-function clearCover() {
-  coverGeneration += 1;
-  coverController?.abort();
-  coverController = null;
-  if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
-  coverObjectUrl = "";
-  els.coverButton.hidden = true;
-  els.coverImg.onload = null;
-  els.coverImg.onerror = null;
-  els.coverImg.removeAttribute("src");
-  els.coverImg.alt = "";
-}
-
-function showCoverImage(src, generation, onFailure) {
-  els.coverImg.onload = () => {
-    if (generation !== coverGeneration) return;
+const { applyCover, clearCover } = createCoverView(els.coverImg, els.coverButton, {
+  getEmbeddedSource: embeddedCoverAudioSource,
+  onShown() {
     els.coverImg.alt = displayTitle();
     els.coverButton.setAttribute("aria-label", t("openCover"));
     setTooltip(els.coverButton, t("openCover"));
-    els.coverButton.hidden = false;
     updateMediaSessionMetadata();
-  };
-  els.coverImg.onerror = () => {
-    if (generation === coverGeneration) onFailure();
-  };
-  els.coverImg.src = src;
-}
+  },
+  onFailure(error) {
+    if (error) reportError("embedded cover", error);
+    showToast(t("coverLoadFailed"), "warning", 5000, "cover-load");
+  },
+});
 
 function embeddedCoverAudioSource() {
-  const isMp4 = (source) => source?.codec === "aac" || source?.mime?.startsWith("audio/mp4")
-    || ["m4a", "m4b", "mp4"].includes(source?.extension);
-  if (isMp4(currentSource)) return currentSource;
+  if (currentSource && isMp4Audio(currentSource)) return currentSource;
   if (navigator.onLine === false) return null;
-  return (sourcesByLanguage.get(languageCode) || []).find(isMp4) || null;
-}
-
-function coverFailed(generation, error) {
-  if (generation !== coverGeneration) return;
-  if (error) reportError("embedded cover", error);
-  clearCover();
-  showToast(t("coverLoadFailed"), "warning", 5000, "cover-load");
-}
-
-async function applyEmbeddedCover(generation) {
-  const source = embeddedCoverAudioSource();
-  if (!source?.url) {
-    coverFailed(generation);
-    return;
-  }
-  const controller = new AbortController();
-  coverController = controller;
-  try {
-    const cover = await loadEmbeddedMp4Cover(source.url, { signal: controller.signal });
-    if (controller.signal.aborted || generation !== coverGeneration) return;
-    if (!cover) throw new Error("The M4A/M4B file does not contain supported cover artwork.");
-    coverObjectUrl = URL.createObjectURL(new Blob([cover.data], { type: cover.mime }));
-    showCoverImage(coverObjectUrl, generation, () => coverFailed(generation, new Error("The embedded cover image could not be decoded.")));
-  } catch (error) {
-    if (error?.name !== "AbortError") coverFailed(generation, error);
-  } finally {
-    if (coverController === controller) coverController = null;
-  }
-}
-
-function applyCover() {
-  clearCover();
-  const generation = coverGeneration;
-  const mode = book?.coverSource || (book?.cover ? "file" : "none");
-  if (mode === "none") return;
-  const configuredCover = resolveCover(book);
-  if ((mode === "file" || mode === "auto") && configuredCover) {
-    showCoverImage(configuredCover, generation, () => {
-      if (mode === "auto") void applyEmbeddedCover(generation);
-      else coverFailed(generation);
-    });
-    return;
-  }
-  if (mode === "embedded" || mode === "auto") void applyEmbeddedCover(generation);
+  return (sourcesByLanguage.get(languageCode) || []).find(isMp4Audio) || null;
 }
 
 function applyCachedAvailability() {
@@ -796,7 +517,7 @@ function scheduleAvailabilityScan(generation, code = languageCode, immediate = f
 
 function requestAvailabilityScan(generation, code = languageCode, immediate = false) {
   const start = () => scheduleAvailabilityScan(generation, code, immediate);
-  if (chapterLoadPromise) void chapterLoadPromise.then(start, start);
+  if (chapters.pending) void chapters.pending.then(start, start);
   else start();
 }
 
@@ -838,17 +559,10 @@ async function loadLibraryTitles() {
 }
 
 async function loadBook(id) {
-  cancelSleep(true);
+  sleep.cancel(true);
   bookController?.abort();
-  chapterController?.abort();
-  chapterController = null;
-  chapterLoadPromise = null;
-  chapterLoadShouldNotify = false;
-  chapterGeneration += 1;
-  els.chaptersList.setAttribute("aria-busy", "false");
+  resetChapters();
   cancelAvailabilityWork();
-  if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
-  els.chaptersTrack.removeAttribute("src");
   bookController = new AbortController();
   const generation = ++bookGeneration;
   setLoading(true);
@@ -863,7 +577,7 @@ async function loadBook(id) {
     const loadedBook = loaded.book;
     if (generation !== bookGeneration) return;
 
-    saveProgress();
+    progress.flush();
     book = loadedBook;
     bookId = id;
     bookConfigUrl = loaded.configUrl;
@@ -872,8 +586,9 @@ async function loadBook(id) {
     applyCachedAvailability();
     const prefs = storage.readBook(bookId);
     const codes = Object.keys(book.languages);
-    const downloaded = navigator.onLine === false && offline.active?.episodeId === id
-      && String(offline.active.cacheVersion) === String(book.cacheVersion) ? offline.active : null;
+    const { active } = offline.snapshot();
+    const downloaded = navigator.onLine === false && active?.episodeId === id
+      && String(active.cacheVersion) === String(book.cacheVersion) ? active : null;
     languageCode = downloaded && codes.includes(downloaded.languageCode)
       ? downloaded.languageCode
       : codes.includes(prefs.language) ? prefs.language : guessLanguage(codes, book.defaultLanguage);
@@ -886,17 +601,8 @@ async function loadBook(id) {
     selectedSourceId = selected.id;
     currentSource = selected;
     durationUnlocked = false;
-    cues = [];
-    activeCueIndex = -1;
-    chaptersLoaded = false;
-    chaptersFailed = false;
-    chapterLoadPromise = null;
-    chapterLoadShouldNotify = false;
     scannedAvailabilityLanguages = new Set();
-    const selectedLanguage = book.languages[languageCode];
-    chapterMode = selectedLanguage.chapterSource || (selectedLanguage.chapters ? "vtt" : "none");
-    chapterUrl = resolveLanguageAsset(selectedLanguage, selectedLanguage.chapters);
-    chapterSourceKey = getChapterSourceKey(selected);
+    resetChapters(book, languageCode, selected);
     media.setSelection(languageSources, selected.id, storage.getProgress(bookId, languageCode), false);
     media.setPlaybackRate(uiPrefs.playbackRate);
     media.setVolume(uiPrefs.volume);
@@ -906,7 +612,7 @@ async function loadBook(id) {
     updateTitle();
     updateMeta();
     const chaptersReady = ensureChapters({ notifyFailure: false, showLoading: false });
-    applyCover();
+    applyCover(book);
     updateChapterButtons();
     storage.setLastBook(id);
     setBookUrl(id);
@@ -924,39 +630,25 @@ function setBookUrl(id) {
   try { const url = new URL(location.href); url.searchParams.set("book", id); url.searchParams.delete("episode"); history.replaceState(null, "", url); } catch {}
 }
 
-function resetChapters() {
-  chapterController?.abort();
-  chapterController = null;
-  chapterLoadPromise = null;
-  chapterLoadShouldNotify = false;
-  chapterGeneration += 1;
-  els.chaptersList.setAttribute("aria-busy", "false");
-  cues = [];
-  activeCueIndex = -1;
-  chaptersLoaded = false;
-  chaptersFailed = false;
-  clearChildren(els.chaptersList);
-  if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
+function clearChapterTrack() {
+  if (trackObjectUrl) URL.revokeObjectURL(trackObjectUrl);
+  trackObjectUrl = "";
   els.chaptersTrack.removeAttribute("src");
-  const language = book?.languages?.[languageCode];
-  chapterMode = language?.chapterSource || (language?.chapters ? "vtt" : "none");
-  chapterUrl = resolveLanguageAsset(language, language?.chapters);
-  chapterSourceKey = getChapterSourceKey(currentSource);
+}
+
+function resetChapters(book, code, source) {
+  chapters.reset(book, code, source);
+  els.chaptersList.setAttribute("aria-busy", "false");
+  clearChildren(els.chaptersList);
+  clearChapterTrack();
   updateMediaSessionMetadata();
   updateChapterButtons();
 }
 
-function getChapterSourceKey(source = currentSource) {
-  if (chapterMode === "embedded") return `embedded:${source?.url || ""}`;
-  if (chapterMode === "auto") return `auto:${chapterUrl}|${source?.url || ""}`;
-  return chapterUrl;
-}
-
-function applyChapterData(text, loaded, kind = "vtt") {
+function applyChapterData({ text, kind }) {
+  els.chaptersList.setAttribute("aria-busy", "false");
   try {
-    if (trackObjectUrl) URL.revokeObjectURL(trackObjectUrl);
-    trackObjectUrl = "";
-    els.chaptersTrack.removeAttribute("src");
+    clearChapterTrack();
     if (kind === "vtt" && text) {
       trackObjectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
       els.chaptersTrack.src = trackObjectUrl;
@@ -965,84 +657,16 @@ function applyChapterData(text, loaded, kind = "vtt") {
   } catch (error) {
     reportError("native chapter track", error);
   }
-  cues = loaded;
-  chaptersLoaded = true;
-  chaptersFailed = false;
   renderChapters();
   updateChapterButtons();
   markActiveChapter(media.position());
 }
 
 function ensureChapters({ force = false, notifyFailure = true, showLoading = !els.chaptersPanel.hidden } = {}) {
-  if (chaptersLoaded && !chaptersFailed) return Promise.resolve(cues);
-  if (chapterMode === "none" || (chapterMode === "vtt" && !chapterUrl)) { chaptersLoaded = true; chaptersFailed = false; renderChapters(); return Promise.resolve(cues); }
-  if (chapterLoadPromise) {
-    chapterLoadShouldNotify ||= notifyFailure;
-    if (showLoading) renderPanelMessage(t("loadingChapters"));
-    return chapterLoadPromise;
-  }
-  if (chaptersFailed && !force) {
-    if (showLoading) renderChapterFailure();
-    return Promise.resolve(cues);
-  }
-  const sourceKey = getChapterSourceKey(currentSource);
-  chapterSourceKey = sourceKey;
-  let revalidate = force;
-  if (!force) {
-    const vttUrl = ["vtt", "auto"].includes(chapterMode) ? chapterUrl : "";
-    const cachedData = storage.readChapterData(book.id, languageCode, book.cacheVersion, sourceKey, vttUrl);
-    if (cachedData) {
-      const cached = cachedData.kind === "vtt" ? parseChapterText(cachedData.text) : cachedData;
-      if (cached) {
-        applyChapterData(cached.text || "", cached.cues, cachedData.kind);
-        return Promise.resolve(cues);
-      }
-      revalidate = true;
-    }
-  }
-  cancelAvailabilityWork();
-  const controller = new AbortController();
-  chapterController = controller;
-  const generation = ++chapterGeneration;
-  const requestUrl = chapterUrl;
-  chapterLoadShouldNotify = notifyFailure;
-  els.chaptersList.setAttribute("aria-busy", "true");
-  if (showLoading) renderPanelMessage(t("loadingChapters"));
-  const promise = (async () => {
-    try {
-      const result = await loadChapters({ mode: chapterMode, vttUrl: requestUrl, sourceUrl: currentSource?.url, sourceMime: currentSource?.mime, signal: controller.signal, revalidate });
-      if (generation !== chapterGeneration || requestUrl !== chapterUrl || sourceKey !== getChapterSourceKey(currentSource)) return cues;
-      storage.writeChapterData(book.id, languageCode, book.cacheVersion, sourceKey, result, requestUrl);
-      applyChapterData(result.text || "", result.cues, result.kind);
-    } catch (error) {
-      if (controller.signal.aborted || generation !== chapterGeneration) return cues;
-      chaptersLoaded = false;
-      chaptersFailed = true;
-      reportError("chapter load", error);
-      if (chapterLoadShouldNotify) showToast(t("chaptersLoadFailed"), "warning", 5000);
-    } finally {
-      if (generation === chapterGeneration) {
-        chapterController = null;
-        chapterLoadShouldNotify = false;
-        els.chaptersList.setAttribute("aria-busy", "false");
-      }
-    }
-    if (generation === chapterGeneration) {
-      if (chaptersFailed) renderChapterFailure();
-      else if (!chaptersLoaded) renderChapters();
-      if (!chaptersLoaded) {
-        updateChapterButtons();
-        markActiveChapter(media.position());
-      }
-    }
-    return cues;
-  })();
-  chapterLoadPromise = promise;
-  void promise.then(
-    () => { if (chapterLoadPromise === promise) chapterLoadPromise = null; },
-    () => { if (chapterLoadPromise === promise) chapterLoadPromise = null; },
-  );
-  return promise;
+  const request = chapters.load({ force, notifyFailure });
+  if (showLoading && chapters.pending) renderPanelMessage(t("loadingChapters"));
+  if (showLoading && chapters.status === "failed") renderChapterFailure();
+  return request;
 }
 
 function renderPanelMessage(message) {
@@ -1070,7 +694,7 @@ function renderChapterFailure() {
     await ensureChapters({ force: true, notifyFailure: true, showLoading: false });
     requestAvailabilityScan(bookGeneration, languageCode);
     if (els.chaptersPanel.hidden) return;
-    const focusTarget = chaptersFailed ? els.chaptersList.querySelector(".chapter-retry-button") : els.chaptersList.querySelector(".chapter-button");
+    const focusTarget = chapters.status === "failed" ? els.chaptersList.querySelector(".chapter-retry-button") : els.chaptersList.querySelector(".chapter-button");
     focusTarget?.focus();
   });
   container.append(message, retry);
@@ -1079,13 +703,13 @@ function renderChapterFailure() {
 
 function renderChapters() {
   clearChildren(els.chaptersList);
-  if (!cues.length) { renderPanelMessage(t("noChaptersFound")); return; }
-  cues.forEach((cue, index) => {
+  if (!chapters.cues.length) { renderPanelMessage(t(chapters.mode === "embedded" ? "noChaptersForSource" : "noChaptersFound")); return; }
+  chapters.cues.forEach((cue, index) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "chapter-button";
     button.dataset.index = String(index);
-    button.setAttribute("aria-current", String(index === activeCueIndex));
+    button.setAttribute("aria-current", String(index === chapters.activeIndex));
     const title = document.createElement("span");
     title.className = "chapter-name";
     title.textContent = cue.title;
@@ -1101,78 +725,37 @@ function renderChapters() {
   });
 }
 
-function lastChapterStarted(position) {
-  let index = -1;
-  for (let cursor = 0; cursor < cues.length; cursor += 1) {
-    if (position >= cues[cursor].start) index = cursor;
-    else break;
-  }
-  return index;
-}
-
-function chapterEnd(index) {
-  return cues[index].end ?? cues[index + 1]?.start ?? (media.duration() || book?.duration || Infinity);
-}
-
-function chapterIndexAt(position) {
-  for (let index = lastChapterStarted(position); index >= 0; index--) {
-    if (position < chapterEnd(index)) return index;
-  }
-  return -1;
+function chapterDuration() {
+  return media.duration() || book?.duration;
 }
 
 function markActiveChapter(position) {
-  const index = chapterIndexAt(position);
-  if (index === activeCueIndex) return;
-  activeCueIndex = index;
+  if (!chapters.updatePosition(position, chapterDuration())) return;
   updateMeta();
   updateMediaSessionMetadata();
-  for (const button of els.chaptersList.querySelectorAll(".chapter-button")) button.setAttribute("aria-current", String(Number(button.dataset.index) === index));
+  for (const button of els.chaptersList.querySelectorAll(".chapter-button")) button.setAttribute("aria-current", String(Number(button.dataset.index) === chapters.activeIndex));
 }
 
 function updateChapterButtons() {
-  const disabled = chapterMode === "none" || (chapterMode === "vtt" && !chapterUrl) || chaptersFailed || (chaptersLoaded && !cues.length);
+  const disabled = chapters.unavailable || chapters.status === "failed" || (chapters.status === "loaded" && !chapters.cues.length);
   els.prevChapterBtn.disabled = disabled;
   els.nextChapterBtn.disabled = disabled;
 }
 
 function refreshEmbeddedChaptersForSource(source) {
-  if (!book || !["embedded", "auto"].includes(chapterMode)) return;
-  const nextKey = getChapterSourceKey(source);
-  if (nextKey === chapterSourceKey && (chaptersLoaded || chapterLoadPromise)) return;
-  chapterController?.abort();
-  chapterController = null;
-  chapterLoadPromise = null;
-  chapterLoadShouldNotify = false;
-  chapterGeneration += 1;
-  chapterSourceKey = nextKey;
-  cues = [];
-  activeCueIndex = -1;
-  chaptersLoaded = false;
-  chaptersFailed = false;
-  clearChildren(els.chaptersList);
-  if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
-  els.chaptersTrack.removeAttribute("src");
+  if (!book || !chapters.needsSource(source)) return;
+  resetChapters(book, languageCode, source);
   updateMeta();
-  updateMediaSessionMetadata();
-  updateChapterButtons();
   void ensureChapters({ notifyFailure: false, showLoading: false });
 }
 
-async function previousChapter() {
-  await ensureChapters();
-  if (!cues.length) return;
-  const position = media.position();
-  const index = lastChapterStarted(position);
-  const restart = index >= 0 && (position >= chapterEnd(index) || position - cues[index].start > 3);
-  const target = restart ? index : Math.max(0, index - 1);
-  media.seek(cues[target].start);
-}
-
-async function nextChapter() {
-  await ensureChapters();
-  const next = cues.find((cue) => cue.start > media.position() + .05);
-  if (next) media.seek(next.start);
+async function seekChapter(direction) {
+  const request = ensureChapters();
+  const generation = chapters.generation;
+  await request;
+  if (generation !== chapters.generation) return;
+  const target = chapters.seekTarget(direction, media.position(), chapterDuration());
+  if (target != null) media.seek(target);
 }
 
 function updateTime(position, mediaDuration) {
@@ -1183,8 +766,8 @@ function updateTime(position, mediaDuration) {
   setText(els.timeCur, formatTime(position));
   setText(els.timeDur, duration ? formatTime(duration) : UNKNOWN_TIME);
   markActiveChapter(position);
-  updateMediaSessionPosition(position, duration);
-  if (sleepState.mode === "chapter" && Number.isFinite(sleepState.chapterEnd) && position >= sleepState.chapterEnd - .05) void completeSleep("sleepEndChapterReached");
+  mediaSession.setPosition(position, duration, media.playbackRate);
+  sleep.onTime(position);
 }
 
 function updatePlaybackUi(state) {
@@ -1194,10 +777,7 @@ function updatePlaybackUi(state) {
   els.playPauseBtn.setAttribute("aria-label", label);
   setTooltip(els.playPauseBtn, label);
   els.playPauseBtn.setAttribute("aria-busy", String(state === "loading" || state === "stalled"));
-  if ("mediaSession" in navigator) {
-    try { navigator.mediaSession.playbackState = playing ? "playing" : state === "idle" ? "none" : "paused"; }
-    catch (error) { reportError("Media Session playback state", error); }
-  }
+  mediaSession.setPlaybackState(playing ? "playing" : state === "idle" ? "none" : "paused");
   if (stallNoticeTimer) clearTimeout(stallNoticeTimer);
   stallNoticeTimer = null;
   if (state === "stalled" && navigator.onLine) {
@@ -1213,7 +793,7 @@ function updatePlaybackUi(state) {
 const media = new MediaController(els.audio, {
   onState: updatePlaybackUi,
   onTime: updateTime,
-  onProgress: scheduleProgress,
+  onProgress: (position, seek) => progress.record(bookId, languageCode, position, seek),
   onSourceChange: (source) => {
     currentSource = source;
     selectedSourceId = source.id;
@@ -1241,37 +821,23 @@ const media = new MediaController(els.audio, {
   onBlocked: () => showToast(t("playBlocked"), "warning", 7000, "play-blocked"),
   onOffline: () => {
     const selection = currentOfflineSelection();
-    if (!selection || !manifestMatchesSelection(offline.active, selection)) showToast(t("offlineWaiting"), "warning", 7000, "offline-waiting");
+    if (!selection || !manifestMatchesSelection(offline.snapshot().active, selection)) showToast(t("offlineWaiting"), "warning", 7000, "offline-waiting");
   },
   onExhausted: (error) => {
     setMeta(t("sourceExhausted"), true);
     reportError("all audio sources failed", error, t("sourceExhausted"));
   },
-  onEnded: () => { if (sleepState.mode === "chapter") void completeSleep("sleepEndChapterReached", false); },
+  onEnded: () => sleep.onEnded(),
 });
 
-function scheduleProgress(position, seek = false) {
-  if (!book || resetInProgress) return;
-  const updatedAt = Date.now();
-  const resetId = storage.resetId();
-  const elapsed = updatedAt - lastProgressWrite;
-  const flushNow = seek || elapsed >= 5000;
-  const previousUpdate = flushNow ? undefined
-    : pendingProgress?.previousUpdate ?? storage.progressTimestamp(bookId, resetId, languageCode);
-  pendingProgress = { bookId, languageCode, position, updatedAt, previousUpdate, resetId };
-  if (flushNow) saveProgress();
-  else if (!progressTimer) progressTimer = setTimeout(saveProgress, 5000 - elapsed);
-}
-
-function saveProgress() {
-  if (!pendingProgress || resetInProgress) return;
-  clearTimeout(progressTimer);
-  progressTimer = null;
-  const { bookId, languageCode, position, ...update } = pendingProgress;
-  pendingProgress = null;
-  lastProgressWrite = Date.now();
-  storage.setProgress(bookId, languageCode, position, update);
-}
+const sleep = new SleepTimer({
+  media,
+  getVolume: () => uiPrefs.volume,
+  canFade: supportsProgrammaticVolume,
+  onChange: renderSleepOptions,
+  onTick: updateSleepButton,
+  onNotice: (key, type, variables) => showToast(t(key, variables), type),
+});
 
 function setAppearance() {
   if (uiPrefs.theme === "system") document.documentElement.removeAttribute("data-theme");
@@ -1304,7 +870,7 @@ function applyUiPreferences() {
 }
 
 function applySkipInterval(seconds) {
-  const value = [5, 10, 15, 30, 60].includes(Number(seconds)) ? Number(seconds) : 15;
+  const value = skipInterval(seconds);
   uiPrefs.skipSeconds = value;
   setSelectValue(els.skipSelect, String(value));
   setText(els.skipBackBtn.querySelector("[aria-hidden]"), `−${value}`);
@@ -1373,9 +939,9 @@ function applyStrings() {
     populateLibrarySelect();
     populateQualitySelect(currentSource);
     updateMeta();
-    if (chaptersFailed) renderChapterFailure();
-    else if (chapterLoadPromise && !els.chaptersPanel.hidden) renderPanelMessage(t("loadingChapters"));
-    else if (chaptersLoaded) renderChapters();
+    if (chapters.status === "failed") renderChapterFailure();
+    else if (chapters.pending && !els.chaptersPanel.hidden) renderPanelMessage(t("loadingChapters"));
+    else if (chapters.status === "loaded") renderChapters();
   }
   updatePlaybackUi(media.state);
   renderOfflineUi();
@@ -1462,12 +1028,12 @@ function renderSleepOptions() {
     button.type = "button";
     button.className = "sleep-option";
     button.textContent = record.label;
-    const selected = record.mode === sleepState.mode && (record.mode !== "minutes" || record.minutes === sleepState.minutes);
+    const selected = record.mode === sleep.mode && (record.mode !== "minutes" || record.minutes === sleep.minutes);
     button.setAttribute("aria-pressed", String(selected));
     button.addEventListener("click", () => {
-      if (record.mode === "minutes") startSleepMinutes(record.minutes);
+      if (record.mode === "minutes") sleep.startMinutes(record.minutes);
       else if (record.mode === "chapter") void startSleepChapter();
-      else cancelSleep();
+      else sleep.cancel();
       closePanel(els.sleepPanel, els.sleepBtn, true);
     });
     els.sleepList.appendChild(button);
@@ -1475,76 +1041,24 @@ function renderSleepOptions() {
   updateSleepButton();
 }
 
-function clearSleepTimers() {
-  if (sleepState.timeout) clearTimeout(sleepState.timeout);
-  if (sleepState.ticker) clearInterval(sleepState.ticker);
-  sleepState.timeout = null;
-  sleepState.ticker = null;
-}
-
-function cancelSleep(silent = false) {
-  sleepGeneration += 1;
-  const wasActive = sleepState.mode !== "off";
-  clearSleepTimers();
-  sleepState = { ...sleepState, mode: "off", minutes: 0, endAt: 0, chapterEnd: null };
-  renderSleepOptions();
-  if (wasActive && !silent) showToast(t("sleepTimerCanceled"));
-}
-
-function startSleepMinutes(minutes) {
-  cancelSleep(true);
-  sleepState.mode = "minutes";
-  sleepState.minutes = minutes;
-  sleepState.endAt = Date.now() + minutes * 60000;
-  sleepState.timeout = setTimeout(() => void completeSleep("sleepTimerEnded"), minutes * 60000);
-  sleepState.ticker = setInterval(updateSleepButton, 30000);
-  renderSleepOptions();
-  showToast(t("sleepTimerSet", { m: minutes }), "success");
-}
-
 async function startSleepChapter() {
-  const generation = ++sleepGeneration;
-  const chapters = ensureChapters();
-  const sourceGeneration = chapterGeneration;
-  await chapters;
-  if (generation !== sleepGeneration || sourceGeneration !== chapterGeneration) return;
+  const generation = sleep.generation;
+  const request = ensureChapters();
+  const sourceGeneration = chapters.generation;
+  await request;
+  if (generation !== sleep.generation || sourceGeneration !== chapters.generation) return;
   const position = media.position();
-  const index = chapterIndexAt(position);
-  const target = index >= 0 ? chapterEnd(index) : null;
-  if (!Number.isFinite(target) || target <= position) { showToast(t("sleepEndChapterUnavailable"), "warning"); return; }
-  cancelSleep(true);
-  sleepState.mode = "chapter";
-  sleepState.chapterEnd = target;
-  renderSleepOptions();
-  showToast(t("sleepEndChapterSet"), "success");
-}
-
-async function completeSleep(messageKey, fade = true) {
-  if (sleepState.completing) return;
-  sleepState.completing = true;
-  const generation = sleepGeneration;
-  clearSleepTimers();
-  if (fade && supportsProgrammaticVolume()) {
-    const original = uiPrefs.volume;
-    for (let step = 7; step >= 0; step -= 1) {
-      media.setVolume(original * step / 8);
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      if (generation !== sleepGeneration) { media.setVolume(original); sleepState.completing = false; return; }
-    }
-    media.requestPause();
-    media.setVolume(original);
-  } else media.requestPause();
-  sleepState = { ...sleepState, mode: "off", minutes: 0, endAt: 0, chapterEnd: null, completing: false };
-  renderSleepOptions();
-  showToast(t(messageKey));
+  const index = chapters.indexAt(position, chapterDuration());
+  const target = index >= 0 ? chapters.end(index, chapterDuration()) : null;
+  sleep.startChapter(target);
 }
 
 function updateSleepButton() {
-  const active = sleepState.mode !== "off";
+  const active = sleep.mode !== "off";
   els.sleepBtn.classList.toggle("is-active", active);
   let label = t("sleepTimer");
-  if (sleepState.mode === "minutes") label += `: ${t("sleepTimerOption", { m: Math.max(1, Math.ceil((sleepState.endAt - Date.now()) / 60000)) })}`;
-  else if (sleepState.mode === "chapter") label += `: ${t("sleepEndChapterOption")}`;
+  if (sleep.mode === "minutes") label += `: ${t("sleepTimerOption", { m: Math.max(1, Math.ceil((sleep.endAt - Date.now()) / 60000)) })}`;
+  else if (sleep.mode === "chapter") label += `: ${t("sleepEndChapterOption")}`;
   els.sleepBtn.setAttribute("aria-label", label);
   setText(els.sleepBtn.querySelector(".sr-only"), label);
   setTooltip(els.sleepBtn, label);
@@ -1565,8 +1079,8 @@ function changeLanguage(nextCode) {
     return;
   }
   const position = media.position();
-  saveProgress();
-  cancelSleep(true);
+  progress.flush();
+  sleep.cancel(true);
   cancelAvailabilityWork();
   languageCode = nextCode;
   selectedSourceId = selected.id;
@@ -1574,12 +1088,12 @@ function changeLanguage(nextCode) {
   const shouldPlay = media.playbackIntent;
   populateLanguageSelect();
   populateQualitySelect(selected);
-  resetChapters();
+  resetChapters(book, languageCode, selected);
   updateTitle();
   updateMeta();
   const generation = bookGeneration;
   const chaptersReady = ensureChapters({ notifyFailure: false, showLoading: false });
-  applyCover();
+  applyCover(book);
   storage.setProgress(bookId, languageCode, position);
   storage.setBookSelection(bookId, languageCode, selected.id);
   void media.setSelection(all, selected.id, position, shouldPlay);
@@ -1602,44 +1116,27 @@ async function changeQuality(nextId) {
   currentSource = selected;
   storage.setBookSelection(bookId, languageCode, selected.id);
   updateMeta();
-  await media.setSelection(all, selected.id, position, shouldPlay);
+  const playback = media.setSelection(all, selected.id, position, shouldPlay);
+  refreshEmbeddedChaptersForSource(currentSource);
   renderOfflineUi();
-  refreshEmbeddedChaptersForSource(selected);
+  await playback;
 }
 
 function updateMediaSessionMetadata() {
-  if (!("mediaSession" in navigator) || typeof MediaMetadata !== "function") return;
-  try {
-    const chapter = cues[activeCueIndex]?.title;
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: chapter || mediaMetadataTitle || t("audio"),
-      album: chapter ? mediaMetadataTitle : "",
-      artwork: els.coverImg.src ? [{ src: els.coverImg.src }] : [],
-    });
-  } catch (error) { reportError("Media Session metadata", error); }
-}
-
-function updateMediaSessionPosition(position, duration) {
-  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function" || !duration) return;
-  try { navigator.mediaSession.setPositionState({ duration, position: clamp(position, 0, duration), playbackRate: media.playbackRate }); }
-  catch (error) { reportError("Media Session position", error); }
+  mediaSession.setMetadata({ title: mediaMetadataTitle || t("audio"),
+    chapter: chapters.activeTitle, artwork: els.coverImg.src });
 }
 
 function initializeMediaSession() {
-  if (!("mediaSession" in navigator)) return;
-  const handlers = {
+  mediaSession.bind({
     play: () => { durationUnlocked = true; void media.requestPlay(); },
     pause: () => media.requestPause(),
     seekbackward: (details) => media.seek(media.position() - (details.seekOffset || uiPrefs.skipSeconds)),
     seekforward: (details) => media.seek(media.position() + (details.seekOffset || uiPrefs.skipSeconds)),
     seekto: (details) => Number.isFinite(details.seekTime) && media.seek(details.seekTime),
-    previoustrack: () => void previousChapter(),
-    nexttrack: () => void nextChapter(),
-  };
-  for (const [action, handler] of Object.entries(handlers)) {
-    try { navigator.mediaSession.setActionHandler(action, handler); }
-    catch (error) { reportError(`Media Session ${action}`, error); }
-  }
+    previoustrack: () => void seekChapter("previous"),
+    nexttrack: () => void seekChapter("next"),
+  });
 }
 
 function closeAllPanels(except = null, restore = false) {
@@ -1655,8 +1152,8 @@ els.playPauseBtn.addEventListener("click", () => {
 });
 els.skipBackBtn.addEventListener("click", () => media.seek(media.position() - uiPrefs.skipSeconds));
 els.skipForwardBtn.addEventListener("click", () => media.seek(media.position() + uiPrefs.skipSeconds));
-els.prevChapterBtn.addEventListener("click", () => void previousChapter());
-els.nextChapterBtn.addEventListener("click", () => void nextChapter());
+els.prevChapterBtn.addEventListener("click", () => void seekChapter("previous"));
+els.nextChapterBtn.addEventListener("click", () => void seekChapter("next"));
 els.chaptersBtn.addEventListener("click", async () => {
   if (!els.chaptersPanel.hidden) { closePanel(els.chaptersPanel, els.chaptersBtn, true); return; }
   closeAllPanels(els.chaptersPanel);
@@ -1725,7 +1222,8 @@ els.offlineCancelBtn.addEventListener("click", async () => {
   finally { els.offlineCancelBtn.disabled = false; renderOfflineUi(); }
 });
 els.offlineRemoveBtn.addEventListener("click", async () => {
-  const saved = offline.active || offline.repairable;
+  const { active, repairable } = offline.snapshot();
+  const saved = active || repairable;
   if (!saved || !confirm(t("offlineRemoveConfirm", { book: saved.episodeTitle || saved.episodeId }))) return;
   els.offlineRemoveBtn.disabled = true;
   try {
@@ -1763,13 +1261,10 @@ els.resetBtn.addEventListener("click", () => openDialog(els.resetDialog, els.res
 els.resetCancel.addEventListener("click", () => { if (dismissReset() !== false) closeDialog(els.resetDialog); });
 els.resetOk.addEventListener("click", async () => {
   if (els.resetOk.disabled) return;
-  resetInProgress = true;
+  progress.stop();
   resetRemaining ??= { local: true, offline: true };
   els.resetOk.disabled = true;
   setText(els.resetOk, t("resetting"));
-  if (progressTimer) clearTimeout(progressTimer);
-  progressTimer = null;
-  pendingProgress = null;
   media.destroy();
   if (resetRemaining.local) resetRemaining.local = !storage.reset();
   if (resetRemaining.offline) {
@@ -1792,7 +1287,7 @@ els.resetOk.addEventListener("click", async () => {
 });
 
 document.addEventListener("click", (event) => {
-  if (!openCustomSelect?.wrapper.contains(event.target)) closeAllCustomSelects();
+  closeSelectOutside(event.target);
   if (!els.player.contains(event.target)) closeAllPanels();
 });
 document.addEventListener("keydown", (event) => {
@@ -1808,8 +1303,8 @@ document.addEventListener("keydown", (event) => {
   else if (event.code === "ArrowUp") { event.preventDefault(); media.seek(media.position() + uiPrefs.skipSeconds); }
   else if (event.code === "ArrowDown") { event.preventDefault(); media.seek(media.position() - uiPrefs.skipSeconds); }
 });
-window.addEventListener("pagehide", () => saveProgress(), { capture: true });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveProgress(); });
+window.addEventListener("pagehide", () => progress.flush(), { capture: true });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") progress.flush(); });
 window.addEventListener("offline", () => {
   cancelAvailabilityWork();
   showToast(t("connectionLost"), "warning", 7000, "offline");
@@ -1818,7 +1313,7 @@ window.addEventListener("offline", () => {
 window.addEventListener("online", () => {
   void recoverLibrary();
   showToast(t("connectionRestored"), "success", 4000, "online");
-  if (chaptersFailed) void ensureChapters({ force: true, notifyFailure: false });
+  if (chapters.status === "failed") void ensureChapters({ force: true, notifyFailure: false });
   scannedAvailabilityLanguages.delete(languageCode);
   requestAvailabilityScan(bookGeneration, languageCode);
   void media.handleReconnect();
@@ -1840,7 +1335,7 @@ async function boot() {
   library = catalog || normalizeLibrary(null);
   const downloadedConfig = preferDownloaded ? offline.downloadedConfig : null;
   bookConfigs = new BookConfigStore({ library, documentBaseUrl, downloadedConfig });
-  const downloadedId = preferDownloaded ? offline.active?.episodeId || "" : "";
+  const downloadedId = preferDownloaded ? offline.snapshot().active?.episodeId || "" : "";
   startupBookRequest = loadStartupBook(downloadedId);
   if (preferDownloaded && navigator.onLine) void recoverLibrary();
   await startupBookRequest;

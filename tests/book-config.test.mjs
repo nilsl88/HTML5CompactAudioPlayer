@@ -1,9 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import vm from "node:vm";
-import { readFile } from "node:fs/promises";
+import { openPlayerPage } from "./player-page.mjs";
 import { BookConfigStore, queryBookId } from "../js/book-config.js";
-import { normalizeBook, normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js";
+import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js";
 
 const baseUrl = "https://example.test/";
 const configuration = (id = "one") => ({
@@ -286,52 +285,23 @@ test("title requests stay lazy, use two workers, reuse cached books, and retry f
   assert.deepEqual(configs.library.byId.get("three").title, { en: "Book three" });
 });
 
-test("a stale cancelled book load cannot overwrite a newer selection", async () => {
-  const source = await readFile(new URL("../player.js", import.meta.url), "utf8");
-  const loadFunction = source.slice(source.indexOf("async function loadBook("), source.indexOf("function setBookUrl("));
+test("a stale cancelled book load cannot overwrite a newer selection", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const old = deferred();
-  const configs = store(async (url) => url.includes("/old/") ? old.promise : json(configuration("new")), [{ id: "old" }, { id: "new" }]);
-  const context = {
-    bookConfigs: configs, bookController: null, bookGeneration: 0, chapterController: null, chapterGeneration: 0,
-    trackObjectUrl: "", navigator: { onLine: true }, location: { href: baseUrl }, offline: {}, uiPrefs: {},
-    els: { chaptersList: { setAttribute() {} }, chaptersTrack: { removeAttribute() {} } },
-    storage: { readBook: () => ({}), getProgress: () => 0, setLastBook() {} },
-    media: { setSelection() {}, setPlaybackRate() {}, setVolume() {} },
-    t: () => "", buildSources: () => [{ id: "aac-64" }], chooseDefaultSource: (sources) => sources[0],
-    guessLanguage: () => "en", getChapterSourceKey: () => "",
-    resolveLanguageAsset: () => "", ensureChapters: () => Promise.resolve(), AbortController, URL, Map, Set,
-  };
-  for (const name of ["saveProgress", "cancelSleep", "cancelAvailabilityWork", "setLoading", "setBusy", "clearCover",
-    "setText", "setMeta", "applyCachedAvailability", "populateLibrarySelect", "populateLanguageSelect", "populateQualitySelect",
-    "updateTitle", "updateMeta", "applyCover", "updateChapterButtons", "setBookUrl", "renderOfflineUi", "requestAvailabilityScan"])
-    context[name] = () => {};
-  const sandbox = vm.createContext(context);
-  vm.runInContext(loadFunction, sandbox);
-  const first = sandbox.loadBook("old");
-  await sandbox.loadBook("new");
-  await first;
-  assert.equal(sandbox.book.id, "new");
+  const { elements } = await openPlayerPage(t, configuration("old"), assert.fail, new Map(), {
+    fetch: async (url) => {
+      if (url.endsWith("/library.json")) return json({ books: [{ id: "old" }, { id: "new" }], ui: { onboardingEnabled: false } });
+      if (url.endsWith("/old/book.json")) return old.promise;
+      if (url.endsWith("/new/book.json")) return json(configuration("new"));
+      return new Response("WEBVTT");
+    },
+  });
+  const select = elements.get("bookSelect");
+  select.value = "new";
+  select.dispatchEvent(new Event("change"));
+  await flush();
+  assert.equal(elements.get("bookTitle").textContent, "Book new");
   old.resolve(json(configuration("old")));
-  await configs.load("old");
-  assert.equal(sandbox.book.id, "new");
-  assert.equal(sandbox.bookId, "new");
-});
-
-test("offline selection retains manifest fields and requires the actual configuration URL", async () => {
-  const source = await readFile(new URL("../player.js", import.meta.url), "utf8");
-  const selectionFunction = source.slice(source.indexOf("function currentOfflineSelection("), source.indexOf("function selectionFromManifest("));
-  const book = normalizeBook(configuration(), { bookBaseUrl: baseUrl + "media/one/", documentBaseUrl: baseUrl });
-  for (const filename of ["book.json", "episode.json"]) {
-    const context = vm.createContext({
-      book, bookId: "one", bookConfigUrl: baseUrl + "media/one/" + filename, languageCode: "en", displayTitle: () => "Book one",
-      currentSource: { id: "aac-64", url: baseUrl + "media/one/audio.m4b", mime: "audio/mp4" },
-      sourceLabel: () => "64 kbps", libraryUrl: baseUrl + "media/library.json", resolveCover,
-      chapterUrl: baseUrl + "media/one/chapters.vtt", documentBaseUrl: baseUrl, URL,
-    });
-    const selected = vm.runInContext(selectionFunction + "\ncurrentOfflineSelection()", context);
-    assert.equal(selected.episodeId, "one");
-    assert.equal(selected.episodeTitle, "Book one");
-    assert.equal(selected.assets.find((asset) => asset.required).url, context.bookConfigUrl);
-    assert.equal(Object.hasOwn(selected, "bookId"), false);
-  }
+  await flush();
+  assert.equal(elements.get("bookTitle").textContent, "Book new");
 });

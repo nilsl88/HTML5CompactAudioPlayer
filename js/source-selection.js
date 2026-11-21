@@ -1,33 +1,8 @@
-import { CODECS, resolveLanguageAsset } from "./config.js";
+import { CODECS, extensionFromPath, mimeCandidatesFor } from "./codecs.js";
+import { resolveLanguageAsset } from "./config.js";
+export { AAC_MIME_TYPES, extensionFromPath, mimeFor, mimeCandidatesFor } from "./codecs.js";
 
 export const CODEC_PREFERENCE = [...CODECS];
-
-// AAC sources may contain AAC-LC, HE-AAC v1, or HE-AAC v2. Keep the
-// profile strings separate: codecs is an evidence hint, not a guarantee
-// that the downloaded file uses that exact profile.
-export const AAC_MIME_TYPES = [
-  'audio/mp4; codecs="mp4a.40.2"',
-  'audio/mp4; codecs="mp4a.40.5"',
-  'audio/mp4; codecs="mp4a.40.29"',
-  "audio/mp4",
-];
-
-export function extensionFromPath(path) {
-  return String(path || "").toLowerCase().match(/\.([a-z0-9]+)(?:[?#]|$)/)?.[1] || "";
-}
-
-export function mimeFor(codec, extension = "") {
-  if (codec === "opus") return extension === "ogg" ? 'audio/ogg; codecs="opus"' : 'audio/webm; codecs="opus"';
-  if (codec === "aac") return AAC_MIME_TYPES[0];
-  if (codec === "mp3") return "audio/mpeg";
-  return "";
-}
-
-export function mimeCandidatesFor(codec, extension = "") {
-  if (codec === "aac") return [...AAC_MIME_TYPES];
-  const mime = mimeFor(codec, extension);
-  return mime ? [mime] : [];
-}
 
 function supportScore(audioElement, mime) {
   const evidence = String(audioElement?.canPlayType?.(mime) || "");

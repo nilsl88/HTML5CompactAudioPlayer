@@ -1,3 +1,5 @@
+import { skipInterval } from "./preferences.js";
+
 const SCHEMA_VERSION = 2;
 const MAX_CHAPTER_CACHE_LENGTH = 512 * 1024;
 export const STORAGE_KEYS = {
@@ -33,17 +35,19 @@ function chapterDataKey(bookId, language, cacheVersion, sourceKey) {
 }
 
 export class PlayerStorage {
-  constructor(storage, baseUrl = "http://localhost/") {
+  constructor(storage, baseUrl = "http://localhost/", getStorage = () => storage) {
     this.storage = storage || null;
+    this.getStorage = getStorage;
     this.prefix = `compactPlayer@${encodeURIComponent(new URL(".", baseUrl).pathname)}:`;
     this.resetKey = this.prefix + "reset";
   }
 
   static fromBrowser() {
+    const getStorage = () => globalThis.localStorage;
     let storage = null;
-    try { storage = globalThis.localStorage; }
+    try { storage = getStorage(); }
     catch (error) { console.warn("[CompactAudioPlayer] Could not access local storage.", error); }
-    return new PlayerStorage(storage, globalThis.location?.href);
+    return new PlayerStorage(storage, globalThis.location?.href, getStorage);
   }
 
   readItem(key) {
@@ -162,7 +166,7 @@ export class PlayerStorage {
       uiLanguage: String(raw.uiLanguage || raw.uiLang || "en"),
       playbackRate: safeNumber(raw.playbackRate, 1, .5, 2),
       volume: safeNumber(raw.volume, 1, 0, 1),
-      skipSeconds: [5, 10, 15, 30, 60].includes(Number(raw.skipSeconds)) ? Number(raw.skipSeconds) : 15,
+      skipSeconds: skipInterval(raw.skipSeconds),
     };
   }
 
@@ -220,8 +224,14 @@ export class PlayerStorage {
       return data;
     }
     if (raw.kind === "embedded" && Array.isArray(raw.cues) && raw.cues.length <= 10000) {
-      const cues = raw.cues.filter((cue) => cue && Number.isFinite(cue.start) && cue.start >= 0 && (cue.end == null || (Number.isFinite(cue.end) && cue.end >= cue.start)) && typeof cue.title === "string" && cue.title.trim());
-      if (cues.length === raw.cues.length) return { kind: raw.kind, cues };
+      let previousStart = 0;
+      for (const cue of raw.cues) {
+        if (!cue || !Number.isFinite(cue.start) || cue.start < previousStart
+          || (cue.end != null && (!Number.isFinite(cue.end) || cue.end < cue.start))
+          || typeof cue.title !== "string" || !cue.title.trim()) return null;
+        previousStart = cue.start;
+      }
+      return { kind: raw.kind, cues: raw.cues };
     }
     return null;
   }
@@ -275,7 +285,7 @@ export class PlayerStorage {
 
   reset() {
     try {
-      this.storage ??= globalThis.localStorage;
+      this.storage ??= this.getStorage();
       if (!this.storage) return true;
       const resetId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
       for (let index = this.storage.length - 1; index >= 0; index -= 1) {

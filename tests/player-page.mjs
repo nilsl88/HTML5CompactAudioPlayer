@@ -2,13 +2,15 @@ import { setImmediate as settle } from "node:timers/promises";
 
 let pageNumber = 0;
 
-class Element extends EventTarget {
+export class Element extends EventTarget {
   children = [];
   dataset = {};
   classList = { add() {}, remove() {}, toggle() {} };
   hidden = true;
-  setAttribute() {}
-  removeAttribute(name) { delete this[name]; }
+  attributes = new Map();
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); delete this[name]; }
   append(...children) { this.children.push(...children); }
   appendChild(child) { this.append(child); }
   replaceChildren() { this.children = []; }

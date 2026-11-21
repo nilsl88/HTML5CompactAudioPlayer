@@ -1,13 +1,53 @@
 import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
-import { openPlayerPage } from "./player-page.mjs";
+import { createCustomSelects } from "../js/custom-select.js";
+import { Element, openPlayerPage } from "./player-page.mjs";
 import { PlayerStorage } from "../js/storage.js";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
   languages: { en: { sources: { aac: { 96: "sample.m4b" } } } },
 };
+
+test("custom selects commit a keyboard choice and restore focus on Escape", () => {
+  const label = new Element();
+  const document = { createElement() {
+    const element = new Element();
+    element.getBoundingClientRect = () => ({ top: 0, bottom: 10, height: 10 });
+    return element;
+  }, querySelector: () => label };
+  const controls = createCustomSelects(document, { innerHeight: 600 });
+  const select = Object.assign(new Element(), { id: "language", value: "da",
+    options: [{ value: "da", textContent: "Dansk" }, { value: "en", textContent: "English" }] });
+  Object.defineProperty(select, "selectedIndex", { get: () => select.options.findIndex((option) => option.value === select.value) });
+  const wrapper = controls.selectWithArrow(select);
+  assert.equal(wrapper.children[1].getAttribute("aria-hidden"), "true");
+  wrapper.insertBefore = (button) => wrapper.children.unshift(button);
+  select.closest = () => wrapper;
+  let changes = 0;
+  select.addEventListener("change", () => changes++);
+  const { button, menu } = controls.enhanceCustomSelect(select);
+  const key = (key) => button.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { key }));
+  assert.equal(button.getAttribute("role"), "combobox");
+  assert.equal(menu.getAttribute("role"), "listbox");
+  assert.equal(button.getAttribute("aria-labelledby"), label.id);
+  let focused = false;
+  button.focus = () => { focused = true; };
+  key("ArrowDown");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.equal(menu.children[1].getAttribute("role"), "option");
+  key("Enter");
+  assert.equal(select.value, "en");
+  assert.equal(changes, 1);
+  assert.ok(menu.hidden && focused);
+  focused = false;
+  key("ArrowUp");
+  key("Escape");
+  assert.ok(menu.hidden && focused);
+  assert.equal(select.value, "en");
+  assert.equal(changes, 1);
+});
 
 test("reset clears only this installation's progress, even for a shared book ID", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -89,6 +129,20 @@ function queueListeningPosition(page) {
     page.audio.dispatchEvent(new Event("timeupdate"));
   }
 }
+
+test("reset discards its pending position before pause, pagehide or a delayed save", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = await openPlayerPage(t, book, assert.fail, new Map(), {
+    location: Object.assign(new URL("https://example.test/"), { reload() {} }),
+  });
+  queueListeningPosition(page);
+  page.elements.get("resetOk").dispatchEvent(new Event("click"));
+  page.audio.currentTime = 40;
+  page.audio.dispatchEvent(new Event("timeupdate"));
+  page.window.dispatchEvent(new Event("pagehide"));
+  t.mock.timers.tick(5000);
+  assert.equal(PlayerStorage.fromBrowser().getProgress(book.id, "en"), 0);
+});
 
 test("a reset invalidates queued positions from another tab, including after a second reset", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -177,6 +231,19 @@ test("pausing while offline keeps playback paused after reconnecting", async (t)
   assert.equal(play.mock.callCount(), 2, "reconnecting respects the latest pause");
   button.dispatchEvent(new Event("click"));
   assert.equal(play.mock.callCount(), 3, "the listener can resume manually");
+});
+
+test("a blocked Media Session leaves playback and chapter controls available", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const navigator = { language: "en", onLine: true,
+    get mediaSession() { throw new DOMException("Blocked", "SecurityError"); },
+  };
+  const { elements, audio } = await openPlayerPage(t, { ...book,
+    languages: { en: { ...book.languages.en, chapters: "en.vtt" } } }, () => new Response(chapterText), new Map(), { navigator });
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.ok(audio.src.endsWith("/sample.m4b"));
+  assert.equal(elements.get("chaptersList").children[0].children[0].textContent, "Introduction");
 });
 
 test("the player starts and accepts Play when accessing localStorage throws", async (t) => {
@@ -271,6 +338,29 @@ test("a rejected language switch preserves the playing source and its listening 
 });
 
 const chapterText = "WEBVTT\n\n00:00.000 --> 00:10.000\nIntroduction";
+
+for (const button of ["prevChapterBtn", "nextChapterBtn"]) {
+  test(`pending ${button} keeps the new language's position`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const config = { ...book, languages: {
+      en: { ...book.languages.en, chapters: "en.vtt" },
+      da: { ...book.languages.en, chapters: "da.vtt" },
+    } };
+    const saved = new Map([["compactPlayer:sample", JSON.stringify({ progressByLang: { en: 10 } })]]);
+    const { elements } = await openPlayerPage(t, config, (_url, { signal }) =>
+      new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })), saved);
+    const storage = PlayerStorage.fromBrowser();
+    storage.writeChapters(book.id, "da", 1, "https://example.test/media/sample/da.vtt",
+      "WEBVTT\n\n00:00.000 --> 00:30.000\nStart\n\n00:30.000 --> 01:00.000\nAndet kapitel");
+    elements.get(button).dispatchEvent(new Event("click"));
+    const language = elements.get("langSelect");
+    language.value = "da";
+    language.dispatchEvent(new Event("change"));
+    await settle();
+    assert.equal(elements.get("timeCur").textContent, "0:10");
+    assert.equal(storage.getProgress(book.id, "da"), 10);
+  });
+}
 
 test("chapter sleep respects a newer timer choice while the chapter file is loading", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
@@ -372,7 +462,7 @@ test("chapter gaps clear the active title and still allow previous-chapter navig
   for (const [position, title] of [[5, "Introduction"], [10, ""], [15, ""], [20, "Finale"], [30, ""]]) {
     audio.currentTime = position;
     audio.dispatchEvent(new Event("timeupdate"));
-    assert.equal(elements.get("bookMeta").textContent.match(/Introduction|Finale/)?.[0] || "", title);
+    assert.equal(elements.get("bookMeta").textContent, ["en", "Low quality", title].filter(Boolean).join(" • "));
   }
   audio.currentTime = 15;
   audio.dispatchEvent(new Event("timeupdate"));
