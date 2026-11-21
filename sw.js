@@ -1,13 +1,16 @@
-const SHELL_VERSION = "v10";
-const SHELL_CACHE = `compact-player-shell-${SHELL_VERSION}`;
+importScripts("./js/offline-manifest.js");
+const { validManifest } = globalThis.CompactPlayerOfflineManifest;
+const SHELL_VERSION = "v11";
+const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
+const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const META_CACHE = "compact-player-offline-meta-v1";
 const DOWNLOAD_HEADER = "x-compact-player-download";
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=10",
-  "./player.js?v=10",
-  "./i18n.js?v=10",
+  "./player.css?v=11",
+  "./player.js?v=11",
+  "./i18n.js?v=11",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/config.js",
@@ -16,11 +19,14 @@ const SHELL_URLS = [
   "./js/media-controller.js",
   "./js/mp4-chapters.js",
   "./js/offline.js",
+  "./js/offline-lock.js",
+  "./js/offline-manifest.js",
   "./js/source-selection.js",
   "./js/storage.js",
   "./js/utils.js",
   "./js/vtt.js",
 ];
+const SHELL_PATHS = new Set(SHELL_URLS.map((path) => new URL(path, self.registration.scope).pathname));
 
 function scopeUrl(path) {
   return new URL(path, self.registration.scope).href;
@@ -30,22 +36,13 @@ function chunkUrl(downloadId, index) {
   return scopeUrl(`__compact_player_offline__/chunks/${encodeURIComponent(downloadId)}/${index}`);
 }
 
-function validManifest(value) {
-  return value?.schemaVersion === 1 && value.status === "ready" && value.downloadId && value.cacheName
-    && value.sourceUrl && value.mime && Number.isSafeInteger(value.totalSize) && value.totalSize > 0
-    && Number.isSafeInteger(value.chunkSize) && value.chunkSize > 0
-    && Number.isSafeInteger(value.totalChunks) && value.totalChunks === Math.ceil(value.totalSize / value.chunkSize)
-    && Array.isArray(value.completed) && new Set(value.completed).size === value.totalChunks
-    && value.completed.every((index) => Number.isInteger(index) && index >= 0 && index < value.totalChunks);
-}
-
 async function activeManifest() {
   const meta = await caches.open(META_CACHE);
   const response = await meta.match(scopeUrl("__compact_player_offline__/active.json"));
   if (!response) return null;
   try {
     const record = await response.json();
-    return record?.cacheName === record?.manifest?.cacheName && validManifest(record.manifest) ? record.manifest : null;
+    return record?.cacheName === record?.manifest?.cacheName && validManifest(record.manifest, "ready") ? record.manifest : null;
   } catch { return null; }
 }
 
@@ -83,26 +80,27 @@ async function cachedMediaResponse(request, manifest, cache) {
   }
   const firstChunk = Math.floor(range.start / manifest.chunkSize);
   const lastChunk = Math.floor(range.end / manifest.chunkSize);
-  const chunks = [];
-  for (let index = firstChunk; index <= lastChunk; index += 1) {
-    const response = await cache.match(chunkUrl(manifest.downloadId, index));
-    if (!response) return null;
-    chunks.push({ index, response });
-  }
+  let index = firstChunk;
+  let firstResponse = await cache.match(chunkUrl(manifest.downloadId, index));
+  if (!firstResponse) return null;
+  let canceled = false;
   const stream = new ReadableStream({
-    async start(controller) {
-      try {
-        for (const { index, response } of chunks) {
-          const data = new Uint8Array(await response.arrayBuffer());
-          const chunkStart = index * manifest.chunkSize;
-          const from = Math.max(0, range.start - chunkStart);
-          const to = Math.min(data.byteLength, range.end - chunkStart + 1);
-          if (to > from) controller.enqueue(data.subarray(from, to));
-        }
-        controller.close();
-      } catch (error) { controller.error(error); }
+    async pull(controller) {
+      const response = firstResponse || await cache.match(chunkUrl(manifest.downloadId, index));
+      firstResponse = null;
+      if (canceled) return;
+      if (!response) throw new Error("A downloaded audio chunk is missing.");
+      const data = new Uint8Array(await response.arrayBuffer());
+      if (canceled) return;
+      const chunkStart = index * manifest.chunkSize;
+      if (data.length !== Math.min(manifest.chunkSize, manifest.totalSize - chunkStart)) throw new Error("A downloaded audio chunk is incomplete.");
+      const from = Math.max(0, range.start - chunkStart);
+      const to = Math.min(data.length, range.end - chunkStart + 1);
+      controller.enqueue(data.subarray(from, to));
+      if (++index > lastChunk) controller.close();
     },
-  });
+    cancel() { canceled = true; firstResponse = null; },
+  }, { highWaterMark: 0 });
   const headers = {
     "accept-ranges": "bytes",
     "content-length": String(range.end - range.start + 1),
@@ -112,7 +110,7 @@ async function cachedMediaResponse(request, manifest, cache) {
   return new Response(stream, { status: range.partial ? 206 : 200, headers });
 }
 
-async function cachedFallback(request) {
+async function cachedBookResponse(request) {
   const manifest = await activeManifest();
   if (manifest) {
     const bookCache = await caches.open(manifest.cacheName);
@@ -120,11 +118,21 @@ async function cachedFallback(request) {
       const response = await cachedMediaResponse(request, manifest, bookCache);
       if (response) return response;
     }
-    const asset = await bookCache.match(request);
-    if (asset) return asset;
+    return bookCache.match(request);
+  }
+  return null;
+}
+
+async function cachedFallback(request) {
+  if (!SHELL_PATHS.has(new URL(request.url).pathname)) {
+    if (request.mode !== "navigate") return cachedBookResponse(request);
+    try {
+      const asset = await cachedBookResponse(request);
+      if (asset) return asset;
+    } catch (error) { console.warn("[CompactAudioPlayer] Could not read the downloaded book during navigation.", error); }
   }
   const shell = await caches.open(SHELL_CACHE);
-  if (request.mode === "navigate") return shell.match(scopeUrl("index.html")) || shell.match(scopeUrl("./"));
+  if (request.mode === "navigate") return await shell.match(scopeUrl("index.html")) || shell.match(scopeUrl("./"));
   return shell.match(request, { ignoreSearch: true });
 }
 
@@ -151,7 +159,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     const names = await caches.keys();
-    await Promise.all(names.filter((name) => name.startsWith("compact-player-shell-") && name !== SHELL_CACHE).map((name) => caches.delete(name)));
+    await Promise.all(names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX) && name !== SHELL_CACHE).map((name) => caches.delete(name)));
     await self.clients.claim();
   })());
 });

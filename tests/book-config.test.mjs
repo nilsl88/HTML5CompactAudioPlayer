@@ -122,6 +122,28 @@ test("a network failure reading the response body can use the legacy config", as
   assert.ok((await configs.load("one")).configUrl.endsWith("/episode.json"));
 });
 
+test("a stalled book.json body times out and loads episode.json", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const reading = deferred();
+  const body = deferred();
+  let transport;
+  const configs = new BookConfigStore({
+    library: normalizeLibrary(null), documentBaseUrl: baseUrl, retries: 1, timeoutMs: 20,
+    fetchImpl: async (url, { signal }) => {
+      if (url.endsWith("/episode.json")) return json(configuration());
+      transport = signal;
+      signal.addEventListener("abort", () => body.reject(signal.reason), { once: true });
+      return { ok: true, text: () => { reading.resolve(); return body.promise; } };
+    },
+  });
+  const result = configs.load("one");
+  await reading.promise;
+  t.mock.timers.tick(21);
+  body.resolve(JSON.stringify(configuration()));
+  assert.equal((await result).configUrl, baseUrl + "media/one/episode.json");
+  assert.equal(transport.aborted, true);
+});
+
 for (const status of [401, 403, 429, 500, 503]) test(`HTTP ${status} does not hide behind episode.json`, async () => {
   const calls = [];
   const configs = store(async (url) => { calls.push(url); return new Response(null, { status }); });
@@ -248,7 +270,7 @@ test("a stale cancelled book load cannot overwrite a newer selection", async () 
     storage: { readBook: () => ({}), getProgress: () => 0, setLastBook() {} },
     media: { setSelection() {}, setPlaybackRate() {}, setVolume() {} },
     t: () => "", buildSources: () => [{ id: "aac-64" }], chooseDefaultSource: (sources) => sources[0],
-    guessLanguage: () => "en", playbackSources: (sources) => sources, getChapterSourceKey: () => "",
+    guessLanguage: () => "en", getChapterSourceKey: () => "",
     resolveLanguageAsset: () => "", ensureChapters: () => Promise.resolve(), AbortController, URL, Map, Set,
   };
   for (const name of ["saveProgress", "cancelSleep", "cancelAvailabilityWork", "setLoading", "setBusy", "clearCover",

@@ -17,7 +17,7 @@ test("migrates legacy book and UI preference names", () => {
   memory.setItem("compactPlayer:book", JSON.stringify({ lang: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 }));
   memory.setItem("compactPlayer:ui", JSON.stringify({ uiLang: "sv", playbackRate: 9, volume: -2, skipSeconds: 30 }));
   const storage = new PlayerStorage(memory);
-  assert.deepEqual(storage.readBook("book"), { schemaVersion: 2, language: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 });
+  assert.deepEqual(storage.readBook("book"), { schemaVersion: 2, language: "da", quality: "aac-96", progressByLang: { da: 42 }, progressUpdatedAt: {}, lastTime: 12 });
   assert.equal(storage.readUi().uiLanguage, "sv");
   assert.equal(storage.readUi().playbackRate, 2);
   assert.equal(storage.readUi().volume, 0);
@@ -31,7 +31,35 @@ test("corrupt storage does not block startup", () => {
   assert.deepEqual(storage.readBook("book").progressByLang, {});
 });
 
-test("book terminology preserves existing selection, progress, and preference keys", () => {
+test("book IDs that match settings keys preserve progress, appearance and catalog selection", () => {
+  const memory = new MemoryStorage();
+  const storage = new PlayerStorage(memory);
+  storage.writeUi({ theme: "dark", playbackRate: 1.5 });
+  storage.setLastBook("north");
+  storage.setProgress("ui", "en", 80);
+  storage.setProgress("lastEpisode", "en", 90);
+  assert.equal(storage.readUi().theme, "dark");
+  assert.equal(storage.readUi().playbackRate, 1.5);
+  assert.equal(storage.getLastBook(), "north");
+  storage.writeUi({ volume: 0.5 });
+  storage.setLastBook("ui");
+  assert.equal(storage.getProgress("ui", "en"), 80);
+  assert.equal(storage.getProgress("lastEpisode", "en"), 90);
+
+  const legacy = new MemoryStorage();
+  const previous = new PlayerStorage(legacy);
+  const record = JSON.stringify({ progressByLang: { en: 42 }, quality: "aac-96" });
+  legacy.setItem(previous.prefix + "compactPlayer:ui", record);
+  legacy.setItem(previous.prefix + "compactPlayer:lastEpisode", record);
+  previous.writeUi({ theme: "light" });
+  previous.setLastBook("another");
+  for (const id of ["ui", "lastEpisode"]) {
+    assert.equal(previous.getProgress(id, "en"), 42);
+    assert.equal(previous.readBook(id).quality, "aac-96");
+  }
+});
+
+test("old book records migrate to installation storage and preserve the last selection key", () => {
   const memory = new MemoryStorage();
   memory.setItem("compactPlayer:lastEpisode", "episode-001");
   memory.setItem("compactPlayer:episode-001", JSON.stringify({ language: "en", quality: "aac-64", progressByLang: { en: 123, da: 456 } }));
@@ -42,9 +70,11 @@ test("book terminology preserves existing selection, progress, and preference ke
   storage.setLastBook("next");
   assert.equal(storage.readBook("episode-001").quality, "aac-64");
   assert.equal(storage.getProgress("episode-001", "da"), 456);
-  assert.equal(memory.getItem("compactPlayer:lastEpisode"), "next");
-  assert.equal(memory.getItem("compactPlayer:lastBook"), null);
-  assert.equal(JSON.parse(memory.getItem("compactPlayer:episode-001")).progressByLang.en, 789);
+  assert.equal(memory.getItem(storage.prefix + "compactPlayer:lastEpisode"), "next");
+  assert.equal(memory.getItem(storage.prefix + "compactPlayer:lastBook"), null);
+  assert.equal(new PlayerStorage(memory).getProgress("episode-001", "en"), 789);
+  assert.equal(memory.getItem("compactPlayer:lastEpisode"), "episode-001");
+  assert.equal(JSON.parse(memory.getItem("compactPlayer:episode-001")).progressByLang.en, 123);
 });
 
 test("reads legacy availability cache values", () => {
@@ -72,7 +102,7 @@ test("chapter cache replaces obsolete versions and rejects corrupt values", () =
   storage.writeChapters("book", "en", 1, "/chapters.vtt", "WEBVTT\n");
   storage.writeChapters("book", "en", 2, "/chapters.vtt", "WEBVTT\n\n00:00.000 --> 00:01.000\nNew");
   assert.equal(storage.readChapters("book", "en", 1, "/chapters.vtt"), "");
-  memory.setItem("compactPlayer:chapters:book:en:2", "{broken");
+  memory.setItem(storage.prefix + "compactPlayer:chapters:book:en:2", "{broken");
   assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
 });
 
@@ -82,6 +112,29 @@ test("caches embedded chapter cues by active source", () => {
   assert.equal(storage.writeChapterData("book", "en", 1, "embedded:https://example.test/book.m4b", { kind: "embedded", cues }), true);
   assert.deepEqual(storage.readChapterData("book", "en", 1, "embedded:https://example.test/book.m4b"), { kind: "embedded", cues });
   assert.equal(storage.readChapterData("book", "en", 1, "embedded:https://example.test/other.m4b"), null);
+});
+
+test("legacy chapter copies migrate while current embedded sources and other languages remain readable", () => {
+  const memory = new MemoryStorage();
+  const storage = new PlayerStorage(memory);
+  const url = "https://example.test/chapters.vtt";
+  const text = "WEBVTT\n\n00:00.000 --> 00:10.000\nOpening";
+  const key = storage.prefix + "compactPlayer:chapters:book:en:2";
+  const autoSource = "auto:" + url + "|audio.m4b";
+  memory.setItem(key + ":" + encodeURIComponent(autoSource), JSON.stringify({ kind: "vtt", sourceKey: autoSource, text }));
+  const cues = [{ start: 0, end: 10, title: "Opening" }];
+  storage.writeChapterData("book", "da", 1, "embedded:dansk", { kind: "embedded", cues });
+  for (const source of ["embedded:large", "embedded:small"]) {
+    storage.writeChapterData("book", "en", 2, source, { kind: "embedded", cues });
+  }
+  assert.equal(storage.readChapterData("book", "en", 2, autoSource, url).text, text);
+  assert.equal(memory.getItem(key + ":" + encodeURIComponent(autoSource)), null);
+  assert.equal(storage.readChapterData("book", "en", 2, "auto:other-quality", url).text, text);
+  for (const source of ["embedded:large", "embedded:small"]) assert.deepEqual(storage.readChapterData("book", "en", 2, source).cues, cues);
+  storage.writeChapterData("book", "en", 20, "embedded:small", { kind: "embedded", cues });
+  assert.equal(storage.readChapterData("book", "en", 2, "embedded:small"), null);
+  assert.equal(storage.readChapters("book", "en", 2, url), "");
+  assert.deepEqual(storage.readChapterData("book", "da", 1, "embedded:dansk").cues, cues);
 });
 
 test("parses real-world WebVTT without retaining cue markup", () => {

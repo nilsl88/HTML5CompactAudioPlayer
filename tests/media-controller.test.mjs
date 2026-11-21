@@ -40,6 +40,26 @@ test("does not report playing until the media element emits playing", async () =
   media.destroy();
 });
 
+test("an external audio pause clears playback intent while a source switch preserves it", async (t) => {
+  const audio = new FakeAudio();
+  const media = new MediaController(audio);
+  t.after(() => media.destroy());
+  await media.setSelection(sources, "opus-128", 0, true);
+  audio.emit("playing");
+  await media.setSelection(sources, "aac-128", 0, true);
+  audio.emit("pause"); // A queued event from pausing the previous source.
+  assert.equal(audio.paused, false);
+  assert.equal(media.playbackIntent, true);
+  audio.emit("playing");
+  audio.pause();
+  assert.equal(media.state, "paused");
+  assert.equal(media.playbackIntent, false);
+  await media.requestPlay();
+  audio.emit("playing");
+  assert.equal(media.state, "playing");
+  assert.equal(media.currentSource().id, "aac-128");
+});
+
 test("initial buffering stays in loading state", async () => {
   const audio = new FakeAudio();
   const media = new MediaController(audio, {}, { sourceTimeoutMs: 1000 });
@@ -72,6 +92,26 @@ test("NotAllowedError stops without walking the fallback queue", async () => {
   assert.equal(media.currentSource().id, "opus-128");
   assert.equal(media.playbackIntent, false);
   media.destroy();
+});
+
+test("a blocked Play stays paused past the source timeout and can retry the same source", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const audio = new FakeAudio();
+  const failures = [];
+  const media = new MediaController(audio, { onSourceFailure: (source) => failures.push(source.id) }, { sourceTimeoutMs: 100 });
+  t.after(() => media.destroy());
+  audio.playImpl = async () => { throw new DOMException("Press Play", "NotAllowedError"); };
+  await media.setSelection(sources, "opus-128");
+  await media.requestPlay();
+  t.mock.timers.tick(1000);
+  assert.deepEqual(failures, []);
+  assert.equal(media.state, "paused");
+  assert.equal(media.playbackIntent, false);
+  audio.playImpl = async () => {};
+  await media.requestPlay();
+  audio.emit("playing");
+  assert.equal(media.currentSource().id, "opus-128");
+  assert.equal(media.state, "playing");
 });
 
 test("decode rejection skips the failed codec family", async () => {

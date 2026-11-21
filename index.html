@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=10">
+  <link rel="stylesheet" href="./player.css?v=11">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -80,6 +80,7 @@
             <progress id="offlineProgress" max="100" value="0" aria-labelledby="offlineLabel offlineStatus" hidden></progress>
             <div class="offline-actions">
               <button id="offlineDownloadBtn" class="secondary-button" type="button">Download for offline use</button>
+              <button id="offlineRepairBtn" class="secondary-button" type="button" hidden>Restore book configuration</button>
               <button id="offlineCancelBtn" class="secondary-button" type="button" hidden>Cancel download</button>
               <button id="offlineRemoveBtn" class="secondary-button" type="button" hidden>Remove download</button>
             </div>
@@ -117,6 +118,6 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script type="module" src="./player.js?v=10"></script>
+  <script type="module" src="./player.js?v=11"></script>
 </body>
 </html>

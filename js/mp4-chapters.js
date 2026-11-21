@@ -88,7 +88,7 @@ class RangeReader {
   async read(start, end) {
     if (this.signal?.aborted) throw createAbortError();
     if (end <= start || end - start > MP4_METADATA_LIMIT_BYTES) throw new Error("MP4 metadata range is invalid or too large.");
-    const response = await fetchWithRetry(this.url, {
+    return fetchWithRetry(this.url, {
       fetchImpl: this.fetchImpl,
       cache: "default",
       credentials: "same-origin",
@@ -96,7 +96,10 @@ class RangeReader {
       signal: this.signal,
       timeoutMs: this.timeoutMs,
       retries: 2,
-    });
+    }, (response) => this.readRange(response, start, end));
+  }
+
+  async readRange(response, start, end) {
     if (response.status !== 206) throw new Error("The audio server does not support metadata byte ranges.");
     const range = parseContentRange(response.headers?.get?.("Content-Range"));
     if (!range) throw new Error("The audio server returned an invalid metadata range.");

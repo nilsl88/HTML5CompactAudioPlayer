@@ -1,5 +1,22 @@
 import { normalizeBook, parseJson } from "./config.js";
-import { createAbortError, fetchWithRetry } from "./utils.js";
+import { buildSources } from "./source-selection.js";
+import { createAbortError, fetchTextWithRetry } from "./utils.js";
+
+function parseBookConfig(text, configUrl, documentBaseUrl) {
+  const raw = parseJson(text, configUrl);
+  return normalizeBook(raw, { bookBaseUrl: new URL(".", configUrl).href, documentBaseUrl });
+}
+
+export function validateOfflineBookConfig(text, configUrl, documentBaseUrl, selection) {
+  const book = parseBookConfig(text, configUrl, documentBaseUrl);
+  const sources = buildSources(book.languages[selection.languageCode]);
+  // Legacy downloads may only have a catalog alias, without the ID from the configuration.
+  if ((selection.configBookId && book.id !== selection.configBookId)
+    || String(book.cacheVersion) !== String(selection.cacheVersion)
+    || !sources.some((source) => source.id === selection.sourceId && source.url === selection.sourceUrl)) {
+    throw new Error("The cached book configuration no longer matches the selected audio.");
+  }
+}
 
 function isBookId(id, library) {
   return library.byId.has(id) || (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) && id !== "..");
@@ -24,8 +41,9 @@ function waitForConfig(promise, signal) {
 }
 
 export class BookConfigStore {
-  constructor({ library, documentBaseUrl, fetchImpl = globalThis.fetch, retries = 2, retryDelayMs = 500, timeoutMs = 8000 }) {
+  constructor({ library, documentBaseUrl, downloadedConfig = null, fetchImpl = globalThis.fetch, retries = 2, retryDelayMs = 500, timeoutMs = 8000 }) {
     this.library = library;
+    this.downloadedConfig = downloadedConfig;
     this.documentBaseUrl = documentBaseUrl;
     this.fetchOptions = { fetchImpl, retries, retryDelayMs, timeoutMs, cache: "default", credentials: "same-origin" };
     this.cache = new Map();
@@ -35,10 +53,11 @@ export class BookConfigStore {
 
   load(id, { signal } = {}) {
     if (signal?.aborted) return Promise.reject(createAbortError());
-    if (!isBookId(id, this.library)) return Promise.reject(new Error("Invalid book identifier."));
+    const recordedUrl = this.downloadedConfig && this.downloadedConfig.id === id ? this.downloadedConfig.url : "";
+    if (!recordedUrl && !isBookId(id, this.library)) return Promise.reject(new Error("Invalid book identifier."));
     if (this.cache.has(id)) return waitForConfig(Promise.resolve(this.cache.get(id)), signal);
     if (!this.requests.has(id)) {
-      const request = this.fetchConfig(id).then((result) => {
+      const request = this.fetchConfig(id, recordedUrl).then((result) => {
         this.cache.set(id, result);
         const record = this.library.byId.get(id);
         if (record) record.title = result.book.title;
@@ -51,26 +70,36 @@ export class BookConfigStore {
     return waitForConfig(this.requests.get(id), signal);
   }
 
-  async fetchConfig(id) {
+  configUrls(id, recordedUrl) {
+    if (recordedUrl) {
+      const root = new URL("media/", this.documentBaseUrl);
+      const url = new URL(recordedUrl, root);
+      if (url.origin !== root.origin || !url.pathname.startsWith(root.pathname) || !/\/(book|episode)\.json$/.test(url.pathname)) {
+        throw new Error("Invalid offline book configuration URL.");
+      }
+      return [url.href];
+    }
     const folder = this.library.byId.get(id)?.folder || id;
     const encodedFolder = folder.split("/").map(encodeURIComponent).join("/");
     const bookBaseUrl = new URL(`media/${encodedFolder}/`, this.documentBaseUrl).href;
-    for (const filename of ["book.json", "episode.json"]) {
-      const configUrl = new URL(filename, bookBaseUrl).href;
+    return ["book.json", "episode.json"].map((name) => new URL(name, bookBaseUrl).href);
+  }
+
+  async fetchConfig(id, recordedUrl) {
+    const urls = this.configUrls(id, recordedUrl);
+    for (const [index, configUrl] of urls.entries()) {
+      const hasFallback = index + 1 < urls.length;
       let response;
-      let text;
       try {
-        response = await fetchWithRetry(configUrl, this.fetchOptions);
-        if (response.ok) text = await response.text();
+        response = await fetchTextWithRetry(configUrl, this.fetchOptions);
       } catch (error) {
         // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
-        if (filename === "book.json" && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
+        if (hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
         throw error;
       }
-      if (filename === "book.json" && [404, 410].includes(response.status)) continue;
+      if (hasFallback && [404, 410].includes(response.status)) continue;
       if (!response.ok) throw new Error(`Could not load book configuration ${configUrl} (HTTP ${response.status}).`);
-      const raw = parseJson(text, `media/${folder}/${filename}`);
-      const book = normalizeBook(raw, { bookBaseUrl, documentBaseUrl: this.documentBaseUrl });
+      const book = parseBookConfig(response.text, configUrl, this.documentBaseUrl);
       return { book, configUrl };
     }
   }
