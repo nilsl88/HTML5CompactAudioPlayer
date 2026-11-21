@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 
 const root = new URL("../", import.meta.url);
 
@@ -18,13 +18,6 @@ test("chapter navigation uses platform-independent icons", async () => {
     assert.match(html, new RegExp(`<button id="${id}"[^>]*>\\s*<svg class="control-icon"[^>]*aria-hidden="true"[^>]*focusable="false"`));
   }
   assert.doesNotMatch(html, /[⏮⏭]/u);
-});
-
-test("player metadata includes only the active chapter title", async () => {
-  const source = await readFile(new URL("player.js", root), "utf8");
-  assert.match(source, /const chapterTitle = cues\[activeCueIndex\]\?\.title \|\| "";/);
-  assert.match(source, /setMeta\(\[language\?\.label \|\| languageCode, sourceLabel\(source, false\), chapterTitle\]\.filter\(Boolean\)/);
-  assert.match(source, /function markActiveChapter\(position\)[\s\S]*?activeCueIndex = index;[\s\S]*?updateMeta\(\);/);
 });
 
 test("vertical arrow shortcuts use the configured skip interval", async () => {
@@ -88,7 +81,6 @@ test("control tooltips support mouse and keyboard users", async () => {
 test("select controls use aligned custom arrows", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   const css = await readFile(new URL("player.css", root), "utf8");
-  const source = await readFile(new URL("player.js", root), "utf8");
   for (const id of ["bookSelect", "langSelect", "qualitySelect", "skipSelect", "themeSelect", "fontSizeSelect", "uiLangSelect"]) {
     assert.match(html, new RegExp(`<div class="select-wrap"><select id="${id}"[\\s\\S]*?</select><span class="select-arrow" aria-hidden="true"><\\/span><\\/div>`));
   }
@@ -98,24 +90,14 @@ test("select controls use aligned custom arrows", async () => {
   assert.match(css, /\.select-arrow\s*{[^}]*transform:\s*translateY\(-50%\) rotate\(45deg\);/s);
   assert.match(css, /\.select-button::after\s*{[^}]*transform:\s*translateY\(-50%\) rotate\(45deg\);/s);
   assert.match(css, /\.select-wrap select:disabled \+ \.select-arrow\s*{[^}]*opacity:\s*\.55;/s);
-  assert.match(source, /function selectWithArrow\(select\)/);
-  assert.match(source, /uiRow\.append\(uiLabel, selectWithArrow\(onboardingUiSelect\)\)/);
-  assert.match(source, /audioRow\.append\(audioLabel, selectWithArrow\(onboardingAudioSelect\)\)/);
 });
 
 test("select controls use styled accessible popups", async () => {
   const css = await readFile(new URL("player.css", root), "utf8");
-  const source = await readFile(new URL("player.js", root), "utf8");
   assert.match(css, /\.select-button\s*{[^}]*min-height:\s*var\(--control-size\);[^}]*justify-content:\s*space-between;/s);
   assert.match(css, /\.select-button::after\s*{[^}]*border-right:[^;]+;[^}]*border-bottom:[^;]+;/s);
   assert.match(css, /\.select-menu\s*{[^}]*position:\s*absolute;[^}]*max-height:[^;]+;[^}]*overflow:\s*auto;/s);
   assert.match(css, /\.select-wrap\.opens-up \.select-menu\s*{/);
-  assert.match(source, /function enhanceCustomSelect\(select\)/);
-  assert.match(source, /button\.setAttribute\("role", "combobox"\)/);
-  assert.match(source, /menu\.setAttribute\("role", "listbox"\)/);
-  assert.match(source, /button\.setAttribute\("role", "option"\)/);
-  assert.match(source, /function handleCustomSelectKeydown\(event, state\)/);
-  assert.match(source, /state\.select\.dispatchEvent\(new Event\("change", \{ bubbles: true \}\)\)/);
 });
 
 test("CSS custom properties are defined", async () => {
@@ -219,19 +201,18 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("player.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(html, /player\.css\?v=12/);
-  assert.match(html, /player\.js\?v=12/);
-  assert.match(source, /i18n\.js\?v=12/);
-  assert.match(worker, /const SHELL_VERSION = "v12"/);
-  for (const path of ["player.css?v=12", "player.js?v=12", "i18n.js?v=12", "js/book-config.js", "js/offline.js", "js/offline-transfer.js", "js/offline-lock.js", "js/offline-manifest.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
-});
-
-test("offline lifecycle is optional and reset clears downloaded media", async () => {
-  const source = await readFile(new URL("player.js", root), "utf8");
-  assert.match(source, /const offline = new OfflineManager/);
-  assert.match(source, /offline\.init\(\)/);
-  assert.match(source, /await offline\.reset\(\)/);
-  assert.match(source, /const preferDownloaded = startedOffline \|\| navigator\.onLine === false;[\s\S]*?preferDownloaded \? offline\.active\?\.episodeId/);
-  assert.match(source, /function saveProgress\(\)\s*{\s*if \(!pendingProgress \|\| resetInProgress\) return;/);
-  assert.match(source, /resetInProgress = true;[\s\S]*?clearTimeout\(progressTimer\);[\s\S]*?media\.destroy\(\);[\s\S]*?storage\.reset\(\);[\s\S]*?await offline\.reset\(\);[\s\S]*?location\.reload\(\);/);
+  const version = worker.match(/const SHELL_VERSION = "v(\d+)"/)?.[1];
+  assert.ok(version);
+  const script = "./player.js?v=" + version;
+  const style = "./player.css?v=" + version;
+  const strings = "./i18n.js?v=" + version;
+  assert.ok(html.includes('src="' + script + '"'));
+  assert.ok(html.includes('href="' + style + '"'));
+  assert.ok(source.includes('from "' + strings + '"'));
+  const urls = worker.match(/const SHELL_URLS = \[([\s\S]*?)\];/)[1];
+  const paths = new Set([...urls.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+  const modules = (await readdir(new URL("js/", root))).filter((name) => name.endsWith(".js"));
+  for (const path of [script, style, strings, ...modules.map((name) => "./js/" + name)]) {
+    assert.ok(paths.has(path), "Missing offline shell asset " + path);
+  }
 });

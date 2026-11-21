@@ -551,10 +551,16 @@ test("keeps completed chunks when a connection fails so download can resume", as
   assert.equal(manager.phase, "paused");
   assert.deepEqual(manager.staging.completed, [0]);
   manager.fetchImpl = rangedFetch(total);
-  const resumed = await manager.inspectSource(selected);
-  assert.equal(resumed.canResume, true);
-  assert.equal(resumed.remainingBytes, 4);
-  const manifest = await manager.start(selected, resumed);
+  const partialId = manager.staging.downloadId;
+  const manifest = await manager.resume({
+    confirmDownload(check, candidate) {
+      assert.equal(check.canResume, true);
+      assert.equal(check.remainingBytes, 4);
+      assert.equal(candidate.sourceUrl, selected.sourceUrl);
+      return true;
+    },
+  });
+  assert.equal(manifest.downloadId, partialId);
   assert.equal(manifest.status, "ready");
   assert.deepEqual(manifest.completed, [0, 1]);
 });
@@ -618,29 +624,31 @@ test("reports an unsupported server instead of accepting a full response", async
   await assert.rejects(manager.inspectSource(selection()), (error) => error.code === "range");
 });
 
-for (const filename of ["book.json", "episode.json"]) test(`downloads and reloads offline with ${filename} after a shell upgrade`, async () => {
+for (const filename of ["book.json", "episode.json"]) test(`downloads and reloads offline with ${filename} after a shell upgrade`, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const baseUrl = "https://example.test/";
-  const raw = { id: "book", defaultLanguage: "en", languages: { en: { sources: { opus: { 64: "audio.webm" } } } } };
+  const raw = { id: "book", defaultLanguage: "en", title: { en: "Book" }, languages: { en: { sources: { opus: { 64: "audio.webm" } } } } };
   const library = normalizeLibrary({ books: [{ id: "book" }] });
   const audioFetch = rangedFetch(10);
   const fetchImpl = async (url, options) => {
+    if (url.endsWith("/library.json")) return Response.json({ books: [{ id: "book" }], ui: { onboardingEnabled: false } });
     if (url.endsWith(`/media/book/${filename}`)) return new Response(JSON.stringify(raw));
     if (url.endsWith("/book.json")) return new Response(null, { status: 404 });
     return audioFetch(url, options);
   };
-  const configs = new BookConfigStore({ library, documentBaseUrl: baseUrl, fetchImpl, retries: 1 });
-  const loaded = await configs.load("book");
+  const configUrl = baseUrl + "media/book/" + filename;
   const cacheStorage = new MemoryCacheStorage();
-  const manager = new OfflineManager({ baseUrl, fetchImpl, cacheStorage, navigatorObject: navigatorStub() });
-  await manager.init();
-  const selected = {
-    ...selection(), sourceUrl: buildSources(loaded.book.languages.en)[0].url,
-    assets: [{ url: loaded.configUrl, required: true }],
-  };
-  const manifest = await manager.start(selected, await manager.inspectSource(selected));
+  const navigator = navigatorStub();
+  const page = await openPlayerPage(t, raw, assert.fail, new Map(), { fetch: fetchImpl, caches: cacheStorage, navigator, confirm: () => true });
+  page.elements.get("offlineDownloadBtn").dispatchEvent(new Event("click"));
+  await settle();
+  const published = await workerContext({ caches: cacheStorage });
+  const manifest = await published.activeManifest();
   assert.equal(manifest.episodeId, "book");
   assert.equal(manifest.episodeTitle, "Book");
-  assert.ok(await (await cacheStorage.open(manifest.cacheName)).match(loaded.configUrl));
+  assert.equal(Object.hasOwn(manifest, "bookId"), false);
+  assert.equal(manifest.assets.find((asset) => asset.required).url, configUrl);
+  assert.ok(await (await cacheStorage.open(manifest.cacheName)).match(configUrl));
 
   const oldShell = "compact-player-app-shell:%2F:v10";
   const otherShell = "compact-player-app-shell:%2Fkids%2F:v10";
@@ -668,8 +676,8 @@ for (const filename of ["book.json", "episode.json"]) test(`downloads and reload
   await reloaded.init();
   assert.equal(reloaded.active.episodeId, "book");
   const offlineConfigs = new BookConfigStore({ library, documentBaseUrl: baseUrl, fetchImpl: offlineFetch, retries: 1 });
-  assert.equal((await offlineConfigs.load("book")).configUrl, loaded.configUrl);
-  const response = await offlineFetch(selected.sourceUrl, { headers: { Range: "bytes=8-9" } });
+  assert.equal((await offlineConfigs.load("book")).configUrl, configUrl);
+  const response = await offlineFetch(manifest.sourceUrl, { headers: { Range: "bytes=8-9" } });
   assert.equal(response.status, 206);
   assert.equal(response.headers.get("content-range"), "bytes 8-9/10");
   assert.equal((await response.arrayBuffer()).byteLength, 2);
@@ -899,6 +907,34 @@ test("an offline startup retains online alternative sources after reconnecting",
   page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   await settle();
   assert.deepEqual(tries, [selected.sourceUrl, new URL("alternate.mp3", selected.sourceUrl).href]);
+});
+
+test("downloading a repairable selection only asks to replace a different selection", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { options, saved, configUrl, config } = await savedBookFixture();
+  await (await options.cacheStorage.open(saved.cacheName)).delete(configUrl);
+  const prompts = [];
+  const { elements } = await openPlayerPage(t, { ...config, debug: { showAllQualities: true } }, rangedFetch(10), new Map(), {
+    navigator: options.navigatorObject, caches: options.cacheStorage,
+    confirm(message) { prompts.push(message); return false; },
+  });
+  assert.equal(elements.get("offlineRepairBtn").hidden, false);
+  const download = elements.get("offlineDownloadBtn");
+  assert.equal(download.textContent, "Download for offline use");
+  download.dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /^Download /);
+  const quality = elements.get("qualitySelect");
+  quality.value = "mp3-64";
+  quality.dispatchEvent(new Event("change"));
+  await settle();
+  download.dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /replace the downloaded copy/);
+  const worker = await workerContext({ caches: options.cacheStorage });
+  assert.equal(await worker.activeManifest(), null);
 });
 
 test("a missing required configuration can be restored without fetching or discarding saved audio", async (t) => {

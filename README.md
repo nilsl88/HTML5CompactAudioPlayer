@@ -72,16 +72,25 @@ sw.js                   Network-first app shell and offline ranged-audio respons
 i18n.js                 Interface strings
 js/
   availability.js       HEAD and Range availability probes
-  chapters.js           Chapter source selection and cached chapter loading
+  chapters.js           WebVTT and embedded chapter loading
+  chapter-session.js    Chapter cache, active source, navigation, and request cancellation
+  codecs.js             Codec families, MIME hints, and quality labels
+  preferences.js        Supported skip intervals and default
   config.js             Configuration validation and normalization
   book-config.js        Book loading, legacy filename fallback, and shared title requests
+  cover.js              Cover loading, image fallback, and object URL lifetime
+  custom-select.js      Select popups, keyboard navigation, and focus restoration
   dialogs.js            Dialog, panel, and focus behavior
+  media-session.js      Browser media keys, metadata, and lock-screen position
   media-controller.js   Sole owner of audio source, seek, and play transitions
   mp4-chapters.js       Bounded Range-based MP4 chapter and cover parser
   offline.js            Offline preflight, quota checks, chunk downloads, and manifests
+  offline-book-store.js  Stored download records, validation, and recovery after interruption
   offline-manifest.js   Offline storage addresses and manifest validation shared with the worker
   offline-transfer.js   Version checks, range validation, and streamed audio chunks
+  progress-writer.js    Batches listening positions and cancels pending writes on reset
   source-selection.js   MIME evidence, quality display, and fallback ordering
+  sleep-timer.js         Timed and end-of-chapter pauses, countdown, and volume fade
   storage.js            Safe preferences, progress, chapter, and availability persistence
   utils.js              Shared utilities and abortable fetch retries
   vtt.js                WebVTT chapter parser
@@ -352,6 +361,8 @@ Set a language's `chapterSource` to `embedded` to read QuickTime chapter tracks 
   }
 }
 ```
+
+When Opus or MP3 is selected, embedded chapters are unavailable for that source. Selecting an M4A/M4B quality loads its chapters. Use WebVTT for chapters shared across formats.
 
 Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. QuickTime text samples are trimmed to their declared title length so trailing format records do not appear in chapter names.
 

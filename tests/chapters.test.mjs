@@ -119,6 +119,31 @@ test("reads Nero embedded chapters with one metadata range", async () => {
   ]);
 });
 
+test("embedded chapters show an empty state on Opus and reload on AAC selection", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const book = { id: "book", defaultLanguage: "en", debug: { showAllQualities: true }, languages: {
+    en: { chapterSource: "embedded", sources: { opus: { 96: "book.webm" }, aac: { 96: "book.m4b" } } },
+  } };
+  const requests = [];
+  const fetchRange = rangedFetch(neroMetadata());
+  const { audio, elements } = await openPlayerPage(t, book, (url, options) => {
+    requests.push(url);
+    return fetchRange(url, options);
+  });
+  const list = elements.get("chaptersList");
+  assert.equal(list.children[0].textContent, "No chapters for this audio source.");
+  assert.deepEqual(requests, []);
+  assert.equal(elements.get("nextChapterBtn").disabled, true);
+  const quality = elements.get("qualitySelect");
+  quality.value = "aac-96";
+  quality.dispatchEvent(new Event("change"));
+  await settle();
+  assert.deepEqual(requests, ["https://example.test/media/book/book.m4b"]);
+  assert.equal(list.children[0].children[0].textContent, "Intro");
+  assert.equal(elements.get("nextChapterBtn").disabled, false);
+  assert.ok(!audio.src);
+});
+
 test("reconnecting retries failed embedded chapters without a WebVTT URL", async (t) => {
   for (const mode of ["embedded", "auto"]) {
     await t.test(mode, async (t) => {
@@ -153,6 +178,28 @@ test("reconnecting retries failed embedded chapters without a WebVTT URL", async
   }
 });
 
+test("an unordered embedded cache reloads the chapter list and current title from the active source", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const url = "https://example.test/media/book/audio.m4b";
+  const book = { id: "book", defaultLanguage: "en", languages: {
+    en: { chapterSource: "embedded", sources: { aac: { 96: "audio.m4b" } } },
+  } };
+  const sourceKey = "embedded:" + url;
+  const cacheKey = "compactPlayer@%2F:compactPlayer:chapters:book:en:1:" + encodeURIComponent(sourceKey);
+  const saved = new Map([[cacheKey, JSON.stringify({ kind: "embedded", sourceKey,
+    cues: [{ start: 30, end: null, title: "Later" }, { start: 0, end: 30, title: "Opening" }] })]]);
+  const requests = [];
+  const range = rangedFetch(neroMetadata());
+  const { elements } = await openPlayerPage(t, book, (url, options) => {
+    requests.push(url);
+    return range(url, options);
+  }, saved);
+  assert.deepEqual(requests, [url]);
+  assert.deepEqual(elements.get("chaptersList").children.map((row) => row.children[0].textContent), ["Intro", "Chapter 1"]);
+  assert.match(elements.get("bookMeta").textContent, /Intro$/);
+  assert.deepEqual(JSON.parse(saved.get(cacheKey)).cues.map((cue) => cue.start), [0, 60]);
+});
+
 test("finds MP4 metadata after a large media-data atom", async () => {
   const metadata = neroMetadata();
   const total = 17 * 1024 * 1024;
@@ -178,6 +225,33 @@ test("reads JPEG cover artwork from MP4 metadata", async () => {
   const cover = await loadEmbeddedMp4Cover("https://example.test/book.m4b", { fetchImpl: rangedFetch(metadata.file) });
   assert.equal(cover.mime, "image/jpeg");
   assert.deepEqual(cover.data, metadata.image);
+});
+
+test("a late cover image load after a language change cannot replace the current cover", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { file } = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
+  const range = rangedFetch(file);
+  const revoked = t.mock.method(URL, "revokeObjectURL");
+  const { elements, audio } = await openPlayerPage(t, {
+    id: "sample", defaultLanguage: "en", title: { en: "One", da: "To" }, coverSource: "embedded",
+    languages: { en: { sources: { aac: { 96: "en.m4b" } } }, da: { sources: { aac: { 96: "da.m4b" } } } },
+  }, range);
+  const image = elements.get("coverImg");
+  const firstUrl = image.src;
+  const oldLoad = image.onload;
+  assert.match(firstUrl, /^blob:/);
+  const language = elements.get("langSelect");
+  language.value = "da";
+  language.dispatchEvent(new Event("change"));
+  await settle();
+  assert.ok(revoked.mock.calls.some((call) => call.arguments[0] === firstUrl));
+  oldLoad();
+  assert.equal(elements.get("coverButton").hidden, true);
+  assert.notEqual(image.src, firstUrl);
+  image.onload();
+  assert.equal(image.alt, "To");
+  assert.equal(elements.get("coverButton").hidden, false);
+  assert.ok(!audio.src);
 });
 
 test("reads PNG cover artwork from MP4 metadata", async () => {

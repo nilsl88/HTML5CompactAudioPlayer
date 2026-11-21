@@ -1,5 +1,6 @@
 import "./offline-manifest.js";
 import { createAbortError, fetchWithRetry } from "./utils.js";
+import { OfflineBookStore, recoverDownloads, responseJson, jsonResponse } from "./offline-book-store.js";
 import { withOfflineLock } from "./offline-lock.js";
 import { validateOfflineBookConfig } from "./book-config.js";
 import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, checkCanceled, chunkBounds, downloadChunks, inspectAudioRange, sameAudioRevision } from "./offline-transfer.js";
@@ -13,8 +14,7 @@ const {
   audioMimeType, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl,
 } = globalThis.CompactPlayerOfflineManifest;
 export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
-export const OFFLINE_BOOK_CACHE_PREFIX = "compact-player-offline-book-v2-";
-const LEGACY_BOOK_CACHE_PREFIX = "compact-player-offline-book-v1-";
+export { OFFLINE_BOOK_CACHE_PREFIX } from "./offline-book-store.js";
 
 export function completedBytes(manifest) {
   if (!validManifest(manifest)) return 0;
@@ -24,13 +24,17 @@ export function completedBytes(manifest) {
   }, 0);
 }
 
-export function manifestMatchesSelection(manifest, selection) {
-  return validManifest(manifest) && manifest.episodeId === selection?.episodeId
+export function sameOfflineSelection(manifest, selection) {
+  return Boolean(manifest && selection) && manifest.episodeId === selection.episodeId
     && (!manifest.configBookId || !selection.configBookId || manifest.configBookId === selection.configBookId)
-    && manifest.languageCode === selection?.languageCode
-    && manifest.sourceId === selection?.sourceId
-    && manifest.sourceUrl === selection?.sourceUrl
-    && String(manifest.cacheVersion) === String(selection?.cacheVersion);
+    && manifest.languageCode === selection.languageCode
+    && manifest.sourceId === selection.sourceId
+    && manifest.sourceUrl === selection.sourceUrl
+    && String(manifest.cacheVersion) === String(selection.cacheVersion);
+}
+
+export function manifestMatchesSelection(manifest, selection) {
+  return validManifest(manifest) && sameOfflineSelection(manifest, selection);
 }
 
 function canResume(staging, selection, preflight) {
@@ -39,17 +43,6 @@ function canResume(staging, selection, preflight) {
 
 function offlineConflict() {
   throw new OfflineDownloadError("conflict", "Another tab is updating or has changed the offline book.");
-}
-
-async function responseJson(response) {
-  if (!response) return null;
-  const text = await response.text();
-  try { return JSON.parse(text); }
-  catch { return null; }
-}
-
-function jsonResponse(value) {
-  return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
 }
 
 function createDownloadId() {
@@ -98,14 +91,14 @@ export class OfflineManager {
   } = {}) {
     const installation = new URL("./", baseUrl || globalThis.location?.href || "http://localhost/");
     this.baseUrl = installation.href;
-    this.bookCachePrefix = `${OFFLINE_BOOK_CACHE_PREFIX}${encodeURIComponent(installation.pathname)}:`;
     this.onChange = onChange;
     this.fetchImpl = fetchImpl;
     this.navigator = navigatorObject;
-    this.cacheStorage = null;
+    this.getCacheStorage = () => cacheStorage === undefined ? globalThis.caches : cacheStorage;
+    this.store = new OfflineBookStore(this.baseUrl, null);
     this.supported = false;
     try {
-      this.cacheStorage = cacheStorage === undefined ? globalThis.caches : cacheStorage;
+      this.store.cacheStorage = this.getCacheStorage();
       this.supported = Boolean(fetchImpl && this.cacheStorage && navigatorObject?.serviceWorker && globalThis.isSecureContext !== false);
     } catch (error) {
       console.warn("[CompactAudioPlayer] Browser access to offline storage is blocked.", error);
@@ -118,6 +111,8 @@ export class OfflineManager {
     this.abortController = null;
     this.currentPromise = null;
   }
+
+  get cacheStorage() { return this.store.cacheStorage; }
 
   snapshot() {
     return {
@@ -157,75 +152,13 @@ export class OfflineManager {
     return this.refresh();
   }
 
-  async metaCache() { return this.cacheStorage.open(OFFLINE_META_CACHE); }
-
-  configUrl(manifest) {
-    return Array.isArray(manifest?.assets) && manifest.assets.find((asset) => asset?.required)?.url;
-  }
+  metaCache() { return this.store.metaCache(); }
+  readRecord(type, includeUnpublished) { return this.store.readRecord(type, includeUnpublished); }
+  writeRecord(type, manifest) { return this.store.writeRecord(type, manifest); }
 
   get downloadedConfig() {
-    const url = this.configUrl(this.active);
+    const url = this.store.configUrl(this.active);
     return url ? { id: this.active.episodeId, url } : null;
-  }
-
-  async ownsBookCache(name) {
-    if (typeof name !== "string") return false;
-    if (name.startsWith(this.bookCachePrefix)) return true;
-    if (!name.startsWith(LEGACY_BOOK_CACHE_PREFIX)) return false;
-    // Legacy names contain only a download ID. The manifest URL identifies the installation.
-    return Boolean(await this.cacheStorage.match(offlineManifestUrl(this.baseUrl), { cacheName: name }));
-  }
-
-  async ownedBookCacheNames() {
-    const owned = [];
-    for (const name of await this.cacheStorage.keys()) {
-      if (await this.ownsBookCache(name)) owned.push(name);
-    }
-    return owned;
-  }
-
-  async deleteOwnedBookCache(name) {
-    if (await this.ownsBookCache(name)) await this.cacheStorage.delete(name);
-  }
-
-  async readRecord(type, includeUnpublished = false) {
-    const response = await this.cacheStorage.match(offlineMetaUrl(this.baseUrl, type), { cacheName: OFFLINE_META_CACHE });
-    const record = await responseJson(response);
-    if (type === "active" && includeUnpublished) {
-      const saved = record?.manifest;
-      if (saved?.status === "removed" && typeof saved.downloadId === "string" && saved.downloadId) return saved;
-      if (saved?.status === "needs-config" && saved.cacheName === record.cacheName
-        && validManifest({ ...saved, status: "ready" }, "ready")) return saved;
-    }
-    const status = type === "active" ? "ready" : "downloading";
-    return validManifest(record?.manifest, status) && record.cacheName === record.manifest.cacheName ? record.manifest : null;
-  }
-
-  async writeRecord(type, manifest) {
-    const cache = await this.metaCache();
-    const key = offlineMetaUrl(this.baseUrl, type);
-    if (!manifest) { await cache.delete(key); return; }
-    await cache.put(key, jsonResponse({ schemaVersion: OFFLINE_SCHEMA_VERSION, cacheName: manifest.cacheName, manifest }));
-  }
-
-  async readBookManifest(cacheName) {
-    const cache = await this.cacheStorage.open(cacheName);
-    let manifest = await responseJson(await cache.match(offlineManifestUrl(this.baseUrl)));
-    if (!validManifest(manifest) || manifest.cacheName !== cacheName) return null;
-    const present = await Promise.all(manifest.completed.map(async (index) => Boolean(await cache.match(offlineChunkUrl(this.baseUrl, manifest.downloadId, index)))));
-    if (manifest.status === "ready" && present.some((exists) => !exists)) return null;
-    if (manifest.status === "downloading" && present.some((exists) => !exists)) {
-      manifest = { ...manifest, completed: manifest.completed.filter((_index, position) => present[position]) };
-      await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(manifest));
-    }
-    if (manifest.status === "ready") {
-      try { await this.verifyCachedConfig(manifest); }
-      catch (error) {
-        if (error.code !== "config") throw error;
-        return { ...manifest, status: "needs-config" };
-      }
-    }
-    return manifest;
   }
 
   withLock(action, whenBusy) {
@@ -259,7 +192,7 @@ export class OfflineManager {
 
   async checkPublishedConfig() {
     if (!this.active) return;
-    try { await this.verifyCachedConfig(this.active); }
+    try { await this.store.verifyCachedConfig(this.active); }
     catch (error) {
       if (error.code === "config") this.active = null;
       else console.warn("[CompactAudioPlayer] Could not read the published book configuration.", error);
@@ -293,26 +226,15 @@ export class OfflineManager {
     let bookNames, manifests, saved;
     try {
       saved = await this.readRecords();
-      bookNames = await this.ownedBookCacheNames();
-      manifests = (await Promise.all(bookNames.map((name) => this.readBookManifest(name)))).filter(Boolean);
+      bookNames = await this.store.ownedBookCacheNames();
+      manifests = (await Promise.all(bookNames.map((name) => this.store.readBookManifest(name)))).filter(Boolean);
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not verify offline downloads. Cleanup skipped.", error);
       if (error?.name === "SecurityError" || error?.name === "NotAllowedError") this.supported = false;
       this.emit();
       return this.snapshot();
     }
-    // After an explicit removal only a later staging download can become the saved book.
-    if (saved?.status === "removed") manifests = manifests.filter((manifest) =>
-      manifest.status === "downloading" || manifest.downloadId === this.staging?.downloadId);
-    const newest = (status, published, by) => {
-      const candidates = manifests.filter((manifest) => manifest.status === status);
-      return candidates.find((manifest) => manifest.cacheName === published?.cacheName)
-        || candidates.sort((a, b) => b[by] - a[by])[0] || null;
-    };
-    const damaged = newest("needs-config", saved, "downloadedAt");
-    const publishedNeedsConfig = damaged && damaged.cacheName === saved?.cacheName;
-    const active = publishedNeedsConfig ? null : newest("ready", saved, "downloadedAt");
-    const staging = newest("downloading", this.staging, "createdAt");
+    const { active, staging, damaged } = recoverDownloads(manifests, saved, this.staging);
     if (this.active || this.repairable || active || damaged) await this.writeRecord("active", active || damaged);
     if (this.staging || staging) await this.writeRecord("staging", staging);
     this.active = active;
@@ -384,7 +306,7 @@ export class OfflineManager {
       schemaVersion: OFFLINE_SCHEMA_VERSION,
       status: "downloading",
       downloadId,
-      cacheName: `${this.bookCachePrefix}${downloadId}`,
+      cacheName: `${this.store.bookCachePrefix}${downloadId}`,
       episodeId: selection.episodeId,
       configBookId: selection.configBookId || selection.episodeId,
       episodeTitle: String(selection.episodeTitle || selection.episodeId),
@@ -443,17 +365,6 @@ export class OfflineManager {
     }
   }
 
-  async verifyCachedConfig(manifest, requiredUrl) {
-    const url = this.configUrl(manifest);
-    if (requiredUrl && url !== requiredUrl) throw new OfflineDownloadError("config", "The manifest lost the required book configuration.");
-    if (!url) return;
-    const response = await this.cacheStorage.match(url, { cacheName: manifest.cacheName });
-    if (!response?.ok) throw new OfflineDownloadError("config", "The downloaded book configuration is missing.");
-    const text = await response.text();
-    try { validateOfflineBookConfig(text, url, this.baseUrl, manifest); }
-    catch (error) { throw new OfflineDownloadError("config", error.message); }
-  }
-
   runOperation(action) {
     if (this.currentPromise) return this.currentPromise;
     this.abortController = new AbortController();
@@ -467,13 +378,18 @@ export class OfflineManager {
     return this.currentPromise;
   }
 
+  resume(options) {
+    if (!this.staging) return Promise.resolve(null);
+    return this.start(this.staging, undefined, options);
+  }
+
   start(selection, preflight, { waitForPriority = async () => {}, confirmDownload = () => true, onPersistence } = {}) {
     return this.runOperation(async (signal) => {
       const expected = this.recordIds();
       try {
         const check = preflight || await this.inspectSource(selection, signal);
         checkCanceled(signal);
-        if (!confirmDownload(check)) return null;
+        if (!confirmDownload(check, selection)) return null;
         if (check.availableBytes != null && check.availableBytes < check.requiredBytes) {
           throw new OfflineDownloadError("quota", "Insufficient browser storage.");
         }
@@ -498,11 +414,11 @@ export class OfflineManager {
     const candidate = this.repairable;
     const expected = this.recordIds();
     return this.runOperation((signal) => this.updateIfCurrent(expected, async () => {
-      if (!candidate || this.active || !(await this.ownedBookCacheNames()).includes(candidate.cacheName)) {
+      if (!candidate || this.active || !(await this.store.ownedBookCacheNames()).includes(candidate.cacheName)) {
         throw new OfflineDownloadError("conflict", "The saved download has changed.");
       }
       const cache = await this.cacheStorage.open(candidate.cacheName);
-      const url = this.configUrl(candidate);
+      const url = this.store.configUrl(candidate);
       if (new URL(url).origin !== new URL(this.baseUrl).origin) throw new OfflineDownloadError("config", "The saved configuration URL belongs to another site.");
       const text = await prepareWithTimeout(async (requestSignal) => {
         const result = await this.fetchImpl(url, { cache: "no-store", credentials: "same-origin",
@@ -513,7 +429,7 @@ export class OfflineManager {
       validateOfflineBookConfig(text, url, this.baseUrl, candidate);
       checkCanceled(signal);
       await cache.put(url, new Response(text, { headers: { "content-type": "application/json" } }));
-      const ready = await this.readBookManifest(candidate.cacheName);
+      const ready = await this.store.readBookManifest(candidate.cacheName);
       if (!validManifest(ready, "ready") || ready.downloadId !== candidate.downloadId) {
         throw new OfflineDownloadError("incomplete", "The saved audio is incomplete.");
       }
@@ -532,7 +448,7 @@ export class OfflineManager {
     if (this.staging?.downloadId === manifest.downloadId) this.staging = null;
     try {
       if (!this.staging) await this.writeRecord("staging", null);
-      if (previous && previous.cacheName !== manifest.cacheName) await this.deleteOwnedBookCache(previous.cacheName);
+      if (previous && previous.cacheName !== manifest.cacheName) await this.store.deleteOwnedBookCache(previous.cacheName);
     } catch (error) {
       console.warn("[CompactAudioPlayer] The download is ready. Cleanup will retry on the next visit.", error);
     }
@@ -556,7 +472,7 @@ export class OfflineManager {
         await this.putManifest(cache, manifest);
       }
       await this.cacheAssets(cache, selection.assets, signal);
-      await this.verifyCachedConfig(manifest, config?.url);
+      await this.store.verifyCachedConfig(manifest, config?.url);
       const completed = new Set(manifest.completed);
       this.setPhase("downloading", completedBytes(manifest) / manifest.totalSize);
       for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
@@ -566,7 +482,7 @@ export class OfflineManager {
         await this.putManifest(cache, manifest);
         this.setPhase("downloading", completedBytes(manifest) / manifest.totalSize);
       }
-      const stored = await this.readBookManifest(manifest.cacheName);
+      const stored = await this.store.readBookManifest(manifest.cacheName);
       checkCanceled(signal);
       if (!manifestMatchesSelection(stored, selection) || stored.status !== "downloading" || stored.downloadId !== manifest.downloadId) {
         await this.removeStagingLocked();
@@ -577,7 +493,7 @@ export class OfflineManager {
         await this.putManifest(cache, stored);
         throw new OfflineDownloadError("incomplete", "A downloaded audio chunk is missing.");
       }
-      await this.verifyCachedConfig(manifest, config?.url);
+      await this.store.verifyCachedConfig(manifest, config?.url);
       checkCanceled(signal);
       this.setPhase("finalizing", 1);
       await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(manifest));
@@ -612,7 +528,7 @@ export class OfflineManager {
   async removeStagingLocked() {
     const staging = this.staging;
     await this.writeRecord("staging", null);
-    await this.deleteOwnedBookCache(staging?.cacheName);
+    await this.store.deleteOwnedBookCache(staging?.cacheName);
     this.staging = null;
   }
 
@@ -621,7 +537,7 @@ export class OfflineManager {
       const saved = this.active || this.repairable;
       if (!saved) return;
       await this.writeRecord("active", { status: "removed", downloadId: saved.downloadId });
-      await this.deleteOwnedBookCache(saved.cacheName);
+      await this.store.deleteOwnedBookCache(saved.cacheName);
       this.active = null;
       this.repairable = null;
       this.setPhase(this.staging ? "paused" : "idle", this.staging ? completedBytes(this.staging) / this.staging.totalSize : 0);
@@ -629,12 +545,12 @@ export class OfflineManager {
   }
 
   async reset() {
-    this.cacheStorage ??= globalThis.caches;
+    this.store.cacheStorage ??= this.getCacheStorage();
     if (!this.cacheStorage) return;
     this.abortController?.abort();
     try { await this.currentPromise; } catch {}
     await this.withLock(async () => {
-      const names = await this.ownedBookCacheNames();
+      const names = await this.store.ownedBookCacheNames();
       for (const name of names) await this.cacheStorage.delete(name);
       await this.writeRecord("active", null);
       await this.writeRecord("staging", null);

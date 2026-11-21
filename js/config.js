@@ -1,6 +1,7 @@
 import { normalizeLanguageTag, safeUrl } from "./utils.js";
+import { CODECS } from "./codecs.js";
 
-export const CODECS = ["opus", "aac", "mp3"];
+export { CODECS };
 
 export function normalizeLibrary(raw) {
   const library = { defaultId: "", books: [], byId: new Map(), ui: { onboardingEnabled: true } };

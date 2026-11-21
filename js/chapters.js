@@ -1,3 +1,4 @@
+import { isMp4Audio } from "./codecs.js";
 import { fetchTextWithRetry } from "./utils.js";
 import { parseWebVtt } from "./vtt.js";
 import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js";
@@ -33,9 +34,9 @@ export async function loadChapterFile(url, {
 
 export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS, revalidate = false } = {}) {
   if (mode === "none") return { kind: "none", text: "", cues: [] };
-  const canReadEmbedded = /^audio\/mp4(?:;|$)/i.test(String(sourceMime)) || /\.(?:m4a|m4b)(?:[?#]|$)/i.test(String(sourceUrl));
+  const canReadEmbedded = isMp4Audio({ mime: sourceMime, url: sourceUrl });
   const loadEmbedded = async () => {
-    if (!canReadEmbedded || !sourceUrl) throw new Error("The active source does not contain readable MP4 chapters.");
+    if (!canReadEmbedded || !sourceUrl) return { kind: "none", text: "", cues: [] };
     return { kind: "embedded", text: "", cues: await loadEmbeddedMp4Chapters(sourceUrl, { signal, fetchImpl, timeoutMs }) };
   };
   if (mode === "embedded") return loadEmbedded();

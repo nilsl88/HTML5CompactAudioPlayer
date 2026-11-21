@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=12">
+  <link rel="stylesheet" href="./player.css?v=13">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -71,7 +71,7 @@
           <div class="setting-row"><label for="qualitySelect">Quality</label><div class="select-wrap"><select id="qualitySelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
           <div id="volumeRow" class="setting-row range-row"><label for="volumeRange">Volume</label><div class="range-wrap"><input id="volumeRange" type="range" min="0" max="100" value="100" step="1"><output id="volumeValue" for="volumeRange">100%</output></div></div>
           <div class="setting-row range-row"><label for="speedRange">Playback speed</label><div class="range-wrap"><input id="speedRange" type="range" min="0.5" max="2" value="1" step="0.05"><output id="speedValue" for="speedRange">1×</output></div></div>
-          <div class="setting-row"><label for="skipSelect">Skip interval</label><div class="select-wrap"><select id="skipSelect"><option value="5">5 s</option><option value="10">10 s</option><option value="15">15 s</option><option value="30">30 s</option><option value="60">60 s</option></select><span class="select-arrow" aria-hidden="true"></span></div></div>
+          <div class="setting-row"><label for="skipSelect">Skip interval</label><div class="select-wrap"><select id="skipSelect"></select><span class="select-arrow" aria-hidden="true"></span></div></div>
           <section id="offlineRow" class="offline-setting" aria-labelledby="offlineLabel" hidden>
             <div class="offline-heading">
               <span id="offlineLabel">Offline</span>
@@ -118,6 +118,6 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script type="module" src="./player.js?v=12"></script>
+  <script type="module" src="./player.js?v=13"></script>
 </body>
 </html>

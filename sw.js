@@ -1,27 +1,36 @@
 importScripts("./js/offline-manifest.js");
 const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v12";
+const SHELL_VERSION = "v13";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=12",
-  "./player.js?v=12",
-  "./i18n.js?v=12",
+  "./player.css?v=13",
+  "./player.js?v=13",
+  "./i18n.js?v=13",
   "./js/availability.js",
   "./js/chapters.js",
+  "./js/chapter-session.js",
   "./js/config.js",
+  "./js/codecs.js",
+  "./js/preferences.js",
+  "./js/cover.js",
   "./js/book-config.js",
   "./js/dialogs.js",
+  "./js/custom-select.js",
   "./js/media-controller.js",
+  "./js/media-session.js",
   "./js/mp4-chapters.js",
   "./js/offline.js",
+  "./js/offline-book-store.js",
+  "./js/progress-writer.js",
   "./js/offline-transfer.js",
   "./js/offline-lock.js",
   "./js/offline-manifest.js",
   "./js/source-selection.js",
   "./js/storage.js",
+  "./js/sleep-timer.js",
   "./js/utils.js",
   "./js/vtt.js",
 ];
