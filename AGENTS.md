@@ -16,6 +16,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `i18n.js`: interface strings for English, Danish, Norwegian Bokmål, and Swedish.
 - `js/config.js`: configuration parsing, validation, URL resolution, and localization helpers.
 - `js/book-config.js`: cached book configuration loading, legacy filename fallback, query selection, and bounded title lookups.
+- `js/book-selection.js` chooses the book’s language and source and records confirmed quality changes.
 - `js/media-controller.js`: the only owner of audio source changes, loading, seeking, play/pause state, and fallback transitions.
 - `js/offline.js`: service-worker registration, storage preflight, chunk downloads, resume state, and offline manifests.
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
@@ -29,6 +30,7 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/utils.js`: shared formatting, URL checks, abort errors, and fetch retries.
 - `media/`: example library, book JSON, cover image, and chapter files.
 - `skills/create-audiobook/SKILL.md`: workflow for encoding new books and generating compatible configuration.
+- `tools/make-chapters.py`: time-based WebVTT chapters for audio without chapter metadata, cut at pauses in the narration.
 - `tests/`: dependency-free Node test files.
 
 ## Development commands
@@ -55,7 +57,9 @@ Do not claim physical iPhone, iPad, or Android testing unless it was actually pe
 
 ## Creating new audiobooks
 
-Use `skills/create-audiobook/SKILL.md` when a user asks to add a book from source audio. It normally creates 64, 96, 128, and 256 kbps Opus WebM, AAC/M4A, and MP3 variants, then writes a compatible `book.json` and minimal `books` entry in `library.json`. Configuration-only or original-audio requests must not trigger encoding or extra media files. It supports embedded or WebVTT chapters and embedded or external cover art. Require `ffmpeg` and `ffprobe`, keep source files unchanged, validate every output, and never overwrite an existing book directory without confirmation. Do not commit or push unless the user explicitly asks.
+Use `skills/create-audiobook/SKILL.md` when a user asks to add a book from source audio. It normally creates 64, 96, 128, and 256 kbps Opus WebM, AAC/M4A, and MP3 variants, then writes a compatible `book.json` and minimal `books` entry in `library.json`. Configuration-only or original-audio requests must not trigger encoding or extra media files. It supports embedded, WebVTT, or generated time-based chapters and embedded or external cover art. Require `ffmpeg` and `ffprobe`, keep source files unchanged, validate every output, and never overwrite an existing book directory without confirmation. Do not commit or push unless the user explicitly asks.
+
+Use `tools/make-chapters.py` only when the user asks for chapters and the audio has neither embedded chapters nor a WebVTT file. It needs Python 3 in addition to `ffmpeg` and `ffprobe`, and it only reads the audio. Do not pass `--force` to replace an existing chapter file without confirmation. Keep the default `Part {n}` titles unless the user supplies a pattern: the parts are time slices, not the chapters of the book. After generating the file, set the language's `chapterSource` to `vtt`, set `chapters`, and raise `cacheVersion`.
 
 ## Audio architecture
 

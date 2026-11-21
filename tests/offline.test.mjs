@@ -434,6 +434,7 @@ test("opening another tab during replacement keeps the newly activated offline b
   const replacement = writer.start(next, await writer.inspectSource(next));
   await activating;
   try {
+    assert.equal(writer.snapshot().canCancel, false);
     await reader.init();
     assert.equal(reader.active?.downloadId, previous.downloadId);
   } finally { release(); }
@@ -1071,6 +1072,38 @@ test("download preparation can be canceled or time out before any chunks are wri
   await restarted.init();
   assert.equal(restarted.active?.downloadId, saved.downloadId);
   assert.equal(restarted.staging, null);
+});
+
+test("a completed replacement survives a failed active record write on resume and reload", async (t) => {
+  for (const recovery of ["resume", "reload"]) {
+    const { manager, options, selected, saved } = await savedBookFixture();
+    const replacement = { ...selected, sourceId: "mp3-64", mime: "audio/mpeg",
+      sourceUrl: new URL("alternate.mp3", selected.sourceUrl).href };
+    const meta = await manager.metaCache();
+    const put = meta.put.bind(meta);
+    const failure = t.mock.method(meta, "put", (key, value) => {
+      if (key.endsWith("/active.json")) throw new Error("Active record write failed");
+      return put(key, value);
+    });
+    await assert.rejects(manager.start(replacement), /Active record write failed/);
+    failure.mock.restore();
+    const staged = manager.staging;
+    assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+    assert.ok(await options.cacheStorage.match(offlineChunkUrl(options.baseUrl, saved.downloadId, 0), { cacheName: saved.cacheName }));
+    const fetch = t.mock.fn(() => { throw new Error("Unexpected network request during publication"); });
+    manager.fetchImpl = fetch;
+    if (recovery === "resume") {
+      assert.equal(await manager.resume({ confirmDownload: () => false }), null);
+      assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+    }
+    const ready = recovery === "resume" ? await manager.resume()
+      : (await new OfflineManager({ ...options, fetchImpl: fetch }).init()).active;
+    assert.equal(ready.downloadId, staged.downloadId);
+    assert.equal((await manager.readRecord("active")).downloadId, staged.downloadId);
+    assert.equal(await manager.readRecord("staging"), null);
+    assert.ok(await options.cacheStorage.match(offlineChunkUrl(options.baseUrl, staged.downloadId, 0), { cacheName: staged.cacheName }));
+    assert.equal(fetch.mock.callCount(), 0);
+  }
 });
 
 test("a published replacement stays successful when housekeeping fails and cleanup retries", async (t) => {

@@ -53,7 +53,7 @@ The example configuration references audio files that are not committed to this 
 The project includes the `create-audiobook` skill at `skills/create-audiobook/SKILL.md`. Use it when adding a new book from an M4A, M4B, or other audio source. A prompt such as `Use create-audiobook. Here is my audiobook: /path/book.m4b` guides the encoder through:
 
 - four Opus WebM, AAC/M4A, and MP3 variants at 64, 96, 128, and 256 kbps
-- embedded or WebVTT chapter selection
+- embedded, WebVTT, or generated time-based chapters
 - embedded or external cover-art selection
 - a compatible `book.json` and minimal `books` entry in `library.json`
 - output and configuration validation with `ffprobe` and Node.js
@@ -61,6 +61,22 @@ The project includes the `create-audiobook` skill at `skills/create-audiobook/SK
 You can also ask for configuration only or to reuse the original audio. In those cases the skill inspects the existing files and does not encode extra variants.
 
 The skill requires `ffmpeg` and `ffprobe`. It keeps the input file unchanged and does not commit or push generated files unless requested.
+
+### Generate chapters for a book without them
+
+`tools/make-chapters.py` writes a WebVTT chapter file for audio that has no chapter metadata. It splits the book into chapters of equal length, none longer than 20 minutes, then moves each boundary to the longest pause in the narration nearby. A chapter starts between sentences instead of in the middle of one.
+
+```bash
+python3 tools/make-chapters.py "media/my-book/My Book.mp3"
+```
+
+The file is written as `chapters.vtt` next to the audio. Use `-o` for another path, `--max-minutes` for a different limit, and `--title "Section {n}"` to replace the default `Part {n}` titles. An existing chapter file is kept unless you pass `--force`.
+
+The titles are numbered parts because the script cannot tell where the book's own chapters begin. If the audio already has embedded chapters, use those.
+
+The script needs Python 3, `ffmpeg`, and `ffprobe`. It decodes the whole file once to find the pauses, about a minute for a twelve-hour book, and never changes the audio. For a variable-bitrate MP3 without a length header it prints a warning: browsers estimate positions in such a file and may land a few seconds from a chapter start.
+
+Afterwards, edit the language in `book.json`: set `chapterSource` to `vtt`, point `chapters` at the new file, and raise `cacheVersion`. One chapter file covers the Opus, AAC, and MP3 encodings of the same recording.
 
 ## Project structure
 
@@ -80,6 +96,7 @@ js/
   preferences.js        Supported skip intervals and default
   config.js             Configuration validation and normalization
   book-config.js        Book loading, legacy filename fallback, and shared title requests
+  book-selection.js     Language and quality choices for the active book
   cover.js              Cover loading, image fallback, and object URL lifetime
   custom-select.js      Select popups, keyboard navigation, and focus restoration
   dialogs.js            Dialog, panel, and focus behavior
@@ -99,6 +116,7 @@ js/
 tests/                  Node built-in tests; no test packages required
 media/                  Library, book, cover, and chapter data
 skills/create-audiobook/ Prompt workflow for encoding a book and generating book.json
+tools/make-chapters.py  Time-based WebVTT chapters for audio without chapter metadata
 ```
 
 `startPlayer()` connects the controls to the player modules. `MediaController` owns the audio element’s source, playback, and seeking.
@@ -281,6 +299,8 @@ For each source transition, the player creates a finite queue:
 
 A confirmed decode or unsupported-source failure skips the rest of that codec family. A network/source failure may try another bitrate before moving to the next codec. Each URL is attempted once per transition. A book opened offline keeps its other configured sources available for fallback when the connection returns.
 
+Choosing a quality in Options saves it immediately. An automatic fallback becomes the saved quality once the browser starts playing it. If a new book fails to open, the current book keeps its playback position and sleep timer.
+
 `NotAllowedError` stops automatic attempts and asks the user to press Play again. Old Promise rejections, media events, probes, chapter loads, and book responses are ignored after a newer generation takes ownership.
 
 ## Lazy loading
@@ -308,6 +328,8 @@ The download also stores the player shell, book configuration, cover, and chapte
 The player stores audio in 8 MiB chunks. With a strong version validator, the player requests sequential byte ranges using If-Range. Without one, it requests a single range covering the file and splits that response as it arrives. Each audio response must match the MIME type established by the initial probe. After an interruption, **Resume download** reuses saved chunks when the server confirms the same file version with a strong ETag or a reliable Last-Modified date. If the version has changed or cannot be confirmed, the download starts again from the first chunk. Explicit cancellation marks the partial copy for removal before deleting it. If the tab closes during cleanup, the next visit discards the canceled copy. Playback traffic has priority while the player is loading or stalled.
 
 One tab at a time can change an installation’s offline book. Other tabs can open the saved book while a replacement downloads. The player uses Web Locks for coordination, with IndexedDB as a fallback. If the browser denies the write lock, the saved book remains available for playback and the player hides the download controls.
+
+If activation fails after the replacement has finished downloading, the previous book stays available. Choose **Resume download** or reopen the player to activate the complete copy from local storage.
 
 Before downloading audio chunks, the player opens the cached book configuration and checks the book ID, cache version, language, quality, and audio URL against the selection. A failed check keeps the previous offline book available. The player also checks the audio MIME type and the completed download manifest. If the server omits the content type or sends a generic binary type, the player uses the configured audio format.
 
@@ -435,6 +457,8 @@ for file in i18n.js js/*.js tests/*.mjs; do node --check "$file"; done
 node --test tests/*.test.mjs
 git diff --check
 ```
+
+Run `python3 tests/test_make_chapters.py` to check the chapter generator with short recordings. This test uses `ffmpeg` and `ffprobe`.
 
 The tests cover:
 

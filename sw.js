@@ -1,14 +1,14 @@
 importScripts("./js/offline-manifest.js");
 const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v14";
+const SHELL_VERSION = "v15";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=14",
-  "./player.js?v=14",
-  "./i18n.js?v=14",
+  "./player.css?v=15",
+  "./player.js?v=15",
+  "./i18n.js?v=15",
   "./js/player-app.js",
   "./js/availability-session.js",
   "./js/availability.js",
@@ -19,6 +19,7 @@ const SHELL_URLS = [
   "./js/preferences.js",
   "./js/cover.js",
   "./js/book-config.js",
+  "./js/book-selection.js",
   "./js/dialogs.js",
   "./js/custom-select.js",
   "./js/media-controller.js",
