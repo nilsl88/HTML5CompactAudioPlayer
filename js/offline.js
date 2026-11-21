@@ -87,6 +87,7 @@ export class OfflineManager {
     onChange = () => {},
     fetchImpl = globalThis.fetch?.bind(globalThis),
     cacheStorage,
+    getCacheStorage = () => cacheStorage === undefined ? globalThis.caches : cacheStorage,
     navigatorObject = globalThis.navigator,
   } = {}) {
     const installation = new URL("./", baseUrl || globalThis.location?.href || "http://localhost/");
@@ -94,7 +95,7 @@ export class OfflineManager {
     this.onChange = onChange;
     this.fetchImpl = fetchImpl;
     this.navigator = navigatorObject;
-    this.getCacheStorage = () => cacheStorage === undefined ? globalThis.caches : cacheStorage;
+    this.getCacheStorage = getCacheStorage;
     this.store = new OfflineBookStore(this.baseUrl, null);
     this.supported = false;
     try {
@@ -107,12 +108,16 @@ export class OfflineManager {
     this.repairable = null;
     this.staging = null;
     this.phase = "idle";
-    this.progress = 0;
     this.abortController = null;
     this.currentPromise = null;
   }
 
   get cacheStorage() { return this.store.cacheStorage; }
+
+  get progress() {
+    if (this.staging) return completedBytes(this.staging) / this.staging.totalSize;
+    return this.phase === "ready" ? 1 : 0;
+  }
 
   snapshot() {
     return {
@@ -127,9 +132,8 @@ export class OfflineManager {
 
   emit() { this.onChange(this.snapshot()); }
 
-  setPhase(phase, progress = this.progress) {
+  setPhase(phase) {
     this.phase = phase;
-    this.progress = Math.max(0, Math.min(1, Number(progress) || 0));
     this.emit();
   }
 
@@ -242,7 +246,7 @@ export class OfflineManager {
     this.staging = staging;
     const retained = new Set([active?.cacheName, staging?.cacheName, this.repairable?.cacheName]);
     try {
-      if (active && !staging) await this.writeRecord("staging", null);
+      if (!staging) await this.writeRecord("staging", null);
       for (const name of bookNames) {
         if (!retained.has(name)) await this.cacheStorage.delete(name);
       }
@@ -250,7 +254,6 @@ export class OfflineManager {
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not finish offline cleanup. The next visit will retry.", error);
     }
-    this.progress = this.staging ? completedBytes(this.staging) / this.staging.totalSize : 0;
     this.phase = this.staging ? "paused" : "idle";
     this.emit();
     return this.snapshot();
@@ -372,9 +375,9 @@ export class OfflineManager {
     this.currentPromise = Promise.resolve().then(() => action(signal)).finally(() => {
       this.abortController = null;
       this.currentPromise = null;
-      if (this.phase === "preparing" || this.phase === "finalizing") this.setPhase(this.staging ? "paused" : "idle", this.progress);
+      if (["preparing", "finalizing", "publishing-repair"].includes(this.phase)) this.setPhase(this.staging ? "paused" : "idle");
     });
-    this.setPhase("preparing", this.progress);
+    this.setPhase("preparing");
     return this.currentPromise;
   }
 
@@ -434,7 +437,7 @@ export class OfflineManager {
         throw new OfflineDownloadError("incomplete", "The saved audio is incomplete.");
       }
       checkCanceled(signal);
-      this.setPhase("finalizing", 1);
+      this.setPhase("publishing-repair");
       await this.publish(ready);
       return ready;
     }));
@@ -452,11 +455,11 @@ export class OfflineManager {
     } catch (error) {
       console.warn("[CompactAudioPlayer] The download is ready. Cleanup will retry on the next visit.", error);
     }
-    this.setPhase("ready", 1);
+    this.setPhase(this.staging ? "paused" : "ready");
   }
 
   async runDownload(selection, preflight, signal, waitForPriority) {
-    this.setPhase("preparing", 0);
+    this.setPhase("preparing");
     try {
       let cache;
       let manifest;
@@ -474,13 +477,13 @@ export class OfflineManager {
       await this.cacheAssets(cache, selection.assets, signal);
       await this.store.verifyCachedConfig(manifest, config?.url);
       const completed = new Set(manifest.completed);
-      this.setPhase("downloading", completedBytes(manifest) / manifest.totalSize);
+      this.setPhase("downloading");
       for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
         await cache.put(offlineChunkUrl(this.baseUrl, manifest.downloadId, index), chunk);
         completed.add(index);
         manifest = { ...manifest, completed: [...completed].sort((a, b) => a - b) };
         await this.putManifest(cache, manifest);
-        this.setPhase("downloading", completedBytes(manifest) / manifest.totalSize);
+        this.setPhase("downloading");
       }
       const stored = await this.store.readBookManifest(manifest.cacheName);
       checkCanceled(signal);
@@ -495,17 +498,17 @@ export class OfflineManager {
       }
       await this.store.verifyCachedConfig(manifest, config?.url);
       checkCanceled(signal);
-      this.setPhase("finalizing", 1);
+      this.setPhase("finalizing");
       await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(manifest));
       await this.publish(manifest);
       return manifest;
     } catch (error) {
       if (signal.aborted && this.phase !== "finalizing") {
         await this.removeStagingLocked();
-        this.setPhase("idle", 0);
+        this.setPhase("idle");
         throw new DOMException("Download canceled", "AbortError");
       }
-      this.setPhase(this.staging ? "paused" : "idle", this.staging ? completedBytes(this.staging) / this.staging.totalSize : 0);
+      this.setPhase(this.staging ? "paused" : "idle");
       if (isQuotaError(error)) throw new OfflineDownloadError("quota", "The browser does not have enough storage for this download.");
       throw error;
     }
@@ -513,7 +516,7 @@ export class OfflineManager {
 
   async cancel() {
     if (this.currentPromise) {
-      if (this.phase !== "finalizing") this.abortController.abort();
+      if (!["finalizing", "publishing-repair"].includes(this.phase)) this.abortController.abort();
       try { await this.currentPromise; }
       catch (error) { if (error?.name !== "AbortError") throw error; }
       return;
@@ -521,15 +524,16 @@ export class OfflineManager {
     if (!this.staging) return;
     await this.updateIfCurrent(this.recordIds(), async () => {
       await this.removeStagingLocked();
-      this.setPhase("idle", 0);
+      this.setPhase("idle");
     });
   }
 
   async removeStagingLocked() {
     const staging = this.staging;
+    await this.store.markStagingRemoved(staging);
     await this.writeRecord("staging", null);
-    await this.store.deleteOwnedBookCache(staging?.cacheName);
     this.staging = null;
+    await this.store.deleteOwnedBookCache(staging?.cacheName);
   }
 
   async removeActive() {
@@ -540,7 +544,7 @@ export class OfflineManager {
       await this.store.deleteOwnedBookCache(saved.cacheName);
       this.active = null;
       this.repairable = null;
-      this.setPhase(this.staging ? "paused" : "idle", this.staging ? completedBytes(this.staging) / this.staging.totalSize : 0);
+      this.setPhase(this.staging ? "paused" : "idle");
     });
   }
 
@@ -557,7 +561,7 @@ export class OfflineManager {
       this.active = null;
       this.repairable = null;
       this.staging = null;
-      this.setPhase("idle", 0);
+      this.setPhase("idle");
     }, offlineConflict);
   }
 }

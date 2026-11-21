@@ -1,7 +1,7 @@
 import { resolveCover } from "./config.js";
 import { loadEmbeddedMp4Cover } from "./mp4-chapters.js";
 
-export function createCoverView(image, button, { getEmbeddedSource, onShown, onFailure }) {
+export function createCoverView(image, button, { fetchImpl, getEmbeddedSource, onShown, onFailure }) {
   let coverGeneration = 0;
   let coverController = null;
   let coverObjectUrl = "";
@@ -46,7 +46,7 @@ export function createCoverView(image, button, { getEmbeddedSource, onShown, onF
     const controller = new AbortController();
     coverController = controller;
     try {
-      const cover = await loadEmbeddedMp4Cover(source.url, { signal: controller.signal });
+      const cover = await loadEmbeddedMp4Cover(source.url, { fetchImpl, signal: controller.signal });
       if (controller.signal.aborted || generation !== coverGeneration) return;
       if (!cover) throw new Error("The M4A/M4B file does not contain supported cover artwork.");
       coverObjectUrl = URL.createObjectURL(new Blob([cover.data], { type: cover.mime }));

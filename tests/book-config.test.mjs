@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { openPlayerPage } from "./player-page.mjs";
+import { deferred, openPlayerPage } from "./player-page.mjs";
 import { BookConfigStore, queryBookId } from "../js/book-config.js";
 import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js";
 
@@ -10,12 +10,6 @@ const configuration = (id = "one") => ({
   languages: { en: { chapters: "chapters.vtt", sources: { aac: { 64: "audio.m4b" } } } },
 });
 const json = (value) => new Response(JSON.stringify(value));
-const deferred = () => {
-  let resolve;
-  let reject;
-  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
-};
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 function store(fetchImpl, entries = [{ id: "one" }]) {
@@ -288,7 +282,7 @@ test("title requests stay lazy, use two workers, reuse cached books, and retry f
 test("a stale cancelled book load cannot overwrite a newer selection", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const old = deferred();
-  const { elements } = await openPlayerPage(t, configuration("old"), assert.fail, new Map(), {
+  const { elements, ready } = await openPlayerPage(configuration("old"), assert.fail, new Map(), {
     fetch: async (url) => {
       if (url.endsWith("/library.json")) return json({ books: [{ id: "old" }, { id: "new" }], ui: { onboardingEnabled: false } });
       if (url.endsWith("/old/book.json")) return old.promise;
@@ -302,6 +296,7 @@ test("a stale cancelled book load cannot overwrite a newer selection", async (t)
   await flush();
   assert.equal(elements.get("bookTitle").textContent, "Book new");
   old.resolve(json(configuration("old")));
+  await ready;
   await flush();
   assert.equal(elements.get("bookTitle").textContent, "Book new");
 });

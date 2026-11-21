@@ -60,8 +60,20 @@ export class SleepTimer {
     this.onNotice("sleepEndChapterSet", "success");
   }
 
+  async refreshChapter(request, getEnd) {
+    if (this.mode !== "chapter") return;
+    this.clear();
+    this.mode = "chapter";
+    const generation = this.generation;
+    await request;
+    if (this.generation !== generation) return;
+    const end = getEnd();
+    if (Number.isFinite(end) && end > this.media.position()) this.chapterEnd = end;
+    else this.cancel();
+  }
+
   onTime(position) {
-    if (this.mode === "chapter" && position >= this.chapterEnd - .05) void this.complete("sleepEndChapterReached");
+    if (this.chapterEnd !== null && position >= this.chapterEnd - .05) void this.complete("sleepEndChapterReached");
   }
 
   onEnded() {

@@ -94,7 +94,7 @@ test("offline startup opens the recorded configuration without a catalog folder 
   const saved = await writer.start(selected, await writer.inspectSource(selected));
   const cache = await cacheStorage.open(saved.cacheName);
   const requests = [];
-  const page = await openPlayerPage(t, config, assert.fail, new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]), {
+  const page = await openPlayerPage(config, assert.fail, new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]), {
     caches: cacheStorage, navigator: { ...navigatorStub(), onLine: false },
     fetch: async (url) => { requests.push(url); return await cache.match(url) || new Response(null, { status: 404 }); },
   });
@@ -315,14 +315,14 @@ test("a denied write lock leaves the published offline book readable", async (t)
     fetch: async () => { throw new TypeError("Offline"); }, URL, Request, Response, ReadableStream,
   });
   const fetch = (url, options) => context.networkFirst(new Request(url, options));
-  const page = await openPlayerPage(t, config, assert.fail, new Map(), {
+  const page = await openPlayerPage(config, assert.fail, new Map(), {
     navigator, fetch, caches: cacheStorage, location: new URL("?book=other", baseUrl),
   });
   assert.equal(page.elements.get("bookTitle").textContent, config.title.en);
   assert.equal(page.elements.get("offlineRow").hidden, true);
   page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   assert.equal(page.audio.src, selected.sourceUrl);
-  const audio = await fetch(page.audio.src, { headers: { Range: "bytes=1-3" } });
+  const audio = await page.window.fetch(page.audio.src, { headers: { Range: "bytes=1-3" } });
   assert.equal(audio.status, 206);
   assert.equal((await audio.arrayBuffer()).byteLength, 3);
   assert.ok((await cacheStorage.keys()).includes(saved.cacheName));
@@ -639,7 +639,7 @@ for (const filename of ["book.json", "episode.json"]) test(`downloads and reload
   const configUrl = baseUrl + "media/book/" + filename;
   const cacheStorage = new MemoryCacheStorage();
   const navigator = navigatorStub();
-  const page = await openPlayerPage(t, raw, assert.fail, new Map(), { fetch: fetchImpl, caches: cacheStorage, navigator, confirm: () => true });
+  const page = await openPlayerPage(raw, assert.fail, new Map(), { fetch: fetchImpl, caches: cacheStorage, navigator, confirm: () => true });
   page.elements.get("offlineDownloadBtn").dispatchEvent(new Event("click"));
   await settle();
   const published = await workerContext({ caches: cacheStorage });
@@ -828,6 +828,25 @@ async function savedBookFixture() {
   return { manager, saved, selected, options, config, configUrl };
 }
 
+test("reopening after interrupted cancellation discards the partial book and keeps the ready one", async (t) => {
+  for (const failure of ["staging record", "book cache"]) {
+    const { manager, options, saved } = await savedBookFixture();
+    manager.fetchImpl = rangedFetch(9 * 1024 ** 2, { failSecondChunk: true });
+    await assert.rejects(manager.start({ ...selection(), episodeId: "other" }), /connection lost/);
+    const { cacheName } = manager.staging;
+    const target = failure === "staging record" ? await manager.metaCache() : options.cacheStorage;
+    const remove = t.mock.method(target, "delete", () => { throw new Error("Deletion interrupted"); });
+    await assert.rejects(manager.cancel(), /Deletion interrupted/);
+    remove.mock.restore();
+    const reopened = new OfflineManager(options);
+    assert.equal(await reopened.readRecord("staging"), null);
+    await reopened.init();
+    assert.equal(reopened.snapshot().staging, null);
+    assert.equal(reopened.snapshot().active.downloadId, saved.downloadId);
+    assert.ok(!(await options.cacheStorage.keys()).includes(cacheName));
+  }
+});
+
 test("a stale tab cannot delete a replacement that also needs its configuration repaired", async (t) => {
   t.mock.method(console, "warn", () => {});
   const { manager, options, selected, saved, configUrl } = await savedBookFixture();
@@ -895,7 +914,7 @@ test("an offline startup retains online alternative sources after reconnecting",
   t.mock.method(console, "error", () => {});
   const { options, config, selected } = await savedBookFixture();
   const navigator = { ...options.navigatorObject, onLine: false };
-  const page = await openPlayerPage(t, config, assert.fail, new Map(), { caches: options.cacheStorage, navigator });
+  const page = await openPlayerPage(config, assert.fail, new Map(), { caches: options.cacheStorage, navigator });
   const tries = [];
   page.audio.play = async () => {
     tries.push(page.audio.src);
@@ -914,7 +933,7 @@ test("downloading a repairable selection only asks to replace a different select
   const { options, saved, configUrl, config } = await savedBookFixture();
   await (await options.cacheStorage.open(saved.cacheName)).delete(configUrl);
   const prompts = [];
-  const { elements } = await openPlayerPage(t, { ...config, debug: { showAllQualities: true } }, rangedFetch(10), new Map(), {
+  const { elements } = await openPlayerPage({ ...config, debug: { showAllQualities: true } }, rangedFetch(10), new Map(), {
     navigator: options.navigatorObject, caches: options.cacheStorage,
     confirm(message) { prompts.push(message); return false; },
   });
@@ -951,7 +970,7 @@ test("a missing required configuration can be restored without fetching or disca
   assert.equal(reloaded.repairable?.downloadId, saved.downloadId);
   assert.ok(await cache.match(chunk));
   const requests = [];
-  const page = await openPlayerPage(t, config, assert.fail, new Map(), {
+  const page = await openPlayerPage(config, assert.fail, new Map(), {
     navigator: options.navigatorObject, caches: options.cacheStorage,
     fetch: async (url, init) => {
       if (url === configUrl) {
@@ -973,6 +992,25 @@ test("a missing required configuration can be restored without fetching or disca
   assert.deepEqual(await (await cache.match(configUrl)).json(), config);
 });
 
+test("repairing the saved book preserves the other download's paused percentage", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { manager, options, saved, configUrl, config } = await savedBookFixture();
+  manager.fetchImpl = rangedFetch(16 * 1024 ** 2, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(), episodeId: "other", episodeTitle: "Other book" }), /connection lost/);
+  await (await options.cacheStorage.open(saved.cacheName)).delete(configUrl);
+  const { elements } = await openPlayerPage(config, assert.fail, new Map(), {
+    navigator: options.navigatorObject, caches: options.cacheStorage,
+  });
+  const progress = elements.get("offlineProgress");
+  assert.equal(progress.value, 50);
+  elements.get("offlineRepairBtn").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+  assert.equal(progress.value, 50);
+  assert.match(elements.get("offlineStatus").textContent, /Downloaded: Book.*Other book.*paused at 50%/);
+  assert.equal(elements.get("offlineDownloadBtn").textContent, "Resume download");
+});
+
 test("partial reset reports the failed store and retries only that store", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   t.mock.method(console, "error", () => {});
@@ -980,7 +1018,7 @@ test("partial reset reports the failed store and retries only that store", async
   const { navigatorObject, cacheStorage } = options;
   const local = new Map();
   const location = Object.assign(new URL(options.baseUrl), { reload: t.mock.fn() });
-  const { elements } = await openPlayerPage(t, config, assert.fail, local, { navigator: navigatorObject, caches: cacheStorage, location });
+  const { elements } = await openPlayerPage(config, assert.fail, local, { navigator: navigatorObject, caches: cacheStorage, location });
   const locks = navigatorObject.locks;
   navigatorObject.locks = { request: async () => { throw new DOMException("Write denied", "SecurityError"); } };
   elements.get("resetOk").dispatchEvent(new Event("click"));
@@ -1005,7 +1043,7 @@ test("download preparation can be canceled or time out before any chunks are wri
   t.mock.method(console, "error", () => {});
   const { options, saved, config } = await savedBookFixture();
   const signals = [];
-  const { elements } = await openPlayerPage(t, config, (_url, init) => {
+  const { elements } = await openPlayerPage(config, (_url, init) => {
     if (!init.headers?.["x-compact-player-download"]) return new Response(null);
     signals.push(init.signal);
     return new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
@@ -1066,9 +1104,9 @@ test("retrying a local reset leaves the successfully cleared download store alon
   const { options, config, saved } = await savedBookFixture();
   const local = new Map();
   const location = Object.assign(new URL(options.baseUrl), { reload: t.mock.fn() });
-  const { elements } = await openPlayerPage(t, config, assert.fail, local,
+  const { elements, window } = await openPlayerPage(config, assert.fail, local,
     { navigator: options.navigatorObject, caches: options.cacheStorage, location });
-  const blocked = t.mock.method(globalThis.localStorage, "removeItem", () => { throw new DOMException("Denied", "SecurityError"); });
+  const blocked = t.mock.method(window.localStorage, "removeItem", () => { throw new DOMException("Denied", "SecurityError"); });
   elements.get("resetOk").dispatchEvent(new Event("click"));
   await settle();
   assert.equal(location.reload.mock.callCount(), 0);
@@ -1091,7 +1129,7 @@ test("canceling a resume during the range check discards only the partial downlo
   await assert.rejects(manager.start(next, await manager.inspectSource(next)), /connection lost/);
   const partial = manager.staging.cacheName;
   let rangeSignal;
-  const { elements } = await openPlayerPage(t, config, (_url, { signal }) => {
+  const { elements } = await openPlayerPage(config, (_url, { signal }) => {
     rangeSignal = signal;
     return new Promise((_, reject) => signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }));
   }, new Map(), { navigator: options.navigatorObject, caches: options.cacheStorage });
@@ -1157,7 +1195,7 @@ test("reset offers an immediate retry while another tab holds the offline lock",
   const { manager, options, saved, config } = await savedBookFixture();
   const location = Object.assign(new URL(options.baseUrl), { reload: t.mock.fn() });
   const local = new Map();
-  const { elements } = await openPlayerPage(t, config, assert.fail, local,
+  const { elements } = await openPlayerPage(config, assert.fail, local,
     { navigator: options.navigatorObject, caches: options.cacheStorage, location });
   let release;
   const held = manager.withLock(() => new Promise((resolve) => { release = resolve; }));

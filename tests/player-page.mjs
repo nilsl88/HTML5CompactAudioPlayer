@@ -1,6 +1,13 @@
 import { setImmediate as settle } from "node:timers/promises";
+import { startPlayer } from "../js/player-app.js";
+import { PlayerStorage } from "../js/storage.js";
 
-let pageNumber = 0;
+export function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
 
 export class Element extends EventTarget {
   children = [];
@@ -21,13 +28,13 @@ export class Element extends EventTarget {
   focus() {}
 }
 
-export async function openPlayerPage(t, book, fetchAsset, saved = new Map(), browserGlobals = {}) {
+export async function openPlayerPage(book, fetchAsset, saved = new Map(), browserGlobals = {}) {
   const elements = new Map();
   const document = Object.assign(new Element(), {
     body: new Element(), documentElement: new Element(),
-    createElement: () => new Element(),
+    createElement: () => Object.assign(new Element(), { ownerDocument: document }),
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, new Element());
+      if (!elements.has(id)) elements.set(id, this.createElement());
       return elements.get(id);
     },
   });
@@ -43,29 +50,26 @@ export async function openPlayerPage(t, book, fetchAsset, saved = new Map(), bro
     setItem: (key, value) => saved.set(key, String(value)),
     removeItem: (key) => saved.delete(key),
   };
-  const globals = {
-    document, window, navigator, location: new URL("https://example.test/"),
-    requestAnimationFrame: (callback) => callback(),
-    get localStorage() {
+  document.defaultView = window;
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    get() {
       if (saved === null) throw new DOMException("Local storage is blocked.", "SecurityError");
       return storage;
     },
+  });
+  Object.assign(window, {
+    document, navigator, location: new URL("https://example.test/"),
+    requestAnimationFrame: (callback) => callback(),
     fetch: async (url, options) => {
       if (url.endsWith("/library.json")) return Response.json({ books: [{ id: book.id }], ui: { onboardingEnabled: false } });
       if (url.endsWith("/book.json")) return Response.json(book);
       return fetchAsset(url, options);
     },
-  };
-  Object.defineProperties(globals, Object.getOwnPropertyDescriptors(browserGlobals));
-  for (const name of Object.keys(globals)) {
-    const original = Object.getOwnPropertyDescriptor(globalThis, name);
-    Object.defineProperty(globalThis, name, Object.getOwnPropertyDescriptor(globals, name));
-    t.after(() => {
-      if (original) Object.defineProperty(globalThis, name, original);
-      else delete globalThis[name];
-    });
-  }
-  await import(`../player.js?page=${++pageNumber}`);
+  });
+  Object.defineProperties(window, Object.getOwnPropertyDescriptors(browserGlobals));
+  const playerStorage = PlayerStorage.fromBrowser(window);
+  const ready = startPlayer({ window, storage: playerStorage, fetchImpl: window.fetch });
   await settle();
-  return { audio, document, elements, navigator: globals.navigator, window: globals.window };
+  return { audio, document, elements, navigator: window.navigator, window, storage: playerStorage, ready };
 }

@@ -67,6 +67,12 @@ export class OfflineBookStore {
     if (await this.ownsBookCache(name)) await this.cacheStorage.delete(name);
   }
 
+  async markStagingRemoved(manifest) {
+    if (!manifest || !await this.ownsBookCache(manifest.cacheName)) return;
+    const cache = await this.cacheStorage.open(manifest.cacheName);
+    await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse({ status: "removed", downloadId: manifest.downloadId }));
+  }
+
   async readRecord(type, includeUnpublished = false) {
     const response = await this.cacheStorage.match(offlineMetaUrl(this.baseUrl, type), { cacheName: OFFLINE_META_CACHE });
     const record = await responseJson(response);
@@ -77,7 +83,13 @@ export class OfflineBookStore {
         && validManifest({ ...saved, status: "ready" }, "ready")) return saved;
     }
     const status = type === "active" ? "ready" : "downloading";
-    return validManifest(record?.manifest, status) && record.cacheName === record.manifest.cacheName ? record.manifest : null;
+    if (!validManifest(record?.manifest, status) || record.cacheName !== record.manifest.cacheName) return null;
+    if (type === "staging") {
+      // Cancellation can reach the book cache before the staging record is cleared.
+      const local = await responseJson(await this.cacheStorage.match(offlineManifestUrl(this.baseUrl), { cacheName: record.cacheName }));
+      if (!local || local.status === "removed") return null;
+    }
+    return record.manifest;
   }
 
   async writeRecord(type, manifest) {
