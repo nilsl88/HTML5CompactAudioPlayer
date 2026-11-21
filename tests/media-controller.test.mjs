@@ -81,6 +81,30 @@ test("buffering after playback starts is a stall", async () => {
   media.destroy();
 });
 
+test("time updates at a stalled position preserve the fallback deadline until playback advances", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const audio = new FakeAudio();
+  const media = new MediaController(audio, {}, { sourceTimeoutMs: 100 });
+  t.after(() => media.destroy());
+  await media.setSelection(sources, "opus-128", 0, true);
+  audio.emit("playing");
+  audio.currentTime = 12;
+  audio.emit("waiting");
+  audio.emit("timeupdate");
+  assert.equal(media.state, "stalled");
+  audio.currentTime = 13;
+  audio.emit("timeupdate");
+  assert.equal(media.state, "playing");
+  t.mock.timers.tick(100);
+  assert.equal(media.currentSource().id, "opus-128");
+  audio.emit("waiting");
+  t.mock.timers.tick(75);
+  audio.emit("stalled");
+  audio.emit("timeupdate");
+  t.mock.timers.tick(25);
+  assert.equal(media.currentSource().id, "opus-96");
+});
+
 test("NotAllowedError stops without walking the fallback queue", async () => {
   const audio = new FakeAudio();
   const blocked = [];

@@ -28,10 +28,20 @@ export function createMediaSession(navigator, Metadata, reportError) {
 
     bind(handlers) {
       if (!session) return;
+      const bound = [];
       for (const [action, handler] of Object.entries(handlers)) {
-        try { session.setActionHandler(action, handler); }
+        try {
+          session.setActionHandler(action, handler);
+          bound.push(action);
+        }
         catch (error) { reportError(`Media Session ${action}`, error); }
       }
+      return () => {
+        for (const action of bound) {
+          try { session.setActionHandler(action, null); }
+          catch (error) { reportError(`Media Session ${action}`, error); }
+        }
+      };
     },
   };
 }

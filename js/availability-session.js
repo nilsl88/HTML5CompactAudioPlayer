@@ -1,4 +1,5 @@
 import { scanSources } from "./availability.js";
+import { buildSources } from "./source-selection.js";
 
 export class AvailabilitySession {
   constructor({ window, fetchImpl, isOnline, readCache, writeCache, onChange, onError }) {
@@ -14,21 +15,29 @@ export class AvailabilitySession {
     this.selectLanguage("");
   }
 
-  setBook(book, sources) {
-    this.selectLanguage("");
-    this.book = book;
-    this.sources = sources;
-    this.scanned.clear();
+  prepareBook(book, audio) {
     const cached = this.readCache(book.id, book.cacheVersion);
-    this.played = new Set(cached.playedUrls);
-    for (const [code, variants] of sources) {
+    const played = new Set(cached.playedUrls);
+    const sources = new Map();
+    for (const language of Object.values(book.languages)) {
+      const variants = buildSources(language, audio);
       for (const source of variants) {
-        const value = cached.byLanguage[code]?.[source.id];
-        if (this.played.has(source.url) || value === true) source.availability = "available";
+        const value = cached.byLanguage[language.code]?.[source.id];
+        if (played.has(source.url) || value === true) source.availability = "available";
         else if (value === false) source.availability = "missing";
         else if (["available", "missing", "unknown"].includes(value)) source.availability = value;
       }
+      sources.set(language.code, variants);
     }
+    return { book, sources, played };
+  }
+
+  setBook({ book, sources, played }) {
+    this.selectLanguage("");
+    this.scanned.clear();
+    this.book = book;
+    this.sources = sources;
+    this.played = played;
   }
 
   save() {

@@ -22,21 +22,23 @@ export class MediaController {
     this.state = "idle";
     this.timeout = null;
     this.internalPause = false;
+    this.events = new AbortController();
     this.bindEvents();
   }
 
   bindEvents() {
-    this.audio.addEventListener("loadstart", () => {
+    const listen = (type, listener) => this.audio.addEventListener(type, listener, { signal: this.events.signal });
+    listen("loadstart", () => {
       if (this.audio.src && (this.playbackIntent || this.state !== "paused")) this.setState("loading");
     });
-    this.audio.addEventListener("loadedmetadata", () => {
+    listen("loadedmetadata", () => {
       this.loaded = true;
       this.applyMediaSettings();
       this.applyDesiredTime();
       if (!this.playbackIntent) { this.clearTimeout(); this.setState("paused"); }
       else this.armTimeout(this.generation, this.currentSource()?.url);
     });
-    this.audio.addEventListener("playing", () => {
+    listen("playing", () => {
       if (!this.audio.src || this.audio.paused) return;
       this.playbackIntent = true;
       this.loaded = true;
@@ -45,35 +47,40 @@ export class MediaController {
       this.setState("playing");
       this.callbacks.onSourceSuccess?.(this.currentSource());
     });
-    this.audio.addEventListener("pause", () => {
+    listen("pause", () => {
       // A pause queued by the previous source can arrive after the new source starts.
       if (!this.internalPause && this.playbackIntent && this.audio.paused && !this.audio.ended) this.markPaused();
     });
     const handleBuffering = () => {
       if (!this.playbackIntent) return;
       const interrupted = this.hasStarted;
+      if (interrupted && this.state === "stalled" && this.timeout !== null) return;
       this.setState(interrupted ? "stalled" : "loading");
       this.armTimeout(this.generation, this.currentSource()?.url, interrupted);
     };
-    this.audio.addEventListener("waiting", handleBuffering);
-    this.audio.addEventListener("stalled", handleBuffering);
-    this.audio.addEventListener("ended", () => { this.playbackIntent = false; this.setState("ended"); this.callbacks.onEnded?.(); });
-    this.audio.addEventListener("timeupdate", () => {
+    listen("waiting", handleBuffering);
+    listen("stalled", handleBuffering);
+    listen("ended", () => { this.playbackIntent = false; this.setState("ended"); this.callbacks.onEnded?.(); });
+    listen("timeupdate", () => {
       // Reloading a source can emit timeupdate at zero before metadata arrives.
       if (!this.loaded || this.audio.seeking) return;
-      if (this.state === "stalled" && !this.audio.paused) { this.clearTimeout(); this.setState("playing"); }
       if (Number.isFinite(this.audio.currentTime)) {
+        if (this.state === "stalled" && this.hasStarted && !this.audio.paused && this.audio.currentTime > this.stallPosition) {
+          this.clearTimeout();
+          this.setState("playing");
+        }
         const moved = this.desiredTime !== this.audio.currentTime;
         this.desiredTime = this.audio.currentTime;
         if (moved && this.hasStarted) this.callbacks.onProgress?.(this.desiredTime);
         this.callbacks.onTime?.(this.audio.currentTime, this.duration());
       }
     });
-    this.audio.addEventListener("durationchange", () => this.callbacks.onTime?.(this.position(), this.duration()));
-    this.audio.addEventListener("error", () => this.handleMediaError());
+    listen("durationchange", () => this.callbacks.onTime?.(this.position(), this.duration()));
+    listen("error", () => this.handleMediaError());
   }
 
   setSelection(sources, selectedId, position = 0, shouldPlay = false) {
+    if (this.events.signal.aborted) return Promise.resolve(false);
     this.generation += 1;
     this.queue = buildFallbackQueue(sources, selectedId);
     this.queueIndex = this.queue.length ? 0 : -1;
@@ -95,6 +102,7 @@ export class MediaController {
   }
 
   requestPlay() {
+    if (this.events.signal.aborted) return Promise.resolve(false);
     this.playbackIntent = true;
     if (this.state === "error" && this.queue.length) {
       this.generation += 1;
@@ -119,6 +127,7 @@ export class MediaController {
   }
 
   requestPause() {
+    if (this.events.signal.aborted) return;
     this.markPaused();
     this.audio.pause();
   }
@@ -212,8 +221,10 @@ export class MediaController {
   }
 
   seek(seconds) {
+    if (this.events.signal.aborted) return this.position();
     const duration = this.duration();
     this.desiredTime = duration ? clamp(Number(seconds) || 0, 0, Math.max(0, duration - .01)) : Math.max(0, Number(seconds) || 0);
+    if (this.state === "stalled") this.stallPosition = this.desiredTime;
     if (this.loaded) this.applyDesiredTime();
     this.callbacks.onProgress?.(this.desiredTime, true);
     this.callbacks.onTime?.(this.desiredTime, duration);
@@ -236,10 +247,16 @@ export class MediaController {
   }
   position() { return this.loaded && !this.audio.seeking && Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : this.desiredTime; }
   duration() { return Number.isFinite(this.audio.duration) && this.audio.duration > 0 ? this.audio.duration : 0; }
-  setState(state) { if (state !== this.state) { this.state = state; this.callbacks.onState?.(state); } }
+  setState(state) {
+    if (state === this.state) return;
+    if (state === "stalled") this.stallPosition = this.position();
+    this.state = state;
+    this.callbacks.onState?.(state);
+  }
   armTimeout(generation, url, includeStall = false) {
     this.clearTimeout();
     this.timeout = setTimeout(() => {
+      this.timeout = null;
       const didNotStart = this.playbackIntent && !this.hasStarted;
       const remainsStalled = includeStall && this.playbackIntent && this.state === "stalled";
       if (generation !== this.generation || this.currentSource()?.url !== url) return;
@@ -248,5 +265,14 @@ export class MediaController {
     }, this.sourceTimeoutMs);
   }
   clearTimeout() { if (this.timeout) clearTimeout(this.timeout); this.timeout = null; }
-  destroy() { this.generation += 1; this.clearTimeout(); this.playbackIntent = false; try { this.audio.pause(); } catch {} }
+  destroy() {
+    if (this.events.signal.aborted) return;
+    this.events.abort();
+    this.generation += 1;
+    this.clearTimeout();
+    this.playbackIntent = false;
+    this.queue = [];
+    this.queueIndex = -1;
+    this.clearSource();
+  }
 }

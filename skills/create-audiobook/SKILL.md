@@ -22,7 +22,7 @@ Confirm or infer these values from the user’s prompt and file metadata:
 - display title and audio language code/label
 - each input file when more than one language is supplied
 - output directory (normally `media/<book-id>/<language>/`)
-- whether chapters should use embedded metadata, a supplied WebVTT file, or none
+- whether chapters should use embedded metadata, a supplied WebVTT file, generated time-based parts, or none
 - whether the cover should use embedded artwork, an external image, or none
 
 Ask only for values that cannot be safely inferred. Never overwrite an existing book directory or source file without explicit confirmation.
@@ -56,6 +56,22 @@ ffmpeg -i "$INPUT" -map 0:a:0 -map_metadata 0 -map_chapters 0 \
 ```
 
 If the input has no attached picture, omit `-map 0:v?`, `-c:v`, and `-disposition:v`. Do not invent chapter text. If the source has chapters but the target browser needs a WebVTT fallback, export or use the user-supplied `.vtt` and set `chapterSource` to `vtt`.
+
+## Generate time-based chapters
+
+Use `tools/make-chapters.py` only when the user asks for chapters and the source has neither embedded chapters nor a supplied WebVTT file. Check with `ffprobe -show_chapters` first. Chapters that already exist are better than generated ones.
+
+```bash
+python3 tools/make-chapters.py "media/<book-id>/<language>/audio-128k.m4a" --max-minutes 20
+```
+
+The script needs Python 3 in addition to `ffmpeg` and `ffprobe`. It splits the audio into equal chapters no longer than `--max-minutes` (default 20) and moves each boundary to the longest pause nearby. The result is `chapters.vtt` next to the audio file, or the path given with `-o`. An existing file is kept unless `--force` is passed, so ask before using that flag.
+
+Keep the default `Part {n}` titles unless the user supplies a pattern for `--title`. The parts are time slices: do not present them as the chapters of the book. Run the script once per language. One chapter file serves every encoding of that recording.
+
+If the script warns that the header length and the decoded length differ, the source is a variable-bitrate MP3 without a length header. Tell the user that browsers may land a few seconds from a chapter start in that file.
+
+Then set `chapterSource` to `vtt` and `chapters` to the file in `book.json`. The path is relative to `basePath` when the language has one, otherwise to the book folder. Raise `cacheVersion` when the book is already published.
 
 ## Write book.json
 
@@ -106,4 +122,4 @@ ffprobe -v error -show_streams -show_chapters "media/<book-id>/<language>/audio-
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log("valid JSON")' media/<book-id>/book.json
 ```
 
-Verify that each configured URL exists, AAC outputs are served as `audio/mp4`, and the book remains compatible with the player’s embedded chapter/cover parser. Run the project test commands from `AGENTS.md` when code or shared configuration changes. Do not commit or push unless the user explicitly asks.
+Verify that each configured URL exists, AAC outputs are served as `audio/mp4`, and the book remains compatible with the player’s embedded chapter/cover parser. For generated chapters, confirm that the first cue starts at zero and the last cue ends at the duration `ffprobe` reports. Run the project test commands from `AGENTS.md` when code or shared configuration changes. Do not commit or push unless the user explicitly asks.

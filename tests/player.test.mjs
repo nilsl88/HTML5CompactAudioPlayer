@@ -140,6 +140,34 @@ test("reset discards its pending position before pause, pagehide or a delayed sa
   assert.equal(page.storage.getProgress(book.id, "en"), 0);
 });
 
+test("late media errors and system Play are inert while reset waits for offline storage", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const offlineReset = deferred();
+  t.mock.method(OfflineManager.prototype, "reset", () => offlineReset.promise);
+  const handlers = new Map();
+  const navigator = { language: "en", onLine: true, mediaSession: { setActionHandler: (action, handler) => handlers.set(action, handler) } };
+  const location = Object.assign(new URL("https://example.test/"), { reload: t.mock.fn() });
+  const config = { ...book, languages: { en: { sources: { aac: { 96: "high.m4b", 64: "low.m4b" } } } } };
+  const { audio, elements } = await openPlayerPage(config, assert.fail, new Map(), { navigator, location });
+  const systemPlay = handlers.get("play");
+  systemPlay();
+  audio.dispatchEvent(new Event("playing"));
+  elements.get("resetOk").dispatchEvent(new Event("click"));
+  const load = t.mock.method(audio, "load");
+  const play = t.mock.method(audio, "play");
+  audio.error = { code: 2 };
+  audio.dispatchEvent(new Event("error"));
+  systemPlay();
+  t.mock.timers.tick(20_000);
+  assert.equal(load.mock.callCount(), 0);
+  assert.equal(play.mock.callCount(), 0);
+  assert.equal(handlers.get("play"), null);
+  assert.equal(location.reload.mock.callCount(), 0);
+  offlineReset.resolve();
+  await settle();
+  assert.equal(location.reload.mock.callCount(), 1);
+});
+
 test("reset prevents late chapter and probe results from repopulating local storage", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const offlineReset = deferred();
@@ -189,6 +217,34 @@ test("a reset invalidates queued positions from another tab, including after a s
   }
 });
 
+test("a failed book switch preserves playback, position and the sleep timer with storage blocked", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  t.mock.method(console, "warn", () => {});
+  t.mock.method(console, "error", () => {});
+  const nextConfig = deferred();
+  const page = await openPlayerPage(book, assert.fail, null, { fetch: (url) => {
+    if (url.endsWith("/library.json")) return Response.json({ books: [{ id: book.id }, { id: "next" }], ui: { onboardingEnabled: false } });
+    if (url.endsWith("/next/book.json")) return nextConfig.promise;
+    return Response.json(book);
+  } });
+  queueListeningPosition(page);
+  const { elements, audio } = page;
+  elements.get("sleepList").children[1].dispatchEvent(new Event("click"));
+  const pause = t.mock.method(audio, "pause");
+  const source = audio.src;
+  const select = elements.get("bookSelect");
+  select.value = "next";
+  select.dispatchEvent(new Event("change"));
+  nextConfig.resolve(Response.json({ id: "next", languages: {} }));
+  await settle();
+  assert.equal(select.value, book.id);
+  assert.equal(pause.mock.callCount(), 0);
+  assert.equal(audio.src, source);
+  assert.equal(elements.get("playPauseBtn").getAttribute("aria-label"), "Pause");
+  assert.equal(elements.get("timeCur").textContent, "0:20");
+  assert.match(elements.get("sleepBtn").dataset.tooltip, /5 min/);
+});
+
 test("a queued position preserves a subsequent quality selection", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const page = await openPlayerPage({ ...book,
@@ -201,6 +257,36 @@ test("a queued position preserves a subsequent quality selection", async (t) => 
   const saved = page.storage;
   assert.equal(saved.readBook(book.id).quality, "aac-64");
   assert.equal(saved.getProgress(book.id, "en"), 20);
+});
+
+test("only a playing fallback changes the quality restored on the next visit", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const saved = new Map();
+  const config = { ...book, languages: { en: { sources: { aac: { 96: "high.m4b", 64: "low.m4b" } } } } };
+  const visit = () => openPlayerPage(config, assert.fail, saved);
+  const { elements, audio, storage } = await visit();
+  const quality = elements.get("qualitySelect");
+  quality.value = "aac-64";
+  quality.dispatchEvent(new Event("change"));
+  const play = elements.get("playPauseBtn");
+  play.dispatchEvent(new Event("click"));
+  audio.error = { code: 2 };
+  audio.dispatchEvent(new Event("error"));
+  assert.match(audio.src, /high\.m4b$/);
+  assert.equal(storage.readBook(book.id).quality, "aac-64");
+  audio.dispatchEvent(new Event("error"));
+  play.dispatchEvent(new Event("click"));
+  audio.dispatchEvent(new Event("playing"));
+  const reopened = await visit();
+  reopened.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.match(reopened.audio.src, /low\.m4b$/);
+  reopened.audio.error = { code: 2 };
+  reopened.audio.dispatchEvent(new Event("error"));
+  reopened.audio.dispatchEvent(new Event("playing"));
+  const afterFallback = await visit();
+  afterFallback.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.match(afterFallback.audio.src, /high\.m4b$/);
 });
 
 test("chapter updates keep one WebVTT copy and discard older versions", async (t) => {

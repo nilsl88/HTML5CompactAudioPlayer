@@ -1,8 +1,8 @@
 import "./offline-manifest.js";
 import { validateOfflineBookConfig } from "./book-config.js";
-import { OfflineDownloadError } from "./offline-transfer.js";
+import { OfflineDownloadError, sameAudioRevision } from "./offline-transfer.js";
 
-const { validManifest, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
+const { validManifest, audioMimeType, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
   offlineMetaUrl, offlineManifestUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
 export const OFFLINE_BOOK_CACHE_PREFIX = "compact-player-offline-book-v2-";
 const LEGACY_BOOK_CACHE_PREFIX = "compact-player-offline-book-v1-";
@@ -18,6 +18,27 @@ export function jsonResponse(value) {
   return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
 }
 
+export function sameOfflineSelection(manifest, selection) {
+  return Boolean(manifest && selection) && manifest.episodeId === selection.episodeId
+    && (!manifest.configBookId || !selection.configBookId || manifest.configBookId === selection.configBookId)
+    && manifest.languageCode === selection.languageCode
+    && manifest.sourceId === selection.sourceId
+    && manifest.sourceUrl === selection.sourceUrl
+    && String(manifest.cacheVersion) === String(selection.cacheVersion);
+}
+
+export function manifestMatchesSelection(manifest, selection) {
+  return validManifest(manifest) && sameOfflineSelection(manifest, selection);
+}
+
+export function canResumeTransfer(staging, selection, preflight) {
+  return manifestMatchesSelection(staging, selection) && sameAudioRevision(staging, preflight);
+}
+
+function matchesStaging(manifest, staging) {
+  return sameOfflineSelection(manifest, staging) && manifest.downloadId === staging.downloadId && manifest.cacheName === staging.cacheName;
+}
+
 export function recoverDownloads(manifests, saved, publishedStaging) {
   // After an explicit removal only a later staging download can become the saved book.
   if (saved?.status === "removed") manifests = manifests.filter((manifest) =>
@@ -29,7 +50,8 @@ export function recoverDownloads(manifests, saved, publishedStaging) {
   };
   const damaged = newest("needs-config", saved, "downloadedAt");
   const publishedNeedsConfig = damaged && damaged.cacheName === saved?.cacheName;
-  const active = publishedNeedsConfig ? null : newest("ready", saved, "downloadedAt");
+  const completed = manifests.find((manifest) => manifest.status === "ready" && matchesStaging(manifest, publishedStaging));
+  const active = completed || (publishedNeedsConfig ? null : newest("ready", saved, "downloadedAt"));
   const staging = newest("downloading", publishedStaging, "createdAt");
   return { active, damaged, staging };
 }
@@ -119,9 +141,39 @@ export class OfflineBookStore {
     return manifest;
   }
 
-  async verifyCachedConfig(manifest, requiredUrl) {
+  async readStaged(staging, selection) {
+    const stored = await this.readBookManifest(staging.cacheName);
+    if (!matchesStaging(stored, staging) || !manifestMatchesSelection(stored, selection)) return null;
+    this.checkConfigUrl(stored, this.configUrl(selection));
+    return stored;
+  }
+
+  async checkCompletion(staging, selection) {
+    const stored = await this.readStaged(staging, selection);
+    if (!stored || stored.status === "ready") return stored;
+    const ready = { ...stored, status: "ready", mime: audioMimeType(stored.mime), downloadedAt: Date.now() };
+    if (!validManifest(ready, "ready")) {
+      await this.writeRecord("staging", stored);
+      return stored;
+    }
+    await this.verifyCachedConfig(ready);
+    return ready;
+  }
+
+  async publish(manifest) {
+    const cache = await this.cacheStorage.open(manifest.cacheName);
+    await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(manifest));
+    await this.writeRecord("active", manifest);
+  }
+
+  checkConfigUrl(manifest, requiredUrl) {
     const url = this.configUrl(manifest);
     if (requiredUrl && url !== requiredUrl) throw new OfflineDownloadError("config", "The manifest lost the required book configuration.");
+    return url;
+  }
+
+  async verifyCachedConfig(manifest, requiredUrl) {
+    const url = this.checkConfigUrl(manifest, requiredUrl);
     if (!url) return;
     const response = await this.cacheStorage.match(url, { cacheName: manifest.cacheName });
     if (!response?.ok) throw new OfflineDownloadError("config", "The downloaded book configuration is missing.");
