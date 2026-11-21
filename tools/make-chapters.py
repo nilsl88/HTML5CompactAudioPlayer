@@ -77,6 +77,10 @@ def find_pauses(path, noise, min_pause, expected):
     if process.returncode != 0:
         sys.exit(f"ffmpeg could not decode the file:\n{text[-800:]}")
 
+    return parse_pauses(text), decoded
+
+
+def parse_pauses(text):
     pauses, begin = [], None
     for line in text.replace("\r", "\n").splitlines():
         match = re.search(r"silence_start: (-?[\d.]+)", line)
@@ -87,7 +91,7 @@ def find_pauses(path, noise, min_pause, expected):
         if match and begin is not None:
             pauses.append((begin, float(match.group(1))))
             begin = None
-    return pauses, decoded
+    return pauses
 
 
 def stamp(seconds):

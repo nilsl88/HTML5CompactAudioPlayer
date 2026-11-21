@@ -3,6 +3,32 @@ import { CODECS } from "./codecs.js";
 
 export { CODECS };
 
+function audioLanguageTag(value) {
+  const tag = String(value || "").trim().replace(/_/g, "-");
+  if (!tag) return "";
+  try { return Intl.getCanonicalLocales(tag)[0]; }
+  catch { return tag.toLowerCase(); }
+}
+
+export function matchAudioLanguage(preferences, codes, defaultLanguage) {
+  for (const preference of preferences) {
+    const tag = audioLanguageTag(preference);
+    if (!tag) continue;
+    if (codes.includes(tag)) return tag;
+    let parent = tag;
+    while (parent.includes("-")) {
+      parent = parent.slice(0, parent.lastIndexOf("-"));
+      if (codes.includes(parent)) return parent;
+    }
+    const base = normalizeLanguageTag(tag);
+    if (codes.includes(base)) return base;
+    if (codes.includes(defaultLanguage) && normalizeLanguageTag(defaultLanguage) === base) return defaultLanguage;
+    const related = codes.find((code) => normalizeLanguageTag(code) === base);
+    if (related) return related;
+  }
+  return "";
+}
+
 export function normalizeLibrary(raw) {
   const library = { defaultId: "", books: [], byId: new Map(), ui: { onboardingEnabled: true } };
   if (!raw || typeof raw !== "object") return library;
@@ -35,18 +61,23 @@ export function parseJson(text, fileName) {
   catch (error) { throw new Error(`Invalid JSON in ${fileName}: ${error.message}`); }
 }
 
+export function parseBookConfig(text, configUrl, documentBaseUrl) {
+  const raw = parseJson(text, configUrl);
+  return normalizeBook(raw, { bookBaseUrl: new URL(".", configUrl).href, documentBaseUrl });
+}
+
 export function normalizeBook(raw, { bookBaseUrl, documentBaseUrl }) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Book configuration must be an object.");
   const id = String(raw.id || "").trim();
-  const defaultLanguage = normalizeLanguageTag(raw.defaultLanguage);
+  const defaultLanguage = audioLanguageTag(raw.defaultLanguage);
   if (!id) throw new Error("Book configuration is missing id.");
   if (!defaultLanguage) throw new Error("Book configuration is missing defaultLanguage.");
   if (!raw.languages || typeof raw.languages !== "object" || Array.isArray(raw.languages)) throw new Error("Book configuration is missing languages.");
 
-  const languages = {};
+  const languages = Object.create(null);
   for (const [rawCode, value] of Object.entries(raw.languages)) {
     if (!value || typeof value !== "object") continue;
-    const code = normalizeLanguageTag(rawCode);
+    const code = audioLanguageTag(rawCode);
     if (!code) continue;
     const baseUrl = value.basePath
       ? safeUrl(value.basePath, documentBaseUrl)
@@ -81,7 +112,7 @@ export function normalizeBook(raw, { bookBaseUrl, documentBaseUrl }) {
 
   return {
     id,
-    defaultLanguage: languages[defaultLanguage] ? defaultLanguage : Object.keys(languages)[0],
+    defaultLanguage: matchAudioLanguage([defaultLanguage], Object.keys(languages)) || Object.keys(languages)[0],
     title: raw.title && typeof raw.title === "object" ? { ...raw.title } : {},
     cover: String(raw.cover || ""),
     coverSource: ["file", "embedded", "auto", "none"].includes(raw.coverSource)
@@ -106,6 +137,7 @@ export function resolveCover(book) {
 
 export function localizedValue(values, locale, fallback = "") {
   if (!values || typeof values !== "object") return fallback;
-  const normalized = normalizeLanguageTag(locale);
-  return String(values[locale] || values[normalized] || values.en || Object.values(values)[0] || fallback);
+  const tag = audioLanguageTag(locale);
+  const key = Object.hasOwn(values, locale) ? locale : Object.keys(values).find((key) => audioLanguageTag(key) === tag);
+  return String((key && values[key]) || values[normalizeLanguageTag(locale)] || values.en || Object.values(values)[0] || fallback);
 }

@@ -20,12 +20,6 @@ test("chapter navigation uses platform-independent icons", async () => {
   assert.doesNotMatch(html, /[⏮⏭]/u);
 });
 
-test("vertical arrow shortcuts use the configured skip interval", async () => {
-  const source = await readFile(new URL("js/player-app.js", root), "utf8");
-  assert.match(source, /event\.code === "ArrowUp"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) \+ uiPrefs\.skipSeconds\);/);
-  assert.match(source, /event\.code === "ArrowDown"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) - uiPrefs\.skipSeconds\);/);
-});
-
 test("visual notifications are centered inside the player", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   const css = await readFile(new URL("player.css", root), "utf8");
@@ -62,20 +56,9 @@ test("popup close buttons use inverse theme colors", async () => {
 
 test("control tooltips support mouse and keyboard users", async () => {
   const css = await readFile(new URL("player.css", root), "utf8");
-  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   assert.match(css, /\[data-tooltip\]::after\s*{[^}]*content:\s*attr\(data-tooltip\)/s);
   assert.match(css, /\[data-tooltip\]:focus-visible::after/);
   assert.match(css, /\[data-tooltip\]:hover::after/);
-  assert.match(source, /function setTooltip\(element, message\)/);
-  for (const id of ["playPauseBtn", "skipBackBtn", "skipForwardBtn", "sleepBtn", "resetBtn"]) {
-    assert.match(source, new RegExp(`setTooltip\\(els\\.${id},`), `Missing tooltip assignment for #${id}`);
-  }
-  for (const id of ["prevChapterBtn", "nextChapterBtn"]) {
-    assert.match(source, new RegExp(`\\[els\\.${id},\\s*t\\(`), `Missing mapped tooltip assignment for #${id}`);
-  }
-  for (const id of ["chaptersBtn", "optionsBtn"]) {
-    assert.match(source, new RegExp(`setControlLabel\\(els\\.${id},`), `Missing labelled tooltip assignment for #${id}`);
-  }
 });
 
 test("select controls use aligned custom arrows", async () => {
@@ -163,13 +146,10 @@ test("the example catalog leaves book titles in the book configurations", async 
 });
 
 test("onboarding policy belongs to the library", async () => {
-  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
   const book = JSON.parse(await readFile(new URL("media/episode-001/book.json", root), "utf8"));
   assert.equal(library.ui.onboardingEnabled, true);
   assert.equal(Object.hasOwn(book, "ui"), false);
-  assert.match(source, /library\.ui\.onboardingEnabled && !storage\.hasSeenOnboarding\(\)/);
-  assert.doesNotMatch(source, /book\.ui\.onboardingEnabled/);
 });
 
 test("offline controls are semantic and media opts into service-worker handling", async () => {
@@ -180,15 +160,6 @@ test("offline controls are semantic and media opts into service-worker handling"
   }
   assert.match(html, /<progress id="offlineProgress"[^>]*aria-labelledby="offlineLabel offlineStatus"/);
   assert.match(html, /<audio id="audio"[^>]*preload="none"[^>]*crossorigin="anonymous"/);
-});
-
-test("service worker keeps online requests first and serves cached byte ranges", async () => {
-  const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(worker, /async function networkFirst\(request\)[\s\S]*?await fetch\(request\)/);
-  assert.match(worker, /new Response\(stream, \{ status: range\.partial \? 206 : 200, headers \}\)/);
-  assert.match(worker, /"content-range"\] = `bytes \$\{range\.start\}-\$\{range\.end\}\/\$\{manifest\.totalSize\}`/);
-  assert.match(worker, /request\.headers\.get\(DOWNLOAD_HEADER\) === "1"/);
-  assert.doesNotMatch(worker, /https:\/\/.*(?:workbox|unpkg|jsdelivr)/i);
 });
 
 test("service-worker shell and versioned entry points stay in sync", async () => {

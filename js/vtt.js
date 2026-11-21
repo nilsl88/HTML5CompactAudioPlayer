@@ -1,11 +1,8 @@
 function parseTimestamp(value) {
-  const parts = String(value || "").trim().replace(",", ".").split(":");
-  if (parts.length < 2 || parts.length > 3) return Number.NaN;
-  const seconds = Number.parseFloat(parts.pop());
-  const minutes = Number.parseInt(parts.pop(), 10);
-  const hours = parts.length ? Number.parseInt(parts.pop(), 10) : 0;
-  if (![hours, minutes, seconds].every(Number.isFinite) || minutes < 0 || seconds < 0 || minutes > 59 || seconds >= 60) return Number.NaN;
-  return hours * 3600 + minutes * 60 + seconds;
+  const match = /^(?:(\d{2,}):)?([0-5]\d):([0-5]\d)[.,](\d{3})$/.exec(value.trim());
+  if (!match) return Number.NaN;
+  const [, hours = "0", minutes, seconds, millis] = match;
+  return Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds) + Number(millis) / 1000;
 }
 
 function cleanCueText(lines) {
@@ -13,7 +10,7 @@ function cleanCueText(lines) {
 }
 
 export function parseWebVtt(text) {
-  const lines = String(text || "").replace(/^\uFEFF/, "").replace(/\r/g, "").split("\n");
+  const lines = String(text || "").replace(/^\uFEFF/, "").split(/\r\n|\r|\n/);
   const cues = [];
   let index = lines[0]?.trim().startsWith("WEBVTT") ? 1 : 0;
   while (index < lines.length) {
@@ -32,7 +29,7 @@ export function parseWebVtt(text) {
     const cueLines = [];
     while (index < lines.length && lines[index].trim()) { cueLines.push(lines[index].trim()); index += 1; }
     const title = cleanCueText(cueLines);
-    if (Number.isFinite(start) && start >= 0 && title) cues.push({ start, end: Number.isFinite(end) && end >= start ? end : null, title });
+    if (Number.isFinite(end) && end > start && title) cues.push({ start, end, title });
   }
   cues.sort((a, b) => a.start - b.start);
   return cues.filter((cue, position) => position === 0 || cue.start !== cues[position - 1].start || cue.title !== cues[position - 1].title);

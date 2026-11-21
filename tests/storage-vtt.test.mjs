@@ -86,6 +86,24 @@ test("reads legacy availability cache values", () => {
   assert.equal(new PlayerStorage(memory).readAvailability("book", 1).en["opus-96"], true);
 });
 
+test("refreshing chapters and clearing probes only touches the current installation", () => {
+  const memory = new MemoryStorage();
+  const first = new PlayerStorage(memory, "https://example.test/one/");
+  const other = new PlayerStorage(memory, "https://example.test/two/");
+  const url = "https://example.test/shared/chapters.vtt";
+  const audio = "https://example.test/shared/audio.mp3";
+  for (const store of [first, other]) {
+    store.writeChapters("book", "en", 1, url, "First edition");
+    store.availabilityCache("book", 1).recordProbe("en", "mp3-64", "available", audio);
+  }
+  first.writeChapters("book", "en", 2, url, "Second edition");
+  first.clearAvailability("book", 1);
+  assert.equal(first.readChapters("book", "en", 1, url), "");
+  assert.equal(first.availabilityCache("book", 1).readProbe("en", "mp3-64", audio), "unknown");
+  assert.equal(other.readChapters("book", "en", 1, url), "First edition");
+  assert.equal(other.availabilityCache("book", 1).readProbe("en", "mp3-64", audio), "available");
+});
+
 test("confirmed playback expires and stale tabs cannot repopulate a cleared availability cache", (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1000 });
   const storage = new PlayerStorage(new MemoryStorage());
@@ -166,6 +184,32 @@ test("legacy chapter copies migrate while current embedded sources and other lan
   assert.equal(storage.readChapterData("book", "en", 2, "embedded:small"), null);
   assert.equal(storage.readChapters("book", "en", 2, url), "");
   assert.deepEqual(storage.readChapterData("book", "da", 1, "embedded:dansk").cues, cues);
+});
+
+test("WebVTT preserves chapters and multiline titles with CR, LF and CRLF line endings", () => {
+  const lines = ["\uFEFFWEBVTT", "", "00:00.000 --> 00:04.500", "Opening", "credits", "",
+    "00:04.500 --> 00:09.000", "Chapter two"];
+  const expected = [
+    { start: 0, end: 4.5, title: "Opening credits" },
+    { start: 4.5, end: 9, title: "Chapter two" },
+  ];
+  for (const separator of ["\r", "\n", "\r\n"]) {
+    assert.deepEqual(parseWebVtt(lines.join(separator)), expected, JSON.stringify(separator));
+  }
+});
+
+test("WebVTT requires complete start and end timestamps and preserves both millisecond separators", () => {
+  const invalid = ["00:01oops.000", "00:01.000x", "00:0.000", "1x:00:01.000", "00:60.000", "00:01.0", "00:01"];
+  const badCues = invalid.flatMap((stamp) => [
+    stamp + " --> 00:03.000\nBad start", "00:00.000 --> " + stamp + "\nBad end",
+  ]);
+  const text = ["WEBVTT", "00:00,250 --> 00:01.750 align:start\nOpening", ...badCues,
+    "00:05.000 --> 00:04.000\nBackwards", "00:06.000 --> 00:06.000\nEmpty interval",
+    "100:02:03.004 --> 100:02:04,005\nClosing"].join("\n\n");
+  assert.deepEqual(parseWebVtt(text), [
+    { start: 0.25, end: 1.75, title: "Opening" },
+    { start: 360123.004, end: 360124.005, title: "Closing" },
+  ]);
 });
 
 test("parses real-world WebVTT without retaining cue markup", () => {

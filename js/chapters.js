@@ -8,6 +8,10 @@ const { checkResponseVersion } = globalThis.CompactPlayerOfflineManifest;
 
 export const CHAPTER_REQUEST_TIMEOUT_MS = 20000;
 
+function embeddedChapters(cues) {
+  return { kind: "embedded", text: "", cues };
+}
+
 export function parseChapterText(text) {
   const value = String(text || "");
   const cues = parseWebVtt(value);
@@ -42,11 +46,14 @@ export async function loadChapterFile(url, {
 export async function loadChapters({
   mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", cacheVersion,
   signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS, revalidate = false, cache,
+  online = true, fallbackCues, onFallback,
 } = {}) {
   const empty = { kind: "none", text: "", cues: [] };
   if (mode === "none") return empty;
   const cached = revalidate ? null : cache?.read();
-  if (cached?.kind === "embedded" && mode !== "vtt") return cached;
+  if (cached?.kind === "embedded" && (mode === "embedded" || (mode === "auto" && !vttUrl))) {
+    return embeddedChapters(cached.cues);
+  }
   const save = (result) => {
     if (!signal?.aborted) cache?.write(result);
     return result;
@@ -61,11 +68,12 @@ export async function loadChapters({
   const canReadEmbedded = isMp4Audio({ mime: sourceMime, url: sourceUrl });
   const loadEmbedded = async () => {
     if (!canReadEmbedded || !sourceUrl) return empty;
-    const stored = cached?.kind === "vtt" && cache.readSource();
-    if (stored?.kind === "embedded") return stored;
+    if (fallbackCues?.length) return embeddedChapters(fallbackCues);
+    const stored = cached?.kind === "vtt" ? cache.readSource() : cached;
+    if (stored?.kind === "embedded") return embeddedChapters(stored.cues);
     cache?.beginWrite();
     const cues = await loadEmbeddedMp4Chapters(sourceUrl, { signal, fetchImpl, timeoutMs, cacheVersion });
-    return save({ kind: "embedded", text: "", cues });
+    return save(embeddedChapters(cues));
   };
   if (mode === "embedded") return loadEmbedded();
   if (mode === "vtt") {
@@ -75,6 +83,12 @@ export async function loadChapters({
   if (mode === "auto") {
     let vttError;
     if (vttUrl) {
+      // A validated empty VTT has its own cache entry. Embedded cues alone leave the VTT lookup pending.
+      if (cached?.kind === "embedded" && cached.cues.length) {
+        const fallback = { ...embeddedChapters(cached.cues), retryVtt: true };
+        if (!online) return fallback;
+        onFallback?.(fallback);
+      }
       try {
         const result = await loadVtt();
         if (result.cues.length) return result;
@@ -85,7 +99,8 @@ export async function loadChapters({
     }
     if (canReadEmbedded && sourceUrl) {
       const result = await loadEmbedded();
-      if (result.cues.length || !vttError) return result;
+      if (!vttError) return result;
+      if (result.cues.length) return { ...result, retryVtt: true };
     }
     if (vttError) throw vttError;
   }

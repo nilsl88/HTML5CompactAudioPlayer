@@ -6,7 +6,8 @@ export function clamp(value, min, max) {
 
 export function normalizeLanguageTag(value) {
   const base = String(value || "").trim().toLowerCase().split(/[-_]/)[0];
-  return ({ no: "nb", nn: "nb", dk: "da" })[base] || base;
+  if (base === "no" || base === "nn") return "nb";
+  return base === "dk" ? "da" : base;
 }
 
 export function formatTime(value) {
@@ -88,7 +89,7 @@ export async function fetchWithRetry(url, options = {}, readResponse) {
 
 export function fetchTextWithRetry(url, options) {
   return fetchWithRetry(url, options, async (response) => ({
-    ok: response.ok, status: response.status, text: response.ok ? await response.text() : "",
+    ok: response.ok, status: response.status, headers: response.headers, text: response.ok ? await response.text() : "",
   }));
 }
 
@@ -98,4 +99,8 @@ export function clearChildren(element) {
 
 export function setText(element, value) {
   if (element) element.textContent = String(value ?? "");
+}
+
+export function asRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }

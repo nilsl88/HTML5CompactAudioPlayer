@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, openPlayerPage } from "./player-page.mjs";
 import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
+import { PlayerStorage } from "../js/storage.js";
 import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
 
 function concatBytes(...values) {
@@ -61,6 +62,25 @@ function rangedFetch(file, total = 262144) {
     };
   };
 }
+
+test("embedded chapters have the same result from the network and both offline cache paths", async () => {
+  const values = new Map();
+  const storage = new PlayerStorage({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    key: (index) => [...values.keys()][index],
+    get length() { return values.size; },
+  });
+  const sourceUrl = "https://example.test/offline-edition.m4b";
+  const vttUrl = "https://example.test/chapters.vtt";
+  const cache = storage.chapterCache("edition", "en", 1, sourceUrl, vttUrl);
+  const online = await loadChapters({ mode: "embedded", sourceUrl, cache, fetchImpl: rangedFetch(neroMetadata()) });
+  assert.equal(online.cues.length, 2);
+  const options = { sourceUrl, cache, fetchImpl: assert.fail };
+  assert.deepEqual(await loadChapters({ ...options, mode: "embedded" }), online);
+  cache.write({ kind: "vtt", text: "WEBVTT\n" });
+  assert.deepEqual(await loadChapters({ ...options, mode: "auto", vttUrl }), online);
+});
 
 test("chapter requests use the browser cache and parse WebVTT", async () => {
   let requestOptions;
@@ -294,6 +314,98 @@ test("decodes QuickTime chapter text without trailing format data", () => {
   assert.equal(decodeMp4ChapterTitle(sample), "Opening Credits");
 });
 
+function uint32Fields(...fields) {
+  const view = new DataView(new ArrayBuffer(4 * fields.length));
+  fields.forEach((value, index) => view.setUint32(4 * index, value));
+  return new Uint8Array(view.buffer);
+}
+
+function quickTimeChapterFile(count, sizeTable, sample = Uint8Array.of(0, 1, 65), padding = 0, gap = 0) {
+  const stride = sample.length + gap;
+  const data = new Uint8Array(padding + (count - 1) * stride + sample.length);
+  for (let i = padding; i < data.length; i += stride) data.set(sample, i);
+  const media = atom("mdat", data);
+  const offsets = gap ? Array.from({ length: count }, (_, i) => 8 + padding + i * stride) : [8 + padding];
+  const references = atom("trak", atom("tref", atom("chap", uint32Fields(2))));
+  const samples = atom("stbl", concatBytes(
+    atom("stts", uint32Fields(0, 1, count, 1000)),
+    atom("stsc", uint32Fields(0, 1, 1, gap ? 1 : count, 1)),
+    atom("stco", uint32Fields(0, offsets.length, ...offsets)),
+    atom("stsz", sizeTable),
+  ));
+  const track = atom("trak", concatBytes(atom("tkhd", uint32Fields(0, 0, 0, 2)),
+    atom("mdia", concatBytes(atom("mdhd", uint32Fields(0, 0, 0, 1000)), atom("minf", samples)))));
+  return concatBytes(media, atom("moov", concatBytes(references, track)));
+}
+
+test("QuickTime chapters reuse the initial range and fetch neighboring titles together", async () => {
+  const count = 100;
+  const sample = Uint8Array.of(0, 1, 65);
+  const prefix = 256 * 1024;
+  for (const [firstSample, gap] of [[8, 0], [prefix - 1, 0], [prefix + 100_000, 4], [prefix, 4000], [prefix, 5000]]) {
+    const file = quickTimeChapterFile(count, uint32Fields(0, sample.length, count), sample, firstSample - 8, gap);
+    const offsets = Array.from({ length: count }, (_, i) => firstSample + i * (sample.length + gap));
+    const mediaEnd = offsets.at(-1) + sample.length;
+    for (let i = 0; i < count; i++) file[offsets[i] + 2] = 65 + i % 26;
+    const requests = [];
+    const fetchRange = rangedFetch(file, file.length);
+    const cues = await loadEmbeddedMp4Chapters("https://example.test/chapters.m4b", {
+      fetchImpl: (url, options) => {
+        requests.push(options.headers.Range);
+        return fetchRange(url, options);
+      },
+    });
+    assert.deepEqual(cues, Array.from({ length: count }, (_, i) => ({
+      start: i, end: i + 1 < count ? i + 1 : null, title: String.fromCharCode(65 + i % 26),
+    })));
+    assert.equal(requests[0], `bytes=0-${prefix - 1}`);
+    const titleReads = requests.slice(1).filter((range) => Number(range.match(/^bytes=(\d+)/)[1]) < mediaEnd);
+    if (file.length <= prefix) assert.equal(requests.length, 1);
+    else if (gap === 5000) assert.deepEqual(titleReads, offsets.map((offset) => `bytes=${offset}-${offset + sample.length - 1}`));
+    else if (gap === 4000) assert.deepEqual(titleReads, [
+      `bytes=${offsets[0]}-${offsets[65] + sample.length - 1}`, `bytes=${offsets[66]}-${mediaEnd - 1}`,
+    ]);
+    else assert.deepEqual(titleReads, [`bytes=${Math.max(prefix, firstSample)}-${mediaEnd - 1}`]);
+  }
+});
+
+test("QuickTime titles follow the UTF-16 byte order and replace previously misdecoded cached titles", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const book = { id: "book", defaultLanguage: "en", languages: { en: {
+    chapterSource: "embedded", sources: { aac: { 64: "book.m4b" } },
+  } } };
+  const url = "https://example.test/media/book/book.m4b";
+  const key = "embedded:" + url;
+  const storedKey = "compactPlayer@%2F:compactPlayer:chapters:book:en:1:" + encodeURIComponent(key);
+  for (const bytes of [[0xfe, 0xff, 0, 0xc5, 0, 0x6c], [0xff, 0xfe, 0xc5, 0, 0x6c, 0]]) {
+    const sample = Uint8Array.of(0, bytes.length, ...bytes, 0, 0, 0, 8);
+    const file = quickTimeChapterFile(1, uint32Fields(0, sample.length, 1), sample);
+    const fetchImpl = rangedFetch(file, file.length);
+    const cues = await loadEmbeddedMp4Chapters(url, { fetchImpl });
+    assert.deepEqual(cues, [{ start: 0, end: null, title: "Ål" }]);
+    const saved = new Map([[storedKey, JSON.stringify({ kind: "embedded", sourceKey: key,
+      cues: [{ start: 0, end: null, title: "\uFFFE\uC500\u6C00" }] })]]);
+    const page = await openPlayerPage(book, fetchImpl, saved);
+    assert.equal(page.elements.get("chaptersList").children[0].children[0].textContent, "Ål");
+    assert.deepEqual(JSON.parse(saved.get(storedKey)).cues, cues);
+  }
+});
+
+test("QuickTime chapter sizes respect the sample limit and require a complete size table", async () => {
+  for (const [count, table, expected] of [
+    [10_001, uint32Fields(0, 3, 10_001), 10_000],
+    [10_001, uint32Fields(0, 0, 10_001, ...Array(10_001).fill(3)), 10_000],
+    [2, uint32Fields(0, 0, 2, 3, 3), 2],
+    [2, uint32Fields(0, 0, 2, 3), 0],
+    [2, uint32Fields(0, 3), 0],
+  ]) {
+    const file = quickTimeChapterFile(count, table);
+    const cues = await loadEmbeddedMp4Chapters("https://example.test/sample-sizes.m4b", { fetchImpl: rangedFetch(file, file.length) });
+    assert.equal(cues.length, expected);
+    if (expected) assert.deepEqual(cues.at(-1), { start: expected - 1, end: null, title: "A" });
+  }
+});
+
 test("reads JPEG cover artwork from MP4 metadata", async () => {
   const metadata = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]), 13);
   const cover = await loadEmbeddedMp4Cover("https://example.test/book.m4b", { fetchImpl: rangedFetch(metadata.file) });
@@ -373,6 +485,22 @@ test("reads PNG cover artwork from MP4 metadata", async () => {
   const cover = await loadEmbeddedMp4Cover("https://example.test/book.m4a", { fetchImpl: rangedFetch(metadata.file) });
   assert.equal(cover.mime, "image/png");
   assert.deepEqual(cover.data, metadata.image);
+});
+
+test("already cancelled chapters and covers leave MP4 range requests to active readers", async (t) => {
+  const url = "https://example.test/cancelled-book.m4b";
+  const signal = AbortSignal.abort();
+  const fetchImpl = t.mock.fn(rangedFetch(neroMetadata()));
+  for (const load of [loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover]) {
+    await assert.rejects(load(url, { fetchImpl, signal }), { name: "AbortError" });
+  }
+  assert.equal(fetchImpl.mock.callCount(), 0);
+
+  const active = loadEmbeddedMp4Chapters(url, { fetchImpl });
+  await assert.rejects(loadEmbeddedMp4Cover(url, { fetchImpl, signal }), { name: "AbortError" });
+  assert.equal((await active)[0].title, "Intro");
+  await assert.rejects(loadEmbeddedMp4Chapters(url, { fetchImpl, signal }), { name: "AbortError" });
+  assert.equal(fetchImpl.mock.callCount(), 1);
 });
 
 test("shares one MP4 metadata range between chapters and cover", async () => {
@@ -456,6 +584,66 @@ test("auto mode falls back from cached empty WebVTT and reuses the embedded chap
     assert.equal(page.elements.get("nextChapterBtn").disabled, false);
     assert.ok(!page.audio.src);
     assert.deepEqual(requests, ["/media/book/chapters.vtt", "/media/book/book.m4b"]);
+  }
+});
+
+test("auto mode retries unavailable WebVTT on reconnect and reload while keeping embedded chapters offline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const book = { id: "book", defaultLanguage: "en", languages: { en: {
+    chapterSource: "auto", chapters: "chapters.vtt", sources: { aac: { 64: "book.m4b" } },
+  } } };
+  const text = "WEBVTT\n\n00:00.000 --> 00:15.000\nRestored";
+  for (const trigger of ["reconnect", "reload"]) {
+    const saved = new Map();
+    const range = rangedFetch(neroMetadata());
+    const requests = [];
+    let response = () => new Response(null, { status: 404 });
+    const visit = (online) => openPlayerPage(book, (url, options) => {
+      const filename = new URL(url).pathname.split("/").at(-1);
+      requests.push(filename);
+      return filename === "chapters.vtt" ? response() : range(url, options);
+    }, saved, { navigator: { onLine: online, language: "en", userAgent: "iPhone" } });
+    const title = (page) => page.elements.get("chaptersList").children[0]?.children[0]?.textContent;
+    const initial = await visit(true);
+    assert.equal(title(initial), "Intro");
+    const page = await visit(false);
+    assert.equal(title(page), "Intro");
+    assert.deepEqual(requests, ["chapters.vtt", "book.m4b"]);
+
+    page.navigator.onLine = true;
+    page.window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.equal(title(page), "Intro");
+    assert.deepEqual(requests, ["chapters.vtt", "book.m4b", "chapters.vtt"]);
+
+    const server = deferred();
+    response = () => server.promise;
+    let restored;
+    if (trigger === "reload") {
+      restored = await visit(true);
+      assert.equal(title(restored), "Intro");
+    }
+    else {
+      restored = page;
+      restored.elements.get("sleepList").children[0].dispatchEvent(new Event("click"));
+      await settle();
+      assert.match(restored.elements.get("sleepBtn").dataset.tooltip, /End of chapter/);
+      restored.window.dispatchEvent(new Event("online"));
+      restored.window.dispatchEvent(new Event("online"));
+      assert.equal(title(restored), "Intro");
+    }
+    server.resolve(new Response(text));
+    await settle();
+    assert.equal(title(restored), "Restored");
+    assert.match(restored.elements.get("bookMeta").textContent, /Restored$/);
+    if (trigger === "reconnect") {
+      restored.audio.dispatchEvent(new Event("loadedmetadata"));
+      restored.audio.currentTime = 15;
+      restored.audio.dispatchEvent(new Event("timeupdate"));
+      assert.equal(restored.elements.get("sleepBtn").dataset.tooltip, "Sleep timer");
+    }
+    assert.equal(title(await visit(false)), "Restored");
+    assert.deepEqual(requests, ["chapters.vtt", "book.m4b", "chapters.vtt", "chapters.vtt"]);
   }
 });
 

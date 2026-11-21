@@ -1,7 +1,8 @@
+import { parseContentRange } from "./http-range.js";
 import "./offline-manifest.js";
 import { createAbortError } from "./utils.js";
 
-const { audioMimeType, downloadHeader: OFFLINE_DOWNLOAD_HEADER } = globalThis.CompactPlayerOfflineManifest;
+const { audioMimeType, strongETag, strongLastModified, downloadHeader: OFFLINE_DOWNLOAD_HEADER } = globalThis.CompactPlayerOfflineManifest;
 export const OFFLINE_CHUNK_SIZE = 8 * 1024 * 1024;
 const RANGE_IDLE_TIMEOUT_MS = 20_000;
 
@@ -17,28 +18,15 @@ export function checkCanceled(signal) {
   if (signal?.aborted) throw createAbortError("Download canceled");
 }
 
-export function parseContentRange(value) {
-  const match = String(value || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
-  if (!match) return null;
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  const total = Number(match[3]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(total) || start > end || end >= total) return null;
-  return { start, end, total };
-}
+export { parseContentRange };
 
 export function chunkBounds(index, totalSize, chunkSize = OFFLINE_CHUNK_SIZE) {
   const start = index * chunkSize;
   return { start, end: Math.min(totalSize - 1, start + chunkSize - 1) };
 }
 
-function rangeValidator({ etag, lastModified, responseDate }) {
-  if (etag) return /^"[\x21\x23-\x7e\x80-\xff]*"$/.test(etag) ? etag : "";
-  const modified = new Date(lastModified);
-  const date = new Date(responseDate);
-  if (modified.toUTCString() !== lastModified || date.toUTCString() !== responseDate) return "";
-  // Allow for clock skew when using a modification time as a strong validator.
-  return date - modified >= 60_000 ? lastModified : "";
+function rangeValidator(manifest) {
+  return manifest.etag ? strongETag(manifest.etag) : strongLastModified(manifest);
 }
 
 export function sameAudioRevision(previous, next) {

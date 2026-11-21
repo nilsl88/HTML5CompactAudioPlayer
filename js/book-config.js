@@ -1,32 +1,18 @@
-import { normalizeBook, normalizeLibrary, parseJson } from "./config.js";
-import { buildSources } from "./source-selection.js";
+import { normalizeLibrary, parseBookConfig, parseJson } from "./config.js";
+export { validateOfflineBookConfig } from "./offline-selection.js";
 import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js";
 import "./offline-manifest.js";
+
+function isDownloadedResponse(response) {
+  return response.headers?.get?.(globalThis.CompactPlayerOfflineManifest.versionHeader) != null;
+}
 
 export function fetchLibraryCatalog(url, fetchImpl) {
   return fetchWithRetry(url, { fetchImpl, cache: "no-store", credentials: "same-origin" }, async (response) => {
     if (!response.ok) return null;
     const library = normalizeLibrary(parseJson(await response.text(), "media/library.json"));
-    const { versionHeader } = globalThis.CompactPlayerOfflineManifest;
-    return { library, fromDownload: response.headers?.get?.(versionHeader) != null };
+    return { library, fromDownload: isDownloadedResponse(response) };
   });
-}
-
-function parseBookConfig(text, configUrl, documentBaseUrl) {
-  const raw = parseJson(text, configUrl);
-  return normalizeBook(raw, { bookBaseUrl: new URL(".", configUrl).href, documentBaseUrl });
-}
-
-export function validateOfflineBookConfig(text, configUrl, documentBaseUrl, selection) {
-  const book = parseBookConfig(text, configUrl, documentBaseUrl);
-  const sources = buildSources(book.languages[selection.languageCode]);
-  // Legacy downloads may only have a catalog alias, without the ID from the configuration.
-  if ((selection.configBookId && book.id !== selection.configBookId)
-    || String(book.cacheVersion) !== String(selection.cacheVersion)
-    || !sources.some((source) => source.id === selection.sourceId && source.url === selection.sourceUrl)) {
-    throw new Error("The cached book configuration no longer matches the selected audio.");
-  }
-  return book.id;
 }
 
 function isBookId(id, library) {
@@ -56,15 +42,20 @@ export class BookConfigStore {
     this.library = library;
     this.downloadedConfig = downloadedConfig;
     this.documentBaseUrl = documentBaseUrl;
-    this.fetchOptions = { fetchImpl, retries, retryDelayMs, timeoutMs, cache: "default", credentials: "same-origin" };
+    this.fetchOptions = { fetchImpl, retries, retryDelayMs, timeoutMs, credentials: "same-origin" };
     this.cache = new Map();
     this.requests = new Map();
     this.titlesRequest = null;
   }
 
   setLibrary(library, { fromDownload = false } = {}) {
+    const recordedId = this.downloadedConfig?.id;
+    const saved = !fromDownload && recordedId && this.cache.get(this.configKey(recordedId));
     this.library = library;
     if (!fromDownload) this.downloadedConfig = null;
+    if (saved?.fromDownload && this.configUrls(recordedId).includes(saved.configUrl)) {
+      this.cache.set(this.configKey(recordedId), saved);
+    }
     const retained = new Set();
     for (const record of library.books) {
       const key = this.configKey(record.id);
@@ -85,13 +76,13 @@ export class BookConfigStore {
     return JSON.stringify([id, recordedUrl, this.library.byId.get(id)?.folder || id]);
   }
 
-  async load(id, { signal } = {}) {
+  async load(id, { signal, revalidate = false } = {}) {
     while (!signal?.aborted) {
       const recordedUrl = this.downloadedConfig?.id === id ? this.downloadedConfig.url : null;
       if (!recordedUrl && !isBookId(id, this.library)) throw new Error("Invalid book identifier.");
       const key = this.configKey(id);
       try {
-        const lookup = this.sharedRequest(id, key, recordedUrl);
+        const lookup = this.sharedRequest(id, key, recordedUrl, revalidate);
         const result = await waitForConfig(lookup, signal);
         if (result && !signal?.aborted && key === this.configKey(id)) return result;
       } catch (error) {
@@ -101,13 +92,15 @@ export class BookConfigStore {
     throw createAbortError();
   }
 
-  sharedRequest(id, key, recordedUrl) {
-    if (this.cache.has(key)) return Promise.resolve(this.cache.get(key));
+  sharedRequest(id, key, recordedUrl, revalidate) {
+    const cached = this.cache.get(key);
+    if (cached && !(revalidate && cached.fromDownload)) return Promise.resolve(cached);
     if (this.requests.has(key)) return this.requests.get(key).promise;
     const controller = new AbortController();
     const request = { id, controller };
     this.requests.set(key, request);
-    request.promise = waitForConfig(this.fetchConfig(id, recordedUrl, controller.signal), controller.signal).then((result) => {
+    const cache = cached ? "no-cache" : "default";
+    request.promise = waitForConfig(this.fetchConfig(id, recordedUrl, controller.signal, cache), controller.signal).then((result) => {
       if (controller.signal.aborted) return null;
       this.cache.set(key, result);
       const record = this.library.byId.get(id);
@@ -115,6 +108,10 @@ export class BookConfigStore {
       return result;
     }, (error) => {
       if (controller.signal.aborted) return null;
+      if (cached) {
+        console.warn("[CompactAudioPlayer] Could not revalidate the downloaded book configuration.", id, error);
+        return cached;
+      }
       throw error;
     }).finally(() => {
       if (this.requests.get(key) === request) this.requests.delete(key);
@@ -137,13 +134,13 @@ export class BookConfigStore {
     return ["book.json", "episode.json"].map((name) => new URL(name, bookBaseUrl).href);
   }
 
-  async fetchConfig(id, recordedUrl, signal) {
+  async fetchConfig(id, recordedUrl, signal, cache) {
     const urls = this.configUrls(id, recordedUrl);
     for (const [index, configUrl] of urls.entries()) {
       const hasFallback = index + 1 < urls.length;
       let response;
       try {
-        response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal });
+        response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal, cache });
         if (signal?.aborted) throw createAbortError();
       } catch (error) {
         // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
@@ -153,7 +150,7 @@ export class BookConfigStore {
       if (hasFallback && [404, 410].includes(response.status)) continue;
       if (!response.ok) throw new Error(`Could not load book configuration ${configUrl} (HTTP ${response.status}).`);
       const book = parseBookConfig(response.text, configUrl, this.documentBaseUrl);
-      return { book, configUrl };
+      return { book, configUrl, fromDownload: isDownloadedResponse(response) };
     }
   }
 

@@ -1,5 +1,6 @@
 import { chooseDefaultSource } from "./source-selection.js";
-import { normalizeLanguageTag } from "./utils.js";
+import { matchAudioLanguage } from "./config.js";
+import { matchesDownloadedSource } from "./offline-selection.js";
 
 function preferredSource(sources, id) {
   return sources.find((source) => source.url && source.id === id && source.availability !== "missing") || chooseDefaultSource(sources);
@@ -11,8 +12,12 @@ export class BookSelection {
     this.byLanguage = sources;
     this.saveSelection = saveSelection;
     const offline = downloaded?.episodeId === bookId && String(downloaded.cacheVersion) === String(book.cacheVersion) ? downloaded : null;
-    const languages = [offline?.languageCode, preferences.language, ...browserLanguages.map(normalizeLanguageTag), book.defaultLanguage];
-    this.languageCode = languages.find((code) => sources.has(code));
+    const codes = [...sources.keys()];
+    const downloadedCodes = offline ? codes.filter((code) =>
+      sources.get(code).some((source) => matchesDownloadedSource(offline, code, source))) : [];
+    this.languageCode = matchAudioLanguage([offline?.languageCode], downloadedCodes, book.defaultLanguage)
+      || matchAudioLanguage([offline?.languageCode, preferences.language, ...browserLanguages], codes, book.defaultLanguage)
+      || book.defaultLanguage;
     const savedAudio = offline && this.sources.find((source) => source.id === offline.sourceId && source.url === offline.sourceUrl);
     this.source = savedAudio || preferredSource(this.sources, preferences.quality);
     if (!this.source) throw new Error("No configured audio source can be selected for this browser.");

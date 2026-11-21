@@ -62,13 +62,16 @@ function navigatorStub(estimate = { quota: 1024 ** 3, usage: 0 }) {
 async function workerContext(globals = {}, decorateContract) {
   const context = vm.createContext({
     self: { registration: { scope: "https://example.test/" }, addEventListener() {} },
-    URL, Request, Response, ReadableStream, ...globals,
+    URL, Request, Response, ReadableStream, setTimeout, clearTimeout, AbortSignal, AbortController, ...globals,
   });
   const workerUrl = new URL("../sw.js", import.meta.url);
-  context.importScripts = (path) => {
-    assert.equal(path, "./js/offline-manifest.js");
-    vm.runInContext(readFileSync(new URL(path, workerUrl), "utf8"), context);
-    if (decorateContract) context.CompactPlayerOfflineManifest = decorateContract(context.CompactPlayerOfflineManifest);
+  context.importScripts = (...paths) => {
+    for (const path of paths) {
+      vm.runInContext(readFileSync(new URL(path, workerUrl), "utf8"), context);
+      if (decorateContract && path === "./js/offline-manifest.js") {
+        context.CompactPlayerOfflineManifest = decorateContract(context.CompactPlayerOfflineManifest);
+      }
+    }
   };
   vm.runInContext(await readFile(workerUrl, "utf8"), context);
   return context;
@@ -102,6 +105,88 @@ test("offline startup opens the recorded configuration without a catalog folder 
   assert.deepEqual(requests, [libraryUrl, configUrl]);
   page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   assert.equal(page.audio.src, selected.sourceUrl);
+});
+
+test("a stalled player navigation uses the installed shell and keeps waiting when the shell is absent", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const scope = "https://example.test/listen/";
+  const worker = await workerContext({ caches: new MemoryCacheStorage(),
+    self: { registration: { scope }, addEventListener() {} } });
+  const shell = await worker.caches.open(vm.runInContext("SHELL_CACHE", worker));
+  const page = new Request(scope + "?book=north");
+  Object.defineProperty(page, "mode", { value: "navigate" });
+  const module = new Request(scope + "js/config.js");
+  for (const [request, key, content] of [[page, scope + "index.html", "saved page"], [module, module.url, "saved module"]]) {
+    const server = deferred();
+    let signal;
+    worker.fetch = (_request, options) => { signal = options?.signal; return server.promise; };
+    await shell.put(key, new Response(content));
+    let delivered;
+    const result = worker.networkFirst(request).then((response) => { delivered = response; });
+    t.mock.timers.tick(2999);
+    await settle();
+    assert.equal(delivered, undefined);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.ok(delivered, "the cached response should arrive while the server is still silent");
+    assert.equal(await delivered.text(), content);
+    assert.equal(signal.aborted, true);
+    server.resolve(new Response("late response"));
+    await result;
+    assert.equal(await (await shell.match(key)).text(), content);
+    await shell.delete(key);
+  }
+  const server = deferred();
+  worker.fetch = () => server.promise;
+  const uncached = worker.networkFirst(page);
+  t.mock.timers.tick(60_000);
+  await settle();
+  const live = new Response("slow live page");
+  server.resolve(live);
+  assert.equal(await uncached, live);
+
+  const disk = deferred();
+  const origin = deferred();
+  worker.caches.open = () => disk.promise;
+  worker.fetch = () => origin.promise;
+  const pending = worker.networkFirst(page);
+  t.mock.timers.tick(3000);
+  await settle();
+  const fresh = new Response("live page while cache is opening");
+  origin.resolve(fresh);
+  assert.equal(await pending, fresh);
+  disk.resolve(shell);
+});
+
+test("navigation preserves missing-page responses and returns cached content only for its own routes", async () => {
+  const scope = "https://example.test/listen/";
+  const caches = new MemoryCacheStorage();
+  const worker = await workerContext({ caches, self: { registration: { scope }, addEventListener() {} } });
+  const shell = await caches.open(vm.runInContext("SHELL_CACHE", worker));
+  await shell.put(scope + "index.html", new Response("player page"));
+  await shell.put(scope + "js/config.js", new Response("player module"));
+  const manifest = { ...selection(), schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved-book",
+    totalSize: 10, chunkSize: 10, totalChunks: 1, completed: [0] };
+  const manager = new OfflineManager({ baseUrl: scope, cacheStorage: caches, navigatorObject: navigatorStub() });
+  await manager.writeRecord("active", manifest);
+  const saved = await caches.open(manifest.cacheName);
+  await saved.put(scope + "media/book/cover.jpg", new Response("saved cover"));
+  const navigate = (path) => {
+    const request = new Request(scope + path);
+    Object.defineProperties(request, { mode: { value: "navigate" }, destination: { value: "document" } });
+    return worker.networkFirst(request);
+  };
+  const missing = new Response("Page not found", { status: 404 });
+  worker.fetch = async () => missing;
+  const response = await navigate("missing-document.html");
+  assert.equal(response.status, 404);
+  assert.equal(await response.text(), "Page not found");
+  assert.equal(await (await navigate("?book=north")).text(), "player page");
+  assert.equal(await (await navigate("index.html?book=south")).text(), "player page");
+  assert.equal(await (await navigate("js/config.js")).text(), "player module");
+  assert.equal(await (await navigate("media/book/cover.jpg")).text(), "saved cover");
+  worker.fetch = async () => { throw new TypeError("Offline"); };
+  await assert.rejects(navigate("missing-document.html"), /Offline/);
 });
 
 test("offline shell requests succeed while book metadata is unreadable", async () => {
@@ -772,6 +857,39 @@ test("service worker range parser handles open and suffix requests", async () =>
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [3, 4, 5, 6, 7]);
 });
 
+test("offline If-Range serves partial audio only when the saved edition matches", async () => {
+  const worker = await workerContext();
+  const url = "https://example.test/book.m4b";
+  const modified = "Wed, 04 Mar 2026 11:00:00 GMT";
+  const manifest = { downloadId: "one", totalSize: 6, chunkSize: 3, mime: "audio/mp4",
+    etag: '"edition-one"', lastModified: modified, responseDate: "Wed, 04 Mar 2026 12:00:00 GMT" };
+  const cache = { match: async (url) => new Response(url.endsWith("/0") ? Uint8Array.of(0, 1, 2) : Uint8Array.of(3, 4, 5)) };
+  for (const [condition, saved, expected] of [
+    ['"edition-two"', manifest, 200], ['"edition-one"', manifest, 206],
+    ['W/"edition-one"', manifest, 200], ['W/"edition-one"', { ...manifest, etag: 'W/"edition-one"' }, 200],
+    [modified, manifest, 206], [modified, { ...manifest, etag: "" }, 206],
+    [manifest.responseDate, manifest, 200], [modified, { ...manifest, responseDate: modified }, 200],
+    ['"edition-one"', { ...manifest, etag: undefined, responseDate: undefined }, 200],
+    ["", manifest, 200], [null, manifest, 206],
+  ]) {
+    const headers = { Range: "bytes=2-3" };
+    if (condition !== null) headers["If-Range"] = condition;
+    const response = await worker.cachedMediaResponse(new Request(url, { headers }), saved, cache);
+    assert.equal(response.status, expected, String(condition));
+    assert.equal(response.headers.get("content-range"), expected === 206 ? "bytes 2-3/6" : null);
+    assert.equal(response.headers.get("content-length"), expected === 206 ? "2" : "6");
+    assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], expected === 206 ? [2, 3] : [0, 1, 2, 3, 4, 5]);
+  }
+  const head = await worker.cachedMediaResponse(new Request(url, { method: "HEAD" }), manifest, cache);
+  assert.equal(head.headers.get("etag"), manifest.etag);
+  assert.equal(head.headers.get("last-modified"), modified);
+  const unsatisfied = (version) => worker.cachedMediaResponse(new Request(url, {
+    headers: { Range: "bytes=20-", "If-Range": version },
+  }), manifest, cache);
+  assert.equal((await unsatisfied('"edition-two"')).status, 200);
+  assert.equal((await unsatisfied('"edition-one"')).status, 416);
+});
+
 test("canceling an offline range stops reads at the last requested chunk", async () => {
   const scope = "https://example.test/";
   const context = await workerContext({ self: { registration: { scope }, addEventListener() {} }, URL, Request, Response, ReadableStream });
@@ -811,6 +929,21 @@ test("canceling an offline range stops reads at the last requested chunk", async
   assert.equal(pastEnd.status, 416);
   assert.equal(pastEnd.headers.get("content-range"), "bytes */12");
   assert.equal(reads.length, readCount);
+});
+
+test("a successful network response wins and explicit download requests bypass the worker", async () => {
+  const events = {};
+  const origin = "https://example.test";
+  const live = new Response("live catalog");
+  const worker = await workerContext({
+    self: { location: { origin }, registration: { scope: origin + "/" },
+      addEventListener(name, handler) { events[name] = handler; } },
+    fetch: async () => live,
+    caches: { open: assert.fail },
+  });
+  const url = origin + "/media/library.json";
+  assert.equal(await worker.networkFirst(new Request(url)), live);
+  events.fetch({ request: new Request(url, { headers: { "x-compact-player-download": "1" } }), respondWith: assert.fail });
 });
 
 test("online audio ranges use the native browser network path", async () => {
@@ -859,11 +992,11 @@ test("offline audio still serves downloaded ranges through the worker", async ()
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [7, 8]);
 });
 
-async function savedBookFixture() {
+async function savedBookFixture(filename = "book.json") {
   const baseUrl = "https://example.test/";
   const config = { id: "book", defaultLanguage: "en", title: { en: "Saved book" },
     languages: { en: { sources: { opus: { 64: "audio.webm" }, mp3: { 64: "alternate.mp3" } } } } };
-  const configUrl = new URL("media/book/book.json", baseUrl).href;
+  const configUrl = new URL("media/book/" + filename, baseUrl).href;
   const selected = { ...selection(), sourceUrl: new URL("audio.webm", configUrl).href,
     assets: [{ url: configUrl, required: true }] };
   const audioFetch = rangedFetch(10);
@@ -914,6 +1047,66 @@ test("a downloaded catalog remains usable and retries on reconnection or when Op
     assert.equal(catalogs, 3);
     assert.equal(pauses.mock.callCount(), 0);
     assert.equal(page.audio.src, selected.sourceUrl);
+  }
+});
+
+test("a downloaded book configuration is revalidated on reconnect or reselection without interrupting playback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  for (const [filename, trigger] of [["book.json", "online"], ["episode.json", "selection"]]) {
+    const { config, configUrl, options, selected } = await savedBookFixture(filename);
+    const navigator = { ...navigatorStub(), language: "en", onLine: filename === "book.json" };
+    const revised = { ...config, title: { en: "Revised book" }, cacheVersion: 2,
+      languages: { en: { sources: { opus: { 64: "new.webm" } } } } };
+    const reads = [];
+    let state = "unavailable";
+    const worker = await workerContext({ caches: options.cacheStorage, fetch(request) {
+      if (request.url.endsWith("/library.json")) {
+        if (!navigator.onLine) return new Response(null, { status: 404 });
+        return Response.json({ books: [{ id: "book" }, { id: "other" }], ui: { onboardingEnabled: false } });
+      }
+      if (request.url.endsWith("/other/book.json")) return Response.json({ ...config, id: "other", title: { en: "Other" } });
+      if (request.url !== configUrl) return new Response(null, { status: 404 });
+      reads.push(request.cache);
+      if (state === "unavailable") return new Response(null, { status: 503 });
+      if (state === "maintenance") return new Response("Maintenance");
+      return Response.json(revised);
+    } });
+    const page = await openPlayerPage(config, assert.fail, new Map(), {
+      navigator, caches: options.cacheStorage,
+      fetch: (path, init) => worker.networkFirst(new Request(path, init)),
+    });
+    await page.ready;
+    const title = () => page.elements.get("bookTitle").textContent;
+    const select = page.elements.get("bookSelect");
+    const choose = async (id) => { select.value = id; select.dispatchEvent(new Event("change")); await settle(); };
+    assert.equal(title(), "Saved book");
+    page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+    const pauses = t.mock.method(page.audio, "pause");
+    state = "maintenance";
+    navigator.onLine = true;
+    page.window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.deepEqual(reads, ["default", "no-cache"]);
+    assert.equal(title(), "Saved book");
+    state = "revised";
+    if (trigger === "online") {
+      page.window.dispatchEvent(new Event("online"));
+      await settle();
+      assert.equal(select.children.find((option) => option.value === "book").textContent, "Revised book");
+    }
+    assert.equal(pauses.mock.callCount(), 0);
+    assert.equal(page.audio.src, selected.sourceUrl);
+    assert.equal(title(), "Saved book");
+    await choose("other");
+    assert.equal(title(), "Other");
+    await choose("book");
+    assert.equal(title(), "Revised book");
+    page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+    assert.equal(page.audio.src, new URL("new.webm", configUrl).href);
+    page.window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.deepEqual(reads, ["default", "no-cache", "no-cache"]);
   }
 });
 

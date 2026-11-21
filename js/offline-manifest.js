@@ -21,6 +21,18 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     return /^audio\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(type) ? type : "";
   }
 
+  function strongETag(value) {
+    return typeof value === "string" && /^"[\x21\x23-\x7e\x80-\xff]*"$/.test(value) ? value : "";
+  }
+
+  function strongLastModified({ lastModified, responseDate }) {
+    const modified = new Date(lastModified);
+    const date = new Date(responseDate);
+    if (modified.toUTCString() !== lastModified || date.toUTCString() !== responseDate) return "";
+    // Allow for clock skew when using a modification time as a strong validator.
+    return date - modified >= 60_000 ? lastModified : "";
+  }
+
   function validManifest(value, requiredStatus = "") {
     if (!value || value.schemaVersion !== schemaVersion) return false;
     if (!value.downloadId || !value.cacheName || !value.episodeId || !value.languageCode || !value.sourceId || !value.sourceUrl || !audioMimeType(value.mime)) return false;
@@ -50,7 +62,7 @@ globalThis.CompactPlayerOfflineManifest = (() => {
   }
 
   return Object.freeze({
-    schemaVersion, audioMimeType, validManifest, chunkByteLength,
+    schemaVersion, audioMimeType, strongETag, strongLastModified, validManifest, chunkByteLength,
     metaCache: "compact-player-offline-meta-v1",
     downloadHeader: "x-compact-player-download",
     versionHeader, versionHeaderValue, checkResponseVersion,

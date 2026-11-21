@@ -24,7 +24,11 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/availability-session.js` schedules probes for the selected language after chapter loading and records successful playback.
 - `js/chapters.js`: cached chapter requests and WebVTT loading.
 - `js/mp4-chapters.js`: bounded Range-based MP4 chapter and cover-art parsing.
+- `js/mp4-atoms.js` traverses MP4 boxes. `js/mp4-metadata.js` shares bounded metadata reads between chapter and cover consumers. It uses the same Content-Range parser as offline transfers in `js/http-range.js`.
 - `js/storage.js`: guarded localStorage access, migrations, progress, preferences, chapter text, and availability cache.
+- `js/chapter-cache.js` and `js/availability-cache.js` own their saved record formats and use the installation-scoped storage operations provided by `PlayerStorage`.
+- `js/chapter-panel.js` manages the chapter list and native track. `js/offline-panel.js` renders download status and handles download actions.
+- `js/offline-book-store.js` owns Cache Storage writes for books. `js/offline-selection.js` checks book and audio identity. The classic worker loads `js/offline-media-response.js` to stream saved chunks.
 - `js/vtt.js`: safe WebVTT chapter parsing.
 - `js/dialogs.js`: panel and dialog focus behavior, Escape handling, and focus restoration.
 - `js/utils.js`: shared formatting, URL checks, abort errors, and fetch retries.
