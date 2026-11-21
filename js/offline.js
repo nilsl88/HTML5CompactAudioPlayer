@@ -2,48 +2,19 @@ import "./offline-manifest.js";
 import { createAbortError, fetchWithRetry } from "./utils.js";
 import { withOfflineLock } from "./offline-lock.js";
 import { validateOfflineBookConfig } from "./book-config.js";
+import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, checkCanceled, chunkBounds, downloadChunks, inspectAudioRange, sameAudioRevision } from "./offline-transfer.js";
+export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js";
 
 const PREPARATION_TIMEOUT_MS = 20_000;
 const MEBIBYTE = 1024 * 1024;
 
-const { schemaVersion: OFFLINE_SCHEMA_VERSION, audioMimeType, validManifest } = globalThis.CompactPlayerOfflineManifest;
-export { OFFLINE_SCHEMA_VERSION, validManifest };
-export const OFFLINE_CHUNK_SIZE = 8 * MEBIBYTE;
-export const OFFLINE_META_CACHE = "compact-player-offline-meta-v1";
+const {
+  schemaVersion: OFFLINE_SCHEMA_VERSION, metaCache: OFFLINE_META_CACHE, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
+  audioMimeType, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl,
+} = globalThis.CompactPlayerOfflineManifest;
+export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
 export const OFFLINE_BOOK_CACHE_PREFIX = "compact-player-offline-book-v2-";
 const LEGACY_BOOK_CACHE_PREFIX = "compact-player-offline-book-v1-";
-export const OFFLINE_DOWNLOAD_HEADER = "x-compact-player-download";
-
-function asUrl(baseUrl, path) {
-  return new URL(path, baseUrl).href;
-}
-
-export function offlineMetaUrl(baseUrl, type) {
-  return asUrl(baseUrl, `__compact_player_offline__/${type}.json`);
-}
-
-export function offlineManifestUrl(baseUrl) {
-  return asUrl(baseUrl, "__compact_player_offline__/manifest.json");
-}
-
-export function offlineChunkUrl(baseUrl, downloadId, index) {
-  return asUrl(baseUrl, `__compact_player_offline__/chunks/${encodeURIComponent(downloadId)}/${index}`);
-}
-
-export function parseContentRange(value) {
-  const match = String(value || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
-  if (!match) return null;
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  const total = Number(match[3]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(total) || start > end || end >= total) return null;
-  return { start, end, total };
-}
-
-export function chunkBounds(index, totalSize, chunkSize = OFFLINE_CHUNK_SIZE) {
-  const start = index * chunkSize;
-  return { start, end: Math.min(totalSize - 1, start + chunkSize - 1) };
-}
 
 export function completedBytes(manifest) {
   if (!validManifest(manifest)) return 0;
@@ -51,13 +22,6 @@ export function completedBytes(manifest) {
     const { start, end } = chunkBounds(index, manifest.totalSize, manifest.chunkSize);
     return total + Math.max(0, end - start + 1);
   }, 0);
-}
-
-function downloadMimeType(contentType, sourceMime) {
-  const type = contentType?.split(";", 1)[0].trim().toLowerCase();
-  if (!type || type === "application/octet-stream" || type === "binary/octet-stream") return audioMimeType(sourceMime);
-  // Servers can label an audio-only file with its container's video or application type.
-  return audioMimeType(type.replace(/^(?:video|application)\/(mp4|ogg|webm)$/, "audio/$1"));
 }
 
 export function manifestMatchesSelection(manifest, selection) {
@@ -69,27 +33,12 @@ export function manifestMatchesSelection(manifest, selection) {
     && String(manifest.cacheVersion) === String(selection?.cacheVersion);
 }
 
-function rangeValidator({ etag, lastModified, responseDate }) {
-  if (etag) return /^"[\x21\x23-\x7e\x80-\xff]*"$/.test(etag) ? etag : "";
-  const modified = new Date(lastModified);
-  const date = new Date(responseDate);
-  if (modified.toUTCString() !== lastModified || date.toUTCString() !== responseDate) return "";
-  // Allow for clock skew when using a modification time as a strong validator.
-  return date - modified >= 60_000 ? lastModified : "";
-}
-
 function canResume(staging, selection, preflight) {
-  if (!manifestMatchesSelection(staging, selection) || staging.totalSize !== preflight.totalSize) return false;
-  const validator = rangeValidator(preflight);
-  return Boolean(validator && validator === rangeValidator(staging));
+  return manifestMatchesSelection(staging, selection) && sameAudioRevision(staging, preflight);
 }
 
-export class OfflineDownloadError extends Error {
-  constructor(code, message) {
-    super(message);
-    this.name = "OfflineDownloadError";
-    this.code = code;
-  }
+function offlineConflict() {
+  throw new OfflineDownloadError("conflict", "Another tab is updating or has changed the offline book.");
 }
 
 async function responseJson(response) {
@@ -120,10 +69,6 @@ async function withTimeout(promise, timeoutMs) {
       new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Service worker setup timed out")), timeoutMs); }),
     ]);
   } finally { clearTimeout(timer); }
-}
-
-function checkCanceled(signal) {
-  if (signal?.aborted) throw createAbortError("Download canceled");
 }
 
 async function prepareWithTimeout(action, signal) {
@@ -195,12 +140,17 @@ export class OfflineManager {
 
   async init() {
     if (!this.supported) { this.emit(); return this.snapshot(); }
+    const script = new URL("sw.js", this.baseUrl);
+    let controlsPage = false;
     try {
-      await withTimeout(this.navigator.serviceWorker.register(new URL("sw.js", this.baseUrl), { scope: new URL(this.baseUrl).pathname }), 8000);
-      await withTimeout(this.navigator.serviceWorker.ready, 8000);
+      const workers = this.navigator.serviceWorker;
+      controlsPage = workers.controller?.scriptURL === script.href;
+      await withTimeout(workers.register(script, { scope: new URL(this.baseUrl).pathname }), 8000);
+      await withTimeout(workers.ready, 8000);
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not register the offline player.", error);
       this.supported = false;
+      if (controlsPage) await this.readPublishedBook();
       this.emit();
       return this.snapshot();
     }
@@ -238,9 +188,15 @@ export class OfflineManager {
     if (await this.ownsBookCache(name)) await this.cacheStorage.delete(name);
   }
 
-  async readRecord(type) {
+  async readRecord(type, includeUnpublished = false) {
     const response = await this.cacheStorage.match(offlineMetaUrl(this.baseUrl, type), { cacheName: OFFLINE_META_CACHE });
     const record = await responseJson(response);
+    if (type === "active" && includeUnpublished) {
+      const saved = record?.manifest;
+      if (saved?.status === "removed" && typeof saved.downloadId === "string" && saved.downloadId) return saved;
+      if (saved?.status === "needs-config" && saved.cacheName === record.cacheName
+        && validManifest({ ...saved, status: "ready" }, "ready")) return saved;
+    }
     const status = type === "active" ? "ready" : "downloading";
     return validManifest(record?.manifest, status) && record.cacheName === record.manifest.cacheName ? record.manifest : null;
   }
@@ -277,25 +233,28 @@ export class OfflineManager {
   }
 
   async readRecords() {
-    this.active = await this.readRecord("active");
+    const saved = await this.readRecord("active", true);
+    this.active = saved?.status === "ready" ? saved : null;
+    this.repairable = saved?.status === "needs-config" ? saved : null;
     this.staging = await this.readRecord("staging");
-    if (this.staging?.downloadId === this.active?.downloadId) this.staging = null;
+    if (this.staging?.downloadId === saved?.downloadId) this.staging = null;
+    return saved;
   }
 
   recordIds() {
-    return { activeId: this.active?.downloadId, stagingId: this.staging?.downloadId };
+    return { activeId: this.active?.downloadId, repairableId: this.repairable?.downloadId, stagingId: this.staging?.downloadId };
   }
 
   updateIfCurrent(expected, action) {
-    const conflict = () => { throw new OfflineDownloadError("conflict", "Another tab is updating or has changed the offline book."); };
     return this.withLock(async () => {
       await this.readRecords();
-      if (this.active?.downloadId !== expected.activeId || this.staging?.downloadId !== expected.stagingId) {
+      if (this.active?.downloadId !== expected.activeId || this.repairable?.downloadId !== expected.repairableId
+        || this.staging?.downloadId !== expected.stagingId) {
         this.emit();
-        return conflict();
+        return offlineConflict();
       }
       return action();
-    }, conflict);
+    }, offlineConflict);
   }
 
   async checkPublishedConfig() {
@@ -305,6 +264,11 @@ export class OfflineManager {
       if (error.code === "config") this.active = null;
       else console.warn("[CompactAudioPlayer] Could not read the published book configuration.", error);
     }
+  }
+
+  async readPublishedBook() {
+    try { this.active = await this.readRecord("active"); await this.checkPublishedConfig(); }
+    catch (error) { console.warn("[CompactAudioPlayer] Could not read the published offline book.", error); }
   }
 
   async refresh() {
@@ -319,17 +283,16 @@ export class OfflineManager {
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not update offline storage. Reading the published book.", error);
       this.supported = false;
-      try { this.active = await this.readRecord("active"); await this.checkPublishedConfig(); }
-      catch (readError) { console.warn("[CompactAudioPlayer] Could not read the published offline book.", readError); }
+      await this.readPublishedBook();
       this.emit();
       return this.snapshot();
     }
   }
 
   async refreshLocked() {
-    let bookNames, manifests;
+    let bookNames, manifests, saved;
     try {
-      await this.readRecords();
+      saved = await this.readRecords();
       bookNames = await this.ownedBookCacheNames();
       manifests = (await Promise.all(bookNames.map((name) => this.readBookManifest(name)))).filter(Boolean);
     } catch (error) {
@@ -338,16 +301,19 @@ export class OfflineManager {
       this.emit();
       return this.snapshot();
     }
+    // After an explicit removal only a later staging download can become the saved book.
+    if (saved?.status === "removed") manifests = manifests.filter((manifest) =>
+      manifest.status === "downloading" || manifest.downloadId === this.staging?.downloadId);
     const newest = (status, published, by) => {
       const candidates = manifests.filter((manifest) => manifest.status === status);
       return candidates.find((manifest) => manifest.cacheName === published?.cacheName)
         || candidates.sort((a, b) => b[by] - a[by])[0] || null;
     };
-    const damaged = newest("needs-config", this.active, "downloadedAt");
-    const publishedNeedsConfig = damaged && damaged.cacheName === this.active?.cacheName;
-    const active = publishedNeedsConfig ? null : newest("ready", this.active, "downloadedAt");
+    const damaged = newest("needs-config", saved, "downloadedAt");
+    const publishedNeedsConfig = damaged && damaged.cacheName === saved?.cacheName;
+    const active = publishedNeedsConfig ? null : newest("ready", saved, "downloadedAt");
     const staging = newest("downloading", this.staging, "createdAt");
-    if (this.active || active) await this.writeRecord("active", active);
+    if (this.active || this.repairable || active || damaged) await this.writeRecord("active", active || damaged);
     if (this.staging || staging) await this.writeRecord("staging", staging);
     this.active = active;
     this.repairable = active ? null : damaged;
@@ -358,6 +324,7 @@ export class OfflineManager {
       for (const name of bookNames) {
         if (!retained.has(name)) await this.cacheStorage.delete(name);
       }
+      if (saved?.status === "removed" && !active && !damaged) await this.writeRecord("active", null);
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not finish offline cleanup. The next visit will retry.", error);
     }
@@ -376,28 +343,9 @@ export class OfflineManager {
     if (this.navigator.onLine === false) throw new OfflineDownloadError("offline", "Connect to the internet before downloading.");
     const sourceUrl = new URL(selection.sourceUrl);
     if (sourceUrl.origin !== new URL(this.baseUrl).origin) throw new OfflineDownloadError("cross-origin", "Offline downloads require audio from this site.");
-    const response = await this.fetchImpl(sourceUrl.href, {
-      method: "GET",
-      headers: { Range: "bytes=0-0", [OFFLINE_DOWNLOAD_HEADER]: "1" },
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-    });
-    const range = parseContentRange(response.headers.get("content-range"));
-    try { await response.body?.cancel(); } catch {}
-    if (response.status !== 206 || !range || range.start !== 0 || range.end !== 0) {
-      throw new OfflineDownloadError("range", "The audio server does not support offline downloads.");
-    }
-    const mime = downloadMimeType(response.headers.get("content-type"), selection.mime);
-    if (!mime) throw new OfflineDownloadError("mime", "The download has no valid audio MIME type.");
-    const representation = {
-      totalSize: range.total,
-      etag: response.headers.get("etag") || "",
-      lastModified: response.headers.get("last-modified") || "",
-      responseDate: response.headers.get("date") || "",
-    };
+    const { mime, ...representation } = await inspectAudioRange(this.fetchImpl, sourceUrl.href, selection.mime, signal);
     const stagingMatches = canResume(this.staging, selection, representation);
-    const remainingBytes = range.total - (stagingMatches ? completedBytes(this.staging) : 0);
+    const remainingBytes = representation.totalSize - (stagingMatches ? completedBytes(this.staging) : 0);
     let quota = null;
     let usage = null;
     try {
@@ -405,7 +353,7 @@ export class OfflineManager {
       quota = Number.isFinite(estimate?.quota) ? estimate.quota : null;
       usage = Number.isFinite(estimate?.usage) ? estimate.usage : null;
     } catch {}
-    const reserve = Math.max(16 * MEBIBYTE, Math.ceil(range.total * .05));
+    const reserve = Math.max(16 * MEBIBYTE, Math.ceil(representation.totalSize * .05));
     return {
       ...representation,
       mime,
@@ -504,36 +452,6 @@ export class OfflineManager {
     const text = await response.text();
     try { validateOfflineBookConfig(text, url, this.baseUrl, manifest); }
     catch (error) { throw new OfflineDownloadError("config", error.message); }
-  }
-
-  async fetchChunk(manifest, index, signal) {
-    const { start, end } = chunkBounds(index, manifest.totalSize, manifest.chunkSize);
-    const headers = { Range: `bytes=${start}-${end}`, [OFFLINE_DOWNLOAD_HEADER]: "1" };
-    const validator = rangeValidator(manifest);
-    if (validator) headers["If-Range"] = validator;
-    const response = await this.fetchImpl(manifest.sourceUrl, {
-      headers,
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-    });
-    const range = parseContentRange(response.headers.get("content-range"));
-    const responseVersion = response.headers.get(manifest.etag ? "etag" : "last-modified");
-    if (response.status !== 206 || !range || range.start !== start || range.end !== end || range.total !== manifest.totalSize
-      || (validator && responseVersion !== null && responseVersion !== validator)) {
-      try { await response.body?.cancel(); } catch {}
-      throw new OfflineDownloadError("changed", "The audio file changed during the download.");
-    }
-    const data = await response.arrayBuffer();
-    if (data.byteLength !== end - start + 1) throw new OfflineDownloadError("incomplete", "The audio download was incomplete.");
-    return new Response(data, {
-      headers: {
-        "content-type": manifest.mime,
-        "content-length": String(data.byteLength),
-        "x-compact-player-start": String(start),
-        "x-compact-player-end": String(end),
-      },
-    });
   }
 
   runOperation(action) {
@@ -641,11 +559,7 @@ export class OfflineManager {
       await this.verifyCachedConfig(manifest, config?.url);
       const completed = new Set(manifest.completed);
       this.setPhase("downloading", completedBytes(manifest) / manifest.totalSize);
-      for (let index = 0; index < manifest.totalChunks; index += 1) {
-        if (completed.has(index)) continue;
-        await waitForPriority(signal);
-        checkCanceled(signal);
-        const chunk = await this.fetchChunk(manifest, index, signal);
+      for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
         await cache.put(offlineChunkUrl(this.baseUrl, manifest.downloadId, index), chunk);
         completed.add(index);
         manifest = { ...manifest, completed: [...completed].sort((a, b) => a - b) };
@@ -706,12 +620,8 @@ export class OfflineManager {
     await this.updateIfCurrent(this.recordIds(), async () => {
       const saved = this.active || this.repairable;
       if (!saved) return;
-      // Clear leftovers from earlier replacements before removing the published record.
-      for (const name of await this.ownedBookCacheNames()) {
-        if (name !== saved.cacheName && name !== this.staging?.cacheName) await this.cacheStorage.delete(name);
-      }
+      await this.writeRecord("active", { status: "removed", downloadId: saved.downloadId });
       await this.deleteOwnedBookCache(saved.cacheName);
-      await this.writeRecord("active", null);
       this.active = null;
       this.repairable = null;
       this.setPhase(this.staging ? "paused" : "idle", this.staging ? completedBytes(this.staging) / this.staging.totalSize : 0);
@@ -732,6 +642,6 @@ export class OfflineManager {
       this.repairable = null;
       this.staging = null;
       this.setPhase("idle", 0);
-    });
+    }, offlineConflict);
   }
 }

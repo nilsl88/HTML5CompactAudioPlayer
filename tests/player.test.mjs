@@ -320,3 +320,145 @@ test("switching language loads WebVTT while the new audio play request is still 
   await settle();
   assert.equal(calls.length, 1);
 });
+
+test("reconnection restores a missing catalog without interrupting the active book", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const navigator = { onLine: false, language: "en" };
+  const counts = { library: 0, book: 0 };
+  const { window, elements, audio } = await openPlayerPage(t, book, assert.fail, new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]), {
+    navigator, location: new URL("https://example.test/?book=sample"),
+    fetch: async (url) => {
+      if (url.endsWith("/library.json")) {
+        counts.library++;
+        if (!navigator.onLine) return new Response(null, { status: 404 });
+        return Response.json({ books: [{ id: book.id }, { id: "another" }] });
+      }
+      counts.book++;
+      if (url.endsWith("/another/book.json")) return Response.json({ ...book, id: "another", title: { en: "Another book" } });
+      return Response.json(book);
+    },
+  });
+  assert.equal(elements.get("bookRow").hidden, true);
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  audio.dispatchEvent(new Event("playing"));
+  const pause = t.mock.method(audio, "pause");
+  const source = audio.src;
+  navigator.onLine = true;
+  window.dispatchEvent(new Event("online"));
+  window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(elements.get("bookRow").hidden, false);
+  assert.deepEqual(elements.get("bookSelect").children.map((entry) => entry.value), [book.id, "another"]);
+  assert.equal(elements.get("bookSelect").children.find((option) => option.selected)?.value, book.id);
+  assert.equal(audio.src, source);
+  assert.equal(pause.mock.callCount(), 0);
+  assert.deepEqual(counts, { library: 2, book: 1 });
+  const selector = elements.get("bookSelect");
+  selector.value = "another";
+  selector.dispatchEvent(new Event("change"));
+  await settle();
+  assert.equal(elements.get("bookTitle").textContent, "Another book");
+});
+
+test("chapter gaps clear the active title and still allow previous-chapter navigation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const vtt = chapterText + "\n\n00:20.000 --> 00:30.000\nFinale";
+  const { elements, audio } = await openPlayerPage(t, { ...book, duration: 60,
+    languages: { en: { ...book.languages.en, chapters: "en.vtt" } } }, () => new Response(vtt));
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  audio.duration = 60;
+  audio.dispatchEvent(new Event("loadedmetadata"));
+  audio.dispatchEvent(new Event("playing"));
+  for (const [position, title] of [[5, "Introduction"], [10, ""], [15, ""], [20, "Finale"], [30, ""]]) {
+    audio.currentTime = position;
+    audio.dispatchEvent(new Event("timeupdate"));
+    assert.equal(elements.get("bookMeta").textContent.match(/Introduction|Finale/)?.[0] || "", title);
+  }
+  audio.currentTime = 15;
+  audio.dispatchEvent(new Event("timeupdate"));
+  elements.get("sleepList").children[0].dispatchEvent(new Event("click"));
+  await settle();
+  assert.match(elements.get("statusAnnouncer").textContent, /unavailable/i);
+  elements.get("prevChapterBtn").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(audio.currentTime, 0);
+});
+
+test("reconnection opens the only catalog book after offline startup failed", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const navigator = { onLine: false, language: "en" };
+  const requests = [];
+  const { window, elements, audio } = await openPlayerPage(t, book, assert.fail, new Map(), {
+    navigator, fetch: async (url) => {
+      if (!navigator.onLine) return new Response(null, { status: 404 });
+      requests.push(new URL(url).pathname);
+      return url.endsWith("/library.json")
+        ? Response.json({ books: [{ id: book.id, folder: "edition" }], ui: { onboardingEnabled: false } })
+        : Response.json(book);
+    },
+  });
+  const play = elements.get("playPauseBtn");
+  assert.equal(play.disabled, true);
+  navigator.onLine = true;
+  window.dispatchEvent(new Event("online"));
+  window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.deepEqual(requests, ["/media/library.json", "/media/edition/book.json"]);
+  assert.equal(elements.get("bookTitle").textContent, book.title.en);
+  assert.equal(play.disabled, false);
+  assert.ok(!audio.src);
+  play.dispatchEvent(new Event("click"));
+  assert.equal(audio.src, "https://example.test/media/edition/sample.m4b");
+});
+
+test("invalid cached and downloaded chapter text remains retryable until valid WebVTT arrives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  t.mock.method(console, "error", () => {});
+  const key = "compactPlayer@%2F:compactPlayer:chapters:sample:en:1";
+  const url = "https://example.test/media/sample/en.vtt";
+  const saved = new Map([[key, JSON.stringify({ kind: "vtt", url, text: "<html>Old error</html>" })]]);
+  const texts = ["<html>Temporary error</html>", "<html>Still unavailable</html>", "WEBVTT\n"];
+  let calls = 0;
+  const { window, elements } = await openPlayerPage(t, { ...book, languages: {
+    en: { ...book.languages.en, chapterSource: "vtt", chapters: "en.vtt" },
+  } }, (requestedUrl, options) => {
+    assert.equal(requestedUrl, url);
+    assert.equal(options.cache, "no-cache");
+    return new Response(texts[calls++]);
+  }, saved);
+  assert.equal(calls, 1);
+  const failure = elements.get("chaptersList").children[0];
+  assert.match(failure.className, /chapter-load-error/);
+  assert.ok(!saved.get(key)?.includes("Temporary error"));
+  failure.children[1].dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(calls, 2);
+  window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(calls, 3);
+  assert.equal(JSON.parse(saved.get(key)).text, "WEBVTT\n");
+  window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(calls, 3);
+  assert.equal(elements.get("nextChapterBtn").disabled, true);
+});
+
+test("a successfully loaded empty catalog stays empty on reconnect", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const navigator = { onLine: false, language: "en" };
+  let catalogs = 0;
+  const { window, elements } = await openPlayerPage(t, book, assert.fail, new Map(), {
+    navigator, location: new URL("https://example.test/?book=sample"), fetch: async (url) => {
+      if (!url.endsWith("/library.json")) return Response.json(book);
+      catalogs++;
+      return Response.json({ books: [], episodes: [{ id: "old" }], ui: { onboardingEnabled: false } });
+    },
+  });
+  navigator.onLine = true;
+  window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(catalogs, 1);
+  assert.equal(elements.get("bookRow").hidden, true);
+});

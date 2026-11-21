@@ -59,7 +59,7 @@ function navigatorStub(estimate = { quota: 1024 ** 3, usage: 0 }) {
   };
 }
 
-async function workerContext(globals = {}) {
+async function workerContext(globals = {}, decorateContract) {
   const context = vm.createContext({
     self: { registration: { scope: "https://example.test/" }, addEventListener() {} },
     URL, Request, Response, ReadableStream, ...globals,
@@ -68,6 +68,7 @@ async function workerContext(globals = {}) {
   context.importScripts = (path) => {
     assert.equal(path, "./js/offline-manifest.js");
     vm.runInContext(readFileSync(new URL(path, workerUrl), "utf8"), context);
+    if (decorateContract) context.CompactPlayerOfflineManifest = decorateContract(context.CompactPlayerOfflineManifest);
   };
   vm.runInContext(await readFile(workerUrl, "utf8"), context);
   return context;
@@ -819,6 +820,68 @@ async function savedBookFixture() {
   return { manager, saved, selected, options, config, configUrl };
 }
 
+test("a stale tab cannot delete a replacement that also needs its configuration repaired", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { manager, options, selected, saved, configUrl } = await savedBookFixture();
+  const caches = options.cacheStorage;
+  await (await caches.open(saved.cacheName)).delete(configUrl);
+  await manager.refresh();
+  assert.equal(manager.repairable.downloadId, saved.downloadId);
+
+  const writer = new OfflineManager(options);
+  await writer.init();
+  const remove = caches.delete.bind(caches);
+  const blocked = t.mock.method(caches, "delete", async (name) => {
+    if (name === saved.cacheName) throw new Error("Previous cache cleanup failed");
+    return remove(name);
+  });
+  const replacement = await writer.start({ ...selected, episodeId: "second", configBookId: "book" });
+  await (await caches.open(replacement.cacheName)).delete(configUrl);
+  await writer.refresh();
+  assert.equal(writer.repairable.downloadId, replacement.downloadId);
+  await assert.rejects(manager.removeActive(), { code: "conflict" });
+  const chunk = offlineChunkUrl(options.baseUrl, replacement.downloadId, 0);
+  assert.ok(await caches.match(chunk, { cacheName: replacement.cacheName }));
+  blocked.mock.restore();
+  await writer.removeActive();
+  assert.ok(!(await caches.keys()).includes(replacement.cacheName));
+  assert.ok((await caches.keys()).includes(saved.cacheName));
+  await writer.refresh();
+  assert.equal(writer.repairable, null);
+  assert.ok(!(await caches.keys()).includes(saved.cacheName));
+});
+
+test("a controlling player worker keeps its saved book readable when registration fails", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { options, saved, configUrl } = await savedBookFixture();
+  for (const script of ["other/sw.js", "sw.js"]) {
+    const navigatorObject = { ...navigatorStub(), onLine: false, serviceWorker: {
+      controller: { scriptURL: new URL(script, options.baseUrl).href },
+      register: async () => { throw new TypeError("Registration unavailable"); },
+    } };
+    const manager = new OfflineManager({ ...options, navigatorObject });
+    await manager.init();
+    assert.equal(manager.active?.downloadId, script === "sw.js" ? saved.downloadId : undefined);
+    if (script === "sw.js") assert.equal(manager.downloadedConfig.url, configUrl);
+  }
+});
+
+test("an unreadable cache preserves the server response and the original network failure", async () => {
+  let reads = 0;
+  const forbidden = new Response("Forbidden", { status: 403 });
+  const offline = new TypeError("Offline");
+  const worker = await workerContext({
+    fetch: async () => forbidden,
+    caches: { open: async () => { reads++; throw new Error("Unreadable cache"); } },
+  });
+  const request = new Request("https://example.test/media/book/book.json");
+  assert.equal(await worker.networkFirst(request), forbidden);
+  assert.equal(reads, 1);
+  worker.fetch = async () => { throw offline; };
+  await assert.rejects(worker.networkFirst(request), (error) => error === offline);
+  assert.equal(reads, 2);
+});
+
 test("an offline startup retains online alternative sources after reconnecting", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   t.mock.method(console, "error", () => {});
@@ -1005,4 +1068,130 @@ test("canceling a resume during the range check discards only the partial downlo
   assert.equal(await manager.readRecord("staging"), null);
   assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
   assert.ok(!(await options.cacheStorage.keys()).includes(partial));
+});
+
+test("a non-audio chunk after a valid probe preserves the published book", async () => {
+  const { manager, saved, options } = await savedBookFixture();
+  const next = { ...selection(), episodeId: "next" };
+  for (const mime of ["text/html", "audio/mpeg"]) {
+    manager.fetchImpl = async (url, init) => {
+      const response = await rangedFetch(10, { contentType: "audio/webm" })(url, init);
+      if (init.headers.Range !== "bytes=0-0") response.headers.set("content-type", mime);
+      return response;
+    };
+    await assert.rejects(manager.start(next), { code: "mime" });
+    assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+    assert.ok((await options.cacheStorage.keys()).includes(saved.cacheName));
+  }
+});
+
+test("an unversioned download stores all chunks from one audio response", async () => {
+  const size = 8 * 1024 * 1024;
+  const total = size + 4;
+  const requests = [];
+  const cacheStorage = new MemoryCacheStorage();
+  const fetchImpl = async (_url, { headers }) => {
+    const [start, end] = headers.Range.slice(6).split("-").map(Number);
+    requests.push(headers.Range);
+    const revision = requests.length;
+    const bytes = new Uint8Array(end - start + 1).fill(revision);
+    const body = new ReadableStream({ start(controller) {
+      controller.enqueue(bytes.subarray(0, 3));
+      controller.enqueue(bytes.subarray(3));
+      controller.close();
+    } });
+    return new Response(body, { status: 206, headers: { "content-range": `bytes ${start}-${end}/${total}`, "content-type": "audio/webm" } });
+  };
+  const manager = new OfflineManager({ baseUrl: "https://example.test/", cacheStorage, navigatorObject: navigatorStub(), fetchImpl });
+  await manager.init();
+  const saved = await manager.start(selection(total));
+  const cache = await cacheStorage.open(saved.cacheName);
+  for (const [index, length] of [size, 4].entries()) {
+    const chunk = await cache.match(offlineChunkUrl(manager.baseUrl, saved.downloadId, index));
+    const bytes = new Uint8Array(await chunk.arrayBuffer());
+    assert.equal(bytes.length, length);
+    assert.ok(bytes.every((byte) => byte === 2));
+  }
+  assert.deepEqual(requests, ["bytes=0-0", `bytes=0-${total - 1}`]);
+});
+
+test("reset offers an immediate retry while another tab holds the offline lock", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const { manager, options, saved, config } = await savedBookFixture();
+  const location = Object.assign(new URL(options.baseUrl), { reload: t.mock.fn() });
+  const local = new Map();
+  const { elements } = await openPlayerPage(t, config, assert.fail, local,
+    { navigator: options.navigatorObject, caches: options.cacheStorage, location });
+  let release;
+  const held = manager.withLock(() => new Promise((resolve) => { release = resolve; }));
+  try {
+    elements.get("resetOk").dispatchEvent(new Event("click"));
+    await settle();
+    assert.equal(elements.get("resetOk").disabled, false);
+    assert.match(elements.get("resetBody").children[0].textContent, /another tab/i);
+    assert.ok((await options.cacheStorage.keys()).includes(saved.cacheName));
+  } finally { release(); await held; }
+  const epoch = [...local.entries()].find(([key]) => key.endsWith(":reset"));
+  elements.get("resetOk").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(location.reload.mock.callCount(), 1);
+  assert.equal(local.get(epoch[0]), epoch[1]);
+  assert.ok(!(await options.cacheStorage.keys()).includes(saved.cacheName));
+});
+
+test("the worker reads the player's shared storage addresses in a nested installation", async (t) => {
+  const scope = "https://example.test/books/listen/";
+  const cacheStorage = new MemoryCacheStorage();
+  const manager = new OfflineManager({ baseUrl: scope, cacheStorage, navigatorObject: navigatorStub(), fetchImpl: rangedFetch(10) });
+  const saved = await manager.start(selection());
+  const contract = globalThis.CompactPlayerOfflineManifest;
+  assert.equal(offlineChunkUrl, contract.offlineChunkUrl);
+  assert.equal(offlineManifestUrl, contract.offlineManifestUrl);
+  assert.equal(contract.offlineMetaUrl(scope, "active"), scope + "__compact_player_offline__/active.json");
+  assert.equal(contract.offlineChunkUrl(scope, "a/b", 1), scope + "__compact_player_offline__/chunks/a%2Fb/1");
+  const metaUrl = t.mock.fn(contract.offlineMetaUrl);
+  const chunkUrl = t.mock.fn(contract.offlineChunkUrl);
+  const worker = await workerContext({ caches: cacheStorage, self: { registration: { scope }, addEventListener() {} } },
+    (format) => ({ ...format, offlineMetaUrl: metaUrl, offlineChunkUrl: chunkUrl }));
+  assert.equal((await worker.activeManifest()).downloadId, saved.downloadId);
+  const response = await worker.cachedBookResponse(new Request(saved.sourceUrl, { headers: { range: "bytes=2-4" } }));
+  assert.equal(response.status, 206);
+  assert.equal((await response.arrayBuffer()).byteLength, 3);
+  assert.deepEqual([...metaUrl.mock.calls[0].arguments], [scope, "active"]);
+  assert.deepEqual([...chunkUrl.mock.calls[0].arguments], [scope, saved.downloadId, 0]);
+});
+
+test("an IndexedDB lock request queued behind an upgrade cannot reset the book later", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { manager, options, saved } = await savedBookFixture();
+  const request = { transaction: { abort: t.mock.fn() }, result: { close: t.mock.fn() } };
+  const original = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { open: () => request } });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "indexedDB", original);
+    else delete globalThis.indexedDB;
+  });
+  manager.navigator.locks = undefined;
+  const expected = assert.rejects(manager.reset(), { code: "conflict" });
+  await settle();
+  t.mock.timers.tick(1000);
+  await expected;
+  request.onupgradeneeded();
+  assert.equal(request.transaction.abort.mock.callCount(), 1);
+  assert.ok((await options.cacheStorage.keys()).includes(saved.cacheName));
+});
+
+test("a truncated or oversized unversioned response cannot replace a playable download", async () => {
+  const { manager, saved } = await savedBookFixture();
+  for (const actualSize of [9, 11]) {
+    manager.fetchImpl = async (_url, { headers }) => {
+      const probe = headers.Range === "bytes=0-0";
+      return new Response(new Uint8Array(probe ? 1 : actualSize), {
+        status: 206, headers: { "content-type": "audio/webm", "content-range": probe ? "bytes 0-0/10" : "bytes 0-9/10" },
+      });
+    };
+    await assert.rejects(manager.start(selection()), { code: "incomplete" });
+    assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+  }
 });

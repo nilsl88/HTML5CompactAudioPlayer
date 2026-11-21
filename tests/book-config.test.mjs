@@ -71,6 +71,34 @@ test("new-only config wins, keeps relative assets, and is reused for titles and 
   assert.deepEqual(configs.library.byId.get("one").title, { en: "Book one" });
 });
 
+test("a recovered catalog replaces cached and pending lookups for a moved book", async () => {
+  for (const pending of [false, true]) {
+    const oldUrl = baseUrl + "media/old/episode.json";
+    const newUrl = baseUrl + "media/new/book.json";
+    const old = deferred();
+    const calls = [];
+    const configs = new BookConfigStore({ documentBaseUrl: baseUrl, library: normalizeLibrary(null),
+      downloadedConfig: { id: "one", url: oldUrl },
+      fetchImpl: (url) => { calls.push(url); return url === oldUrl ? old.promise : json(configuration("new")); },
+    });
+    const initial = configs.load("one");
+    if (!pending) { old.resolve(json(configuration("old"))); await initial; }
+    const library = normalizeLibrary({ books: [{ id: "one", folder: "new" }] });
+    configs.setLibrary(library);
+    const selected = configs.load("one");
+    if (pending) {
+      await flush();
+      old.resolve(json(configuration("old")));
+    }
+    await initial;
+    assert.equal((await selected).configUrl, newUrl);
+    await configs.loadTitles();
+    assert.equal((await configs.load("one")).book.id, "new");
+    assert.deepEqual(library.byId.get("one").title, { en: "Book new" });
+    assert.deepEqual(calls, [oldUrl, newUrl]);
+  }
+});
+
 test("book.json wins when both configurations exist", async () => {
   const calls = [];
   const configs = store(async (url) => {

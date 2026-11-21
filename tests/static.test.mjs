@@ -182,7 +182,8 @@ test("library titles are requested only from Options", async () => {
   assert.match(source, /bookConfigs = new BookConfigStore\(/);
   assert.match(source, /await bookConfigs\.loadTitles\(/);
   assert.match(source, /openPanel\(els\.optionsPanel[\s\S]*?void loadLibraryTitles\(\);/);
-  assert.equal((source.match(/void loadLibraryTitles\(\)/g) || []).length, 1);
+  assert.match(source, /if \(!els\.optionsPanel\.hidden\) void loadLibraryTitles\(\)/);
+  assert.doesNotMatch(source.slice(source.indexOf("async function boot()")), /loadLibraryTitles\(/);
 });
 
 test("onboarding policy belongs to the library", async () => {
@@ -218,11 +219,11 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("player.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
-  assert.match(html, /player\.css\?v=11/);
-  assert.match(html, /player\.js\?v=11/);
-  assert.match(source, /i18n\.js\?v=11/);
-  assert.match(worker, /const SHELL_VERSION = "v11"/);
-  for (const path of ["player.css?v=11", "player.js?v=11", "i18n.js?v=11", "js/book-config.js", "js/offline.js", "js/offline-lock.js", "js/offline-manifest.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
+  assert.match(html, /player\.css\?v=12/);
+  assert.match(html, /player\.js\?v=12/);
+  assert.match(source, /i18n\.js\?v=12/);
+  assert.match(worker, /const SHELL_VERSION = "v12"/);
+  for (const path of ["player.css?v=12", "player.js?v=12", "i18n.js?v=12", "js/book-config.js", "js/offline.js", "js/offline-transfer.js", "js/offline-lock.js", "js/offline-manifest.js", "js/mp4-chapters.js"]) assert.ok(worker.includes(`"./${path}"`), `Missing ${path} from the offline shell`);
 });
 
 test("offline lifecycle is optional and reset clears downloaded media", async () => {
@@ -230,7 +231,7 @@ test("offline lifecycle is optional and reset clears downloaded media", async ()
   assert.match(source, /const offline = new OfflineManager/);
   assert.match(source, /offline\.init\(\)/);
   assert.match(source, /await offline\.reset\(\)/);
-  assert.match(source, /navigator\.onLine === false \? offline\.active\?\.episodeId/);
+  assert.match(source, /const preferDownloaded = startedOffline \|\| navigator\.onLine === false;[\s\S]*?preferDownloaded \? offline\.active\?\.episodeId/);
   assert.match(source, /function saveProgress\(\)\s*{\s*if \(!pendingProgress \|\| resetInProgress\) return;/);
   assert.match(source, /resetInProgress = true;[\s\S]*?clearTimeout\(progressTimer\);[\s\S]*?media\.destroy\(\);[\s\S]*?storage\.reset\(\);[\s\S]*?await offline\.reset\(\);[\s\S]*?location\.reload\(\);/);
 });

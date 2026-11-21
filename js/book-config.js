@@ -51,23 +51,43 @@ export class BookConfigStore {
     this.titlesRequest = null;
   }
 
+  setLibrary(library) {
+    this.library = library;
+    this.downloadedConfig = null;
+    const retained = new Set();
+    for (const record of library.books) {
+      const key = this.configKey(record.id);
+      retained.add(key);
+      const cached = this.cache.get(key);
+      if (cached) record.title = cached.book.title;
+    }
+    for (const key of this.cache.keys()) if (!retained.has(key)) this.cache.delete(key);
+  }
+
+  configKey(id) {
+    const recordedUrl = this.downloadedConfig?.id === id ? this.downloadedConfig.url : null;
+    return JSON.stringify([id, recordedUrl, this.library.byId.get(id)?.folder || id]);
+  }
+
   load(id, { signal } = {}) {
     if (signal?.aborted) return Promise.reject(createAbortError());
     const recordedUrl = this.downloadedConfig && this.downloadedConfig.id === id ? this.downloadedConfig.url : "";
     if (!recordedUrl && !isBookId(id, this.library)) return Promise.reject(new Error("Invalid book identifier."));
-    if (this.cache.has(id)) return waitForConfig(Promise.resolve(this.cache.get(id)), signal);
-    if (!this.requests.has(id)) {
+    const key = this.configKey(id);
+    if (this.cache.has(key)) return waitForConfig(Promise.resolve(this.cache.get(key)), signal);
+    if (!this.requests.has(key)) {
       const request = this.fetchConfig(id, recordedUrl).then((result) => {
-        this.cache.set(id, result);
+        if (key !== this.configKey(id)) return result;
+        this.cache.set(key, result);
         const record = this.library.byId.get(id);
         if (record) record.title = result.book.title;
         return result;
       });
-      this.requests.set(id, request);
-      void request.then(() => this.requests.delete(id), () => this.requests.delete(id));
+      this.requests.set(key, request);
+      void request.then(() => this.requests.delete(key), () => this.requests.delete(key));
     }
     // Consumers can leave a shared title/selection request independently.
-    return waitForConfig(this.requests.get(id), signal);
+    return waitForConfig(this.requests.get(key), signal);
   }
 
   configUrls(id, recordedUrl) {
@@ -106,19 +126,26 @@ export class BookConfigStore {
 
   loadTitles(onError = (id, error) => console.warn(`Could not load book title (${id}).`, error)) {
     if (this.titlesRequest) return this.titlesRequest;
-    const records = this.library.books.filter((record) => !this.cache.has(record.id));
+    const library = this.library;
+    const records = library.books.filter((record) => !this.cache.has(this.configKey(record.id)));
     if (!records.length) return Promise.resolve();
     let cursor = 0;
     const worker = async () => {
-      while (cursor < records.length) {
+      while (library === this.library && cursor < records.length) {
         const record = records[cursor]; cursor += 1;
         try { await this.load(record.id); }
         catch (error) { onError(record.id, error); }
       }
     };
-    const request = Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker()));
+    const request = Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker())).then(() => {
+      if (library !== this.library) {
+        this.titlesRequest = null;
+        return this.loadTitles(onError);
+      }
+    });
     this.titlesRequest = request;
-    void request.then(() => { this.titlesRequest = null; }, () => { this.titlesRequest = null; });
+    const clear = () => { if (this.titlesRequest === request) this.titlesRequest = null; };
+    void request.then(clear, clear);
     return request;
   }
 }

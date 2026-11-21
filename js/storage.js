@@ -20,6 +20,10 @@ function bookKey(id, resetId, part) {
   return `book:${encodeURIComponent(id)}:${encodeURIComponent(resetId)}:${part}`;
 }
 
+function positionKey(id, resetId, language = "") {
+  return bookKey(id, resetId, "progress") + ":" + encodeURIComponent(language);
+}
+
 function chapterCacheKey(bookId, language, cacheVersion) {
   return `compactPlayer:chapters:${encodeURIComponent(String(bookId))}:${encodeURIComponent(String(language))}:${encodeURIComponent(String(cacheVersion))}`;
 }
@@ -71,6 +75,38 @@ export class PlayerStorage {
     } catch { return {}; }
   }
 
+  savedPosition(key) {
+    try {
+      const data = JSON.parse(this.storage?.getItem(key) || "null");
+      return Number.isFinite(data?.seconds) && data.seconds >= 0 && Number.isFinite(data.updatedAt) ? data : null;
+    } catch { return null; }
+  }
+
+  positionRecords(id, resetId, selectedLanguage) {
+    const prefix = this.prefix + positionKey(id, resetId);
+    const records = [];
+    try {
+      for (let index = 0; index < (this.storage?.length || 0); index++) {
+        const key = this.storage.key(index);
+        if (!key?.startsWith(prefix)) continue;
+        const [encodedLanguage, revision] = key.slice(prefix.length).split(":");
+        let language;
+        try { language = decodeURIComponent(encodedLanguage); }
+        catch { continue; }
+        if (selectedLanguage !== undefined && selectedLanguage !== language) continue;
+        const position = this.savedPosition(key);
+        if (position) records.push({ ...position, key, language, revision,
+          activityAt: Number.isFinite(position.activityAt) ? position.activityAt : position.updatedAt });
+      }
+    } catch (error) { console.warn("[CompactAudioPlayer] Could not read saved listening positions.", error); }
+    return records.sort((a, b) => a.activityAt - b.activityAt || a.updatedAt - b.updatedAt || a.key.localeCompare(b.key));
+  }
+
+  progressTimestamp(id, resetId, language, records = this.positionRecords(id, resetId, language)) {
+    const timestamp = records.at(-1)?.updatedAt ?? this.readBookPart(id, resetId, "progress").progressUpdatedAt?.[language];
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+
   readProgress(id, resetId) {
     const raw = this.readBookPart(id, resetId, "progress");
     const progressByLang = {};
@@ -78,11 +114,14 @@ export class PlayerStorage {
       const progress = safeNumber(value, -1, 0, Number.MAX_SAFE_INTEGER);
       if (progress >= 0) progressByLang[language] = progress;
     }
-    return {
-      progressByLang,
-      progressUpdatedAt: objectOrEmpty(raw.progressUpdatedAt),
-      lastTime: safeNumber(raw.lastTime, 0, 0, Number.MAX_SAFE_INTEGER),
-    };
+    const progressUpdatedAt = objectOrEmpty(raw.progressUpdatedAt);
+    let lastTime = safeNumber(raw.lastTime, 0, 0, Number.MAX_SAFE_INTEGER);
+    for (const position of this.positionRecords(id, resetId)) {
+      progressByLang[position.language] = position.seconds;
+      progressUpdatedAt[position.language] = position.updatedAt;
+      lastTime = position.seconds;
+    }
+    return { progressByLang, progressUpdatedAt, lastTime };
   }
 
   readBook(id) {
@@ -133,15 +172,19 @@ export class PlayerStorage {
   getProgress(id, language) { const prefs = this.readProgress(id, this.resetId()); return prefs.progressByLang[language] ?? prefs.lastTime; }
   setProgress(id, language, seconds, { updatedAt = Date.now(), previousUpdate, resetId = this.resetId() } = {}) {
     if (resetId !== this.resetId()) return;
-    const prefs = this.readProgress(id, resetId);
-    const storedAt = Number.isFinite(prefs.progressUpdatedAt[language]) ? prefs.progressUpdatedAt[language] : 0;
+    const records = this.positionRecords(id, resetId, language);
+    const storedAt = this.progressTimestamp(id, resetId, language, records);
+    const lastActivity = records.at(-1)?.activityAt ?? storedAt;
     // A different tab may have saved newer activity while this write was waiting.
-    if (previousUpdate !== undefined && storedAt !== previousUpdate && storedAt >= updatedAt) return;
+    if (lastActivity > updatedAt || (lastActivity === updatedAt && previousUpdate !== undefined && storedAt !== previousUpdate)) return;
     const value = safeNumber(seconds, 0, 0, Number.MAX_SAFE_INTEGER);
-    prefs.progressByLang[language] = value;
-    prefs.progressUpdatedAt[language] = Math.max(updatedAt, storedAt + 1);
-    prefs.lastTime = value;
-    this.writeJson(bookKey(id, resetId, "progress"), { ...prefs, schemaVersion: SCHEMA_VERSION });
+    const revision = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    const key = positionKey(id, resetId, language) + ":" + revision;
+    if (!this.writeJson(key, { schemaVersion: SCHEMA_VERSION, seconds: value, activityAt: updatedAt, updatedAt: Math.max(updatedAt, storedAt + 1) })) return;
+    // Another tab can publish between our read and write. Only prune immutable revisions from our snapshot.
+    try {
+      for (const record of records) if (record.revision) this.storage.removeItem(record.key);
+    } catch (error) { console.warn("[CompactAudioPlayer] Could not remove superseded listening positions.", error); }
   }
   getLastBook() { try { return String(this.readItem(STORAGE_KEYS.lastBook) || ""); } catch { return ""; } }
   setLastBook(id) {
