@@ -20,5 +20,22 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     return true;
   }
 
-  return Object.freeze({ schemaVersion, audioMimeType, validManifest });
+  function offlineMetaUrl(baseUrl, type) {
+    return new URL(`__compact_player_offline__/${type}.json`, baseUrl).href;
+  }
+
+  function offlineManifestUrl(baseUrl) {
+    return offlineMetaUrl(baseUrl, "manifest");
+  }
+
+  function offlineChunkUrl(baseUrl, downloadId, index) {
+    return new URL(`__compact_player_offline__/chunks/${encodeURIComponent(downloadId)}/${index}`, baseUrl).href;
+  }
+
+  return Object.freeze({
+    schemaVersion, audioMimeType, validManifest,
+    metaCache: "compact-player-offline-meta-v1",
+    downloadHeader: "x-compact-player-download",
+    offlineMetaUrl, offlineManifestUrl, offlineChunkUrl,
+  });
 })();

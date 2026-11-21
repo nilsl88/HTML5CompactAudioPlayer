@@ -6,26 +6,32 @@ export const CHAPTER_REQUEST_TIMEOUT_MS = 20000;
 
 export function parseChapterText(text) {
   const value = String(text || "");
-  return { text: value, cues: parseWebVtt(value) };
+  const cues = parseWebVtt(value);
+  // Older chapter files can omit the header but still contain usable timestamped cues.
+  if (!/^\uFEFF?WEBVTT(?=[ \t\r\n]|$)/.test(value) && (!cues.length || /^\s*</.test(value))) return null;
+  return { text: value, cues };
 }
 
 export async function loadChapterFile(url, {
   fetchImpl = globalThis.fetch,
   signal,
   timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS,
+  revalidate = false,
 } = {}) {
   const response = await fetchTextWithRetry(url, {
     fetchImpl,
-    cache: "default",
+    cache: revalidate ? "no-cache" : "default",
     credentials: "same-origin",
     signal,
     timeoutMs,
   });
   if (!response.ok) throw new Error(`Chapter request failed with HTTP ${response.status}.`);
-  return parseChapterText(response.text);
+  const chapters = parseChapterText(response.text);
+  if (!chapters) throw new Error("The chapter file does not contain WebVTT.");
+  return chapters;
 }
 
-export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS } = {}) {
+export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS, revalidate = false } = {}) {
   if (mode === "none") return { kind: "none", text: "", cues: [] };
   const canReadEmbedded = /^audio\/mp4(?:;|$)/i.test(String(sourceMime)) || /\.(?:m4a|m4b)(?:[?#]|$)/i.test(String(sourceUrl));
   const loadEmbedded = async () => {
@@ -35,13 +41,13 @@ export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "",
   if (mode === "embedded") return loadEmbedded();
   if (mode === "vtt") {
     if (!vttUrl) return { kind: "vtt", text: "", cues: [] };
-    return { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs }) };
+    return { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs, revalidate }) };
   }
   if (mode === "auto") {
     let vttError;
     if (vttUrl) {
       try {
-        const result = { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs }) };
+        const result = { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs, revalidate }) };
         if (result.cues.length) return result;
       } catch (error) {
         if (signal?.aborted) throw error;

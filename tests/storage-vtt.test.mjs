@@ -149,3 +149,42 @@ test("keeps overlapping cues ordered and drops exact duplicates", () => {
   const cues = parseWebVtt(`WEBVTT\n\n00:05.000 --> 00:10.000\nTwo\n\n00:00.000 --> 00:08.000\nOne\n\n00:00.000 --> 00:08.000\nOne`);
   assert.deepEqual(cues.map((cue) => cue.title), ["One", "Two"]);
 });
+
+test("interleaved progress writes for two languages preserve both positions and legacy data", () => {
+  const memory = new MemoryStorage();
+  const first = new PlayerStorage(memory);
+  const second = new PlayerStorage(memory);
+  memory.setItem(first.prefix + "book:book::progress", JSON.stringify({ progressByLang: { sv: 30 }, lastTime: 30 }));
+  const write = memory.setItem.bind(memory);
+  memory.setItem = (key, value) => {
+    memory.setItem = write;
+    second.setProgress("book", "da", 20, { updatedAt: 20 });
+    write(key, value);
+  };
+  first.setProgress("book", "en", 10, { updatedAt: 10 });
+  const prefs = new PlayerStorage(memory).readBook("book");
+  assert.deepEqual(prefs.progressByLang, { en: 10, da: 20, sv: 30 });
+  assert.equal(prefs.lastTime, 20);
+});
+
+test("concurrent saves in one language preserve the latest activity, including a backward seek", () => {
+  const memory = new MemoryStorage();
+  const first = new PlayerStorage(memory);
+  const second = new PlayerStorage(memory);
+  const legacy = first.prefix + "book:book::progress:en";
+  memory.setItem(legacy, JSON.stringify({ seconds: 40, updatedAt: 5 }));
+  assert.equal(first.getProgress("book", "en"), 40);
+  const write = memory.setItem.bind(memory);
+  memory.setItem = (key, value) => {
+    memory.setItem = write;
+    second.setProgress("book", "en", 90, { updatedAt: 20, previousUpdate: 5 });
+    write(key, value);
+  };
+  first.setProgress("book", "en", 10, { updatedAt: 10, previousUpdate: 5 });
+  const reader = new PlayerStorage(memory);
+  assert.equal(reader.getProgress("book", "en"), 90);
+  assert.equal(reader.progressTimestamp("book", "", "en"), 20);
+  first.setProgress("book", "en", 3, { updatedAt: 30 });
+  assert.equal(reader.getProgress("book", "en"), 3);
+  assert.equal([...memory.map.keys()].filter((key) => key.startsWith(legacy + ":")).length, 1);
+});

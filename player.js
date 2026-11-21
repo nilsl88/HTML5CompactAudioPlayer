@@ -1,4 +1,4 @@
-import { UI_STRINGS } from "./i18n.js?v=11";
+import { UI_STRINGS } from "./i18n.js?v=12";
 import { BookConfigStore, queryBookId } from "./js/book-config.js";
 import { scanSources } from "./js/availability.js";
 import { loadChapters, parseChapterText } from "./js/chapters.js";
@@ -44,6 +44,9 @@ let uiPrefs = storage.readUi();
 let locale = resolveUiLocale(uiPrefs.uiLanguage);
 let library = normalizeLibrary(null);
 let bookConfigs = null;
+let libraryNeedsRetry = false;
+let libraryRetry = null;
+let startupBookRequest = null;
 let book = null;
 let bookId = "";
 let bookConfigUrl = "";
@@ -79,7 +82,6 @@ let lastProgressWrite = 0;
 let resetInProgress = false;
 let resetRemaining = null;
 let mediaMetadataTitle = "";
-let mediaMetadataChapter = "";
 let coverGeneration = 0;
 let coverController = null;
 let coverObjectUrl = "";
@@ -596,8 +598,10 @@ function initializeCustomSelects() {
 initializeCustomSelects();
 
 function populateLibrarySelect() {
-  optionsFrom(els.bookSelect, library.books.map((item) => ({ ...item, value: item.id })), bookId, (item) => localizedValue(item.title, locale, item.label || item.id));
-  els.bookRow.hidden = library.books.length <= 1;
+  const records = library.books.map((item) => ({ ...item, value: item.id }));
+  if (book && !library.byId.has(bookId)) records.unshift({ value: bookId, label: displayTitle() || bookId });
+  optionsFrom(els.bookSelect, records, bookId, (item) => localizedValue(item.title, locale, item.label || item.id));
+  els.bookRow.hidden = records.length <= 1;
 }
 
 function populateLanguageSelect() {
@@ -796,15 +800,35 @@ function requestAvailabilityScan(generation, code = languageCode, immediate = fa
   else start();
 }
 
-async function loadLibrary(signal) {
+async function loadLibrary() {
   try {
-    const response = await fetchTextWithRetry(libraryUrl, { cache: "no-store", credentials: "same-origin", signal });
-    if (!response.ok) return normalizeLibrary(null);
+    const response = await fetchTextWithRetry(libraryUrl, { cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) return null;
     return normalizeLibrary(parseJson(response.text, "media/library.json"));
   } catch (error) {
     if (error?.name !== "AbortError") reportError("library load", error);
-    return normalizeLibrary(null);
+    return null;
   }
+}
+
+async function recoverLibrary() {
+  if (!bookConfigs || navigator.onLine === false) return;
+  if (libraryRetry) return libraryRetry;
+  const generation = bookGeneration;
+  libraryRetry = (async () => {
+    if (libraryNeedsRetry) {
+      const catalog = await loadLibrary();
+      if (!catalog) return;
+      libraryNeedsRetry = false;
+      library = catalog;
+      bookConfigs.setLibrary(catalog);
+      populateLibrarySelect();
+    } else if (bookConfigs.downloadedConfig) bookConfigs.setLibrary(library);
+    await startupBookRequest;
+    if (!book && !bookController && generation === bookGeneration) await loadStartupBook();
+    if (!els.optionsPanel.hidden) void loadLibraryTitles();
+  })().finally(() => { libraryRetry = null; });
+  return libraryRetry;
 }
 
 async function loadLibraryTitles() {
@@ -892,7 +916,7 @@ async function loadBook(id) {
     if (generation !== bookGeneration) return;
     throw error;
   } finally {
-    if (generation === bookGeneration) { setLoading(false); setBusy(false); renderOfflineUi(); }
+    if (generation === bookGeneration) { bookController = null; setLoading(false); setBusy(false); renderOfflineUi(); }
   }
 }
 
@@ -918,7 +942,6 @@ function resetChapters() {
   chapterMode = language?.chapterSource || (language?.chapters ? "vtt" : "none");
   chapterUrl = resolveLanguageAsset(language, language?.chapters);
   chapterSourceKey = getChapterSourceKey(currentSource);
-  mediaMetadataChapter = "";
   updateMediaSessionMetadata();
   updateChapterButtons();
 }
@@ -964,13 +987,17 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
   }
   const sourceKey = getChapterSourceKey(currentSource);
   chapterSourceKey = sourceKey;
+  let revalidate = force;
   if (!force) {
     const vttUrl = ["vtt", "auto"].includes(chapterMode) ? chapterUrl : "";
     const cachedData = storage.readChapterData(book.id, languageCode, book.cacheVersion, sourceKey, vttUrl);
     if (cachedData) {
       const cached = cachedData.kind === "vtt" ? parseChapterText(cachedData.text) : cachedData;
-      applyChapterData(cached.text || "", cached.cues, cachedData.kind);
-      return Promise.resolve(cues);
+      if (cached) {
+        applyChapterData(cached.text || "", cached.cues, cachedData.kind);
+        return Promise.resolve(cues);
+      }
+      revalidate = true;
     }
   }
   cancelAvailabilityWork();
@@ -983,7 +1010,7 @@ function ensureChapters({ force = false, notifyFailure = true, showLoading = !el
   if (showLoading) renderPanelMessage(t("loadingChapters"));
   const promise = (async () => {
     try {
-      const result = await loadChapters({ mode: chapterMode, vttUrl: requestUrl, sourceUrl: currentSource?.url, sourceMime: currentSource?.mime, signal: controller.signal });
+      const result = await loadChapters({ mode: chapterMode, vttUrl: requestUrl, sourceUrl: currentSource?.url, sourceMime: currentSource?.mime, signal: controller.signal, revalidate });
       if (generation !== chapterGeneration || requestUrl !== chapterUrl || sourceKey !== getChapterSourceKey(currentSource)) return cues;
       storage.writeChapterData(book.id, languageCode, book.cacheVersion, sourceKey, result, requestUrl);
       applyChapterData(result.text || "", result.cues, result.kind);
@@ -1074,20 +1101,30 @@ function renderChapters() {
   });
 }
 
-function chapterIndexAt(position) {
+function lastChapterStarted(position) {
   let index = -1;
   for (let cursor = 0; cursor < cues.length; cursor += 1) {
-    if (position + .05 >= cues[cursor].start) index = cursor;
+    if (position >= cues[cursor].start) index = cursor;
     else break;
   }
   return index;
+}
+
+function chapterEnd(index) {
+  return cues[index].end ?? cues[index + 1]?.start ?? (media.duration() || book?.duration || Infinity);
+}
+
+function chapterIndexAt(position) {
+  for (let index = lastChapterStarted(position); index >= 0; index--) {
+    if (position < chapterEnd(index)) return index;
+  }
+  return -1;
 }
 
 function markActiveChapter(position) {
   const index = chapterIndexAt(position);
   if (index === activeCueIndex) return;
   activeCueIndex = index;
-  mediaMetadataChapter = cues[index]?.title || "";
   updateMeta();
   updateMediaSessionMetadata();
   for (const button of els.chaptersList.querySelectorAll(".chapter-button")) button.setAttribute("aria-current", String(Number(button.dataset.index) === index));
@@ -1117,6 +1154,7 @@ function refreshEmbeddedChaptersForSource(source) {
   if (trackObjectUrl) { URL.revokeObjectURL(trackObjectUrl); trackObjectUrl = ""; }
   els.chaptersTrack.removeAttribute("src");
   updateMeta();
+  updateMediaSessionMetadata();
   updateChapterButtons();
   void ensureChapters({ notifyFailure: false, showLoading: false });
 }
@@ -1125,8 +1163,9 @@ async function previousChapter() {
   await ensureChapters();
   if (!cues.length) return;
   const position = media.position();
-  const index = chapterIndexAt(position);
-  const target = index < 0 ? 0 : position - cues[index].start > 3 ? index : Math.max(0, index - 1);
+  const index = lastChapterStarted(position);
+  const restart = index >= 0 && (position >= chapterEnd(index) || position - cues[index].start > 3);
+  const target = restart ? index : Math.max(0, index - 1);
   media.seek(cues[target].start);
 }
 
@@ -1218,7 +1257,7 @@ function scheduleProgress(position, seek = false) {
   const elapsed = updatedAt - lastProgressWrite;
   const flushNow = seek || elapsed >= 5000;
   const previousUpdate = flushNow ? undefined
-    : pendingProgress?.previousUpdate ?? storage.readProgress(bookId, resetId).progressUpdatedAt[languageCode] ?? 0;
+    : pendingProgress?.previousUpdate ?? storage.progressTimestamp(bookId, resetId, languageCode);
   pendingProgress = { bookId, languageCode, position, updatedAt, previousUpdate, resetId };
   if (flushNow) saveProgress();
   else if (!progressTimer) progressTimer = setTimeout(saveProgress, 5000 - elapsed);
@@ -1350,7 +1389,7 @@ function populateUiLanguageSelect() {
 function renderResetBody() {
   clearChildren(els.resetBody);
   const paragraphs = resetRemaining
-    ? [resetRemaining.local && t("resetLocalFailed"), resetRemaining.offline && t("resetOfflineFailed")].filter(Boolean)
+    ? [resetRemaining.local && t("resetLocalFailed"), resetRemaining.offline && t(resetRemaining.offline === "conflict" ? "offlineTabConflict" : "resetOfflineFailed")].filter(Boolean)
     : t("resetBody").split(/\n\s*\n/);
   const action = resetRemaining ? t("retryReset") : t("resetOk");
   setText(els.resetOk, action);
@@ -1471,9 +1510,8 @@ async function startSleepChapter() {
   if (generation !== sleepGeneration || sourceGeneration !== chapterGeneration) return;
   const position = media.position();
   const index = chapterIndexAt(position);
-  const cue = cues[index];
-  const target = cue && (cue.end ?? cues[index + 1]?.start ?? (media.duration() || book?.duration));
-  if (!target || target <= position) { showToast(t("sleepEndChapterUnavailable"), "warning"); return; }
+  const target = index >= 0 ? chapterEnd(index) : null;
+  if (!Number.isFinite(target) || target <= position) { showToast(t("sleepEndChapterUnavailable"), "warning"); return; }
   cancelSleep(true);
   sleepState.mode = "chapter";
   sleepState.chapterEnd = target;
@@ -1572,9 +1610,10 @@ async function changeQuality(nextId) {
 function updateMediaSessionMetadata() {
   if (!("mediaSession" in navigator) || typeof MediaMetadata !== "function") return;
   try {
+    const chapter = cues[activeCueIndex]?.title;
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: mediaMetadataChapter || mediaMetadataTitle || t("audio"),
-      album: mediaMetadataChapter ? mediaMetadataTitle : "",
+      title: chapter || mediaMetadataTitle || t("audio"),
+      album: chapter ? mediaMetadataTitle : "",
       artwork: els.coverImg.src ? [{ src: els.coverImg.src }] : [],
     });
   } catch (error) { reportError("Media Session metadata", error); }
@@ -1632,7 +1671,8 @@ els.optionsBtn.addEventListener("click", () => {
   if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
   closeAllPanels(els.optionsPanel);
   openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? selectFocusTarget(els.langSelect) : selectFocusTarget(els.bookSelect));
-  void loadLibraryTitles();
+  if (libraryNeedsRetry || !book) void recoverLibrary();
+  else void loadLibraryTitles();
   requestAvailabilityScan(bookGeneration, languageCode, true);
 });
 els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
@@ -1736,7 +1776,10 @@ els.resetOk.addEventListener("click", async () => {
     try {
       await offline.reset();
       resetRemaining.offline = false;
-    } catch (error) { reportError("offline reset", error); }
+    } catch (error) {
+      resetRemaining.offline = error?.code === "conflict" ? "conflict" : true;
+      reportError("offline reset", error);
+    }
   }
   if (resetRemaining.local || resetRemaining.offline) {
     els.resetOk.disabled = false;
@@ -1773,6 +1816,7 @@ window.addEventListener("offline", () => {
   renderOfflineUi();
 });
 window.addEventListener("online", () => {
+  void recoverLibrary();
   showToast(t("connectionRestored"), "success", 4000, "online");
   if (chaptersFailed) void ensureChapters({ force: true, notifyFailure: false });
   scannedAvailabilityLanguages.delete(languageCode);
@@ -1787,14 +1831,24 @@ async function boot() {
   applyStrings();
   initializeMediaSession();
   const offlineReady = offline.init();
-  if (navigator.onLine === false) await offlineReady;
-  const bootController = new AbortController();
-  library = await loadLibrary(bootController.signal);
-  const downloadedConfig = navigator.onLine === false ? offline.downloadedConfig : null;
+  const startedOffline = navigator.onLine === false;
+  if (startedOffline) await offlineReady;
+  const catalog = await loadLibrary();
+  const preferDownloaded = startedOffline || navigator.onLine === false;
+  if (preferDownloaded && !startedOffline) await offlineReady;
+  libraryNeedsRetry = !catalog;
+  library = catalog || normalizeLibrary(null);
+  const downloadedConfig = preferDownloaded ? offline.downloadedConfig : null;
   bookConfigs = new BookConfigStore({ library, documentBaseUrl, downloadedConfig });
+  const downloadedId = preferDownloaded ? offline.active?.episodeId || "" : "";
+  startupBookRequest = loadStartupBook(downloadedId);
+  if (preferDownloaded && navigator.onLine) void recoverLibrary();
+  await startupBookRequest;
+}
+
+async function loadStartupBook(downloadedId = "") {
   const queryId = queryBookId(new URL(location.href).searchParams, library);
   const savedId = storage.getLastBook();
-  const downloadedId = navigator.onLine === false ? offline.active?.episodeId || "" : "";
   const initialId = downloadedId || queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
   try {
     await loadBook(initialId);

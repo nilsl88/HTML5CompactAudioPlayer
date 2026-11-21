@@ -1,16 +1,14 @@
 importScripts("./js/offline-manifest.js");
-const { validManifest } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v11";
+const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
+const SHELL_VERSION = "v12";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
-const META_CACHE = "compact-player-offline-meta-v1";
-const DOWNLOAD_HEADER = "x-compact-player-download";
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=11",
-  "./player.js?v=11",
-  "./i18n.js?v=11",
+  "./player.css?v=12",
+  "./player.js?v=12",
+  "./i18n.js?v=12",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/config.js",
@@ -19,6 +17,7 @@ const SHELL_URLS = [
   "./js/media-controller.js",
   "./js/mp4-chapters.js",
   "./js/offline.js",
+  "./js/offline-transfer.js",
   "./js/offline-lock.js",
   "./js/offline-manifest.js",
   "./js/source-selection.js",
@@ -33,12 +32,12 @@ function scopeUrl(path) {
 }
 
 function chunkUrl(downloadId, index) {
-  return scopeUrl(`__compact_player_offline__/chunks/${encodeURIComponent(downloadId)}/${index}`);
+  return offlineChunkUrl(self.registration.scope, downloadId, index);
 }
 
 async function activeManifest() {
   const meta = await caches.open(META_CACHE);
-  const response = await meta.match(scopeUrl("__compact_player_offline__/active.json"));
+  const response = await meta.match(offlineMetaUrl(self.registration.scope, "active"));
   if (!response) return null;
   try {
     const record = await response.json();
@@ -137,15 +136,18 @@ async function cachedFallback(request) {
 }
 
 async function networkFirst(request) {
+  let response;
+  let networkError;
   try {
-    const response = await fetch(request);
-    if (response.ok || response.status === 206) return response;
-    return await cachedFallback(request) || response;
-  } catch (error) {
+    response = await fetch(request);
+    if (response.ok) return response;
+  } catch (error) { networkError = error; }
+  try {
     const cached = await cachedFallback(request);
     if (cached) return cached;
-    throw error;
-  }
+  } catch (error) { console.warn("[CompactAudioPlayer] Could not read the cached response.", error); }
+  if (response) return response;
+  throw networkError;
 }
 
 self.addEventListener("install", (event) => {
