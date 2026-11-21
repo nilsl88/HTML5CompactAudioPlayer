@@ -84,6 +84,7 @@ export class MediaController {
     this.clearTimeout();
     if (shouldPlay) return this.activateCurrent(true);
     this.clearSource();
+    if (this.currentSource()) this.callbacks.onSourceChange?.(this.currentSource());
     this.callbacks.onTime?.(this.desiredTime, 0);
     return Promise.resolve(false);
   }

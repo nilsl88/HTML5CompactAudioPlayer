@@ -42,12 +42,12 @@ export class PlayerStorage {
     this.resetKey = this.prefix + "reset";
   }
 
-  static fromBrowser() {
-    const getStorage = () => globalThis.localStorage;
+  static fromBrowser(browser = globalThis) {
+    const getStorage = () => browser.localStorage;
     let storage = null;
     try { storage = getStorage(); }
     catch (error) { console.warn("[CompactAudioPlayer] Could not access local storage.", error); }
-    return new PlayerStorage(storage, globalThis.location?.href, getStorage);
+    return new PlayerStorage(storage, browser.location?.href, getStorage);
   }
 
   readItem(key) {

@@ -1,14 +1,16 @@
 importScripts("./js/offline-manifest.js");
 const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v13";
+const SHELL_VERSION = "v14";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=13",
-  "./player.js?v=13",
-  "./i18n.js?v=13",
+  "./player.css?v=14",
+  "./player.js?v=14",
+  "./i18n.js?v=14",
+  "./js/player-app.js",
+  "./js/availability-session.js",
   "./js/availability.js",
   "./js/chapters.js",
   "./js/chapter-session.js",

@@ -17,22 +17,22 @@ function fallbackKeydown(event) {
   if (!items.length) { event.preventDefault(); return; }
   const first = items[0];
   const last = items.at(-1);
-  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  if (event.shiftKey && dialog.ownerDocument.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && dialog.ownerDocument.activeElement === last) { event.preventDefault(); first.focus(); }
 }
 
 export function openDialog(dialog, focusTarget) {
   if (!dialog || dialog.open) return;
-  focusByDialog.set(dialog, document.activeElement);
+  focusByDialog.set(dialog, dialog.ownerDocument.activeElement);
   if (typeof dialog.showModal === "function") dialog.showModal();
   else {
     dialog.setAttribute("open", "");
     dialog.setAttribute("role", "dialog");
     dialog.setAttribute("aria-modal", "true");
     dialog.addEventListener("keydown", fallbackKeydown);
-    document.querySelector("main")?.setAttribute("inert", "");
+    dialog.ownerDocument.querySelector("main")?.setAttribute("inert", "");
   }
-  requestAnimationFrame(() => (focusTarget || focusableElements(dialog)[0] || dialog).focus?.());
+  dialog.ownerDocument.defaultView.requestAnimationFrame(() => (focusTarget || focusableElements(dialog)[0] || dialog).focus?.());
 }
 
 export function closeDialog(dialog) {
@@ -41,11 +41,11 @@ export function closeDialog(dialog) {
   else {
     dialog.removeAttribute("open");
     dialog.removeEventListener("keydown", fallbackKeydown);
-    document.querySelector("main")?.removeAttribute("inert");
+    dialog.ownerDocument.querySelector("main")?.removeAttribute("inert");
   }
   const previous = focusByDialog.get(dialog);
   focusByDialog.delete(dialog);
-  requestAnimationFrame(() => previous?.isConnected && previous.focus?.());
+  dialog.ownerDocument.defaultView.requestAnimationFrame(() => previous?.isConnected && previous.focus?.());
 }
 
 export function bindDialogDismiss(dialog, closeButton, onClose) {
@@ -61,7 +61,7 @@ export function openPanel(panel, trigger, firstFocus) {
   panel.hidden = false;
   trigger?.setAttribute("aria-expanded", "true");
   trigger?.classList.add("is-active");
-  requestAnimationFrame(() => (firstFocus || focusableElements(panel)[0])?.focus?.());
+  panel.ownerDocument.defaultView.requestAnimationFrame(() => (firstFocus || focusableElements(panel)[0])?.focus?.());
 }
 
 export function closePanel(panel, trigger, restoreFocus = false) {
@@ -69,5 +69,5 @@ export function closePanel(panel, trigger, restoreFocus = false) {
   panel.hidden = true;
   trigger?.setAttribute("aria-expanded", "false");
   trigger?.classList.remove("is-active");
-  if (restoreFocus) requestAnimationFrame(() => trigger?.focus?.());
+  if (restoreFocus) panel.ownerDocument.defaultView.requestAnimationFrame(() => trigger?.focus?.());
 }

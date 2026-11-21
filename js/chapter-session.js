@@ -2,7 +2,8 @@ import { loadChapters, parseChapterText } from "./chapters.js";
 import { resolveLanguageAsset } from "./config.js";
 
 export class ChapterSession {
-  constructor({ readCache, writeCache, onStart, onLoaded, onFailure }) {
+  constructor({ fetchImpl, readCache, writeCache, onStart, onLoaded, onFailure }) {
+    this.fetchImpl = fetchImpl;
     this.readCache = readCache;
     this.writeCache = writeCache;
     this.onStart = onStart;
@@ -81,7 +82,7 @@ export class ChapterSession {
   async fetch(controller, revalidate) {
     try {
       const result = await loadChapters({ mode: this.mode, vttUrl: this.url, sourceUrl: this.source?.url,
-        sourceMime: this.source?.mime, signal: controller.signal, revalidate });
+        sourceMime: this.source?.mime, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate });
       if (controller.signal.aborted) return;
       this.writeCache(...this.cacheKey, result, this.url);
       this.accept(result);

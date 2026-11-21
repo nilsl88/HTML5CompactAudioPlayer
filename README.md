@@ -67,11 +67,13 @@ The skill requires `ffmpeg` and `ffprobe`. It keeps the input file unchanged and
 ```text
 index.html              Semantic player markup and dialogs
 player.css              Responsive layout and design tokens
-player.js               Application coordinator and DOM event wiring
+player.js               Starts the player with the current browser window and storage
 sw.js                   Network-first app shell and offline ranged-audio responses
 i18n.js                 Interface strings
 js/
+  player-app.js         Player startup, DOM event wiring, and feature coordination
   availability.js       HEAD and Range availability probes
+  availability-session.js  Schedules scans after chapters load and records source availability
   chapters.js           WebVTT and embedded chapter loading
   chapter-session.js    Chapter cache, active source, navigation, and request cancellation
   codecs.js             Codec families, MIME hints, and quality labels
@@ -99,7 +101,7 @@ media/                  Library, book, cover, and chapter data
 skills/create-audiobook/ Prompt workflow for encoding a book and generating book.json
 ```
 
-`player.js` coordinates the modules but does not assign `audio.src`, call `audio.load()`, seek the element, or call `audio.play()` directly. Those operations belong to `media-controller.js` so source changes follow one path.
+`startPlayer()` connects the controls to the player modules. `MediaController` owns the audio element’s source, playback, and seeking.
 
 ## Book configuration
 
@@ -255,7 +257,7 @@ Introduction
 Chapter 1
 ```
 
-The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML. The active chapter title appears after language and quality in the player summary; it is omitted before the first cue, in gaps between cues, and after the last explicit end time. In a gap, Previous chapter returns to the preceding cue and the chapter sleep timer is unavailable.
+The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML. The active chapter title appears after language and quality in the player summary; it is omitted before the first cue, in gaps between cues, and after the last explicit end time. In a gap, Previous chapter returns to the preceding cue and the chapter sleep timer is unavailable. When a quality change or automatic fallback supplies different chapters, the timer follows the current chapter in the new source. It turns off if that chapter has no usable end time. Minute timers keep their original deadline.
 
 ## Source selection and fallback
 
@@ -303,13 +305,13 @@ Options includes **Download for offline use** when Service Worker and Cache Stor
 
 The download also stores the player shell, book configuration, cover, and chapter file needed for an offline reload. A missing optional cover or chapter file does not prevent audio from being saved. The player uses the network first whenever it is online and keeps the completed copy as a fallback. Returning online does not delete the download.
 
-The player stores audio in 8 MiB chunks. With a strong version validator, the player requests sequential byte ranges using If-Range. Without one, it requests a single range covering the file and splits that response as it arrives. Each audio response must match the MIME type established by the initial probe. After an interruption, **Resume download** reuses saved chunks when the server confirms the same file version with a strong ETag or a reliable Last-Modified date. If the version has changed or cannot be confirmed, the download starts again from the first chunk. Explicit cancellation removes the partial copy. Playback traffic has priority while the player is loading or stalled.
+The player stores audio in 8 MiB chunks. With a strong version validator, the player requests sequential byte ranges using If-Range. Without one, it requests a single range covering the file and splits that response as it arrives. Each audio response must match the MIME type established by the initial probe. After an interruption, **Resume download** reuses saved chunks when the server confirms the same file version with a strong ETag or a reliable Last-Modified date. If the version has changed or cannot be confirmed, the download starts again from the first chunk. Explicit cancellation marks the partial copy for removal before deleting it. If the tab closes during cleanup, the next visit discards the canceled copy. Playback traffic has priority while the player is loading or stalled.
 
 One tab at a time can change an installation’s offline book. Other tabs can open the saved book while a replacement downloads. The player uses Web Locks for coordination, with IndexedDB as a fallback. If the browser denies the write lock, the saved book remains available for playback and the player hides the download controls.
 
 Before downloading audio chunks, the player opens the cached book configuration and checks the book ID, cache version, language, quality, and audio URL against the selection. A failed check keeps the previous offline book available. The player also checks the audio MIME type and the completed download manifest. If the server omits the content type or sends a generic binary type, the player uses the configured audio format.
 
-At startup the player checks the required configuration before listing a download as ready. If the configuration is missing or invalid and the audio is intact, **Restore book configuration** in Options fetches just the saved configuration URL. After a replacement becomes active, any failed cleanup of the previous download is retried on the next visit.
+At startup the player checks the required configuration before listing a download as ready. If the configuration is missing or invalid and the audio is intact, **Restore book configuration** in Options fetches just the saved configuration URL. A separate paused download keeps its own progress during a repair. After a replacement becomes active, any failed cleanup of the previous download is retried on the next visit.
 
 If Cache Storage reports a read error during startup, the player keeps the saved book and checks it again on the next visit. When the browser blocks access to Cache Storage, the player hides the download controls and can still play online.
 

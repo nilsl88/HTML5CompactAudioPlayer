@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { setImmediate as settle } from "node:timers/promises";
 import { probeUrl } from "../js/availability.js";
-import { PlayerStorage } from "../js/storage.js";
 import { openPlayerPage } from "./player-page.mjs";
 import { UI_STRINGS } from "../i18n.js";
 
@@ -35,7 +34,7 @@ test("a late missing probe preserves the source that played on the next selectio
   const pendingHead = new Promise((resolve) => { finishHead = resolve; });
   const requests = [];
   const saved = new Map();
-  const { audio, elements } = await openPlayerPage(t, book, (url, options) => {
+  const { audio, elements, storage } = await openPlayerPage(book, (url, options) => {
     requests.push([new URL(url).pathname.split("/").pop(), options.method]);
     if (url.endsWith("/book.webm") && options.method === "HEAD") return pendingHead;
     return response(url.endsWith(".webm") ? 404 : 200);
@@ -50,7 +49,7 @@ test("a late missing probe preserves the source that played on the next selectio
   finishHead(response(404));
   await settle();
   assert.ok(requests.some(([file, method]) => file === "book.webm" && method === "GET"));
-  const cache = PlayerStorage.fromBrowser().readAvailabilityCache(book.id, 1);
+  const cache = storage.readAvailabilityCache(book.id, 1);
   assert.equal(cache.byLanguage.en["opus-64"], "missing");
   assert.equal(cache.byLanguage.en["opus-128"], "available");
   const select = elements.get("bookSelect");
@@ -65,7 +64,7 @@ test("a late missing probe preserves the source that played on the next selectio
 });
 
 test("English contains every literal translation key used by the coordinator", async () => {
-  const source = await readFile(new URL("../player.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../js/player-app.js", import.meta.url), "utf8");
   const keys = new Set([...source.matchAll(/\bt\("([A-Za-z0-9]+)"/g)].map((match) => match[1]));
   assert.deepEqual([...keys].filter((key) => !(key in UI_STRINGS.en)), []);
 });

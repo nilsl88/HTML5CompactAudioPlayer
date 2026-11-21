@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
-import { openPlayerPage } from "./player-page.mjs";
+import { deferred, openPlayerPage } from "./player-page.mjs";
 import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
 import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
 
@@ -21,7 +21,7 @@ function atom(type, payload) {
   return bytes;
 }
 
-function neroMetadata() {
+function neroMetadata(secondStart = 60) {
   const title1 = new TextEncoder().encode("Intro");
   const title2 = new TextEncoder().encode("Chapter 1");
   const payload = new Uint8Array(27 + title1.length + title2.length);
@@ -31,7 +31,7 @@ function neroMetadata() {
   payload[17] = title1.length;
   payload.set(title1, 18);
   const second = 18 + title1.length;
-  view.setBigUint64(second, 600000000n, false);
+  view.setBigUint64(second, BigInt(secondStart) * 10_000_000n, false);
   payload[second + 8] = title2.length;
   payload.set(title2, second + 9);
   return atom("moov", atom("chpl", payload));
@@ -126,7 +126,7 @@ test("embedded chapters show an empty state on Opus and reload on AAC selection"
   } };
   const requests = [];
   const fetchRange = rangedFetch(neroMetadata());
-  const { audio, elements } = await openPlayerPage(t, book, (url, options) => {
+  const { audio, elements } = await openPlayerPage(book, (url, options) => {
     requests.push(url);
     return fetchRange(url, options);
   });
@@ -144,6 +144,80 @@ test("embedded chapters show an empty state on Opus and reload on AAC selection"
   assert.ok(!audio.src);
 });
 
+test("switching source reschedules availability checks after the new chapters and an idle period", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const config = { id: "book", defaultLanguage: "en", debug: { showAllQualities: true },
+    languages: { en: { chapterSource: "embedded", sources: { opus: { 96: "book.webm" }, aac: { 96: "book.m4b" } } } } };
+  const metadata = deferred();
+  const probes = [];
+  const range = rangedFetch(neroMetadata());
+  const { elements } = await openPlayerPage(config, async (url, options) => {
+    if (options.method === "HEAD") {
+      probes.push(url);
+      return new Response(null, { status: 200 });
+    }
+    await metadata.promise;
+    return range(url, options);
+  });
+  const quality = elements.get("qualitySelect");
+  quality.value = "aac-96";
+  quality.dispatchEvent(new Event("change"));
+  t.mock.timers.tick(3000);
+  assert.deepEqual(probes, []);
+  metadata.resolve();
+  await settle();
+  assert.deepEqual(probes, []);
+  t.mock.timers.tick(1500);
+  await settle();
+  assert.deepEqual(probes.map((url) => new URL(url).pathname).sort(), ["/media/book/book.m4b", "/media/book/book.webm"]);
+});
+
+test("chapter sleep follows the active source after quality changes and automatic fallback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const config = { id: "book", defaultLanguage: "en", debug: { showAllQualities: true },
+    languages: { en: { chapterSource: "embedded", sources: { opus: { 96: "book.webm" }, aac: { 96: "book.m4b", 64: "other.m4b" } } } } };
+  const original = rangedFetch(neroMetadata());
+  const other = rangedFetch(neroMetadata(90));
+  const { audio, elements } = await openPlayerPage(config, (url, options) =>
+    url.endsWith("other.m4b") ? other(url, options) : original(url, options), new Map(),
+    { navigator: { language: "en", onLine: true, userAgent: "iPhone" } });
+  const quality = elements.get("qualitySelect");
+  const timer = elements.get("sleepBtn");
+  async function select(id) {
+    quality.value = id;
+    quality.dispatchEvent(new Event("change"));
+    await settle();
+  }
+  for (const action of ["select", "fallback"]) {
+    await select("aac-96");
+    elements.get("sleepList").children[0].dispatchEvent(new Event("click"));
+    await settle();
+    assert.match(timer.dataset.tooltip, /End of chapter/);
+    if (action === "select") await select("opus-96");
+    else {
+      elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+      audio.error = { code: 3 };
+      audio.dispatchEvent(new Event("error"));
+      await settle();
+      assert.ok(audio.src.endsWith("book.webm"));
+    }
+    assert.equal(timer.dataset.tooltip, "Sleep timer", action);
+  }
+  elements.get("sleepList").children[1].dispatchEvent(new Event("click"));
+  await select("aac-96");
+  assert.match(timer.dataset.tooltip, /5 min/);
+  elements.get("sleepList").children[0].dispatchEvent(new Event("click"));
+  await settle();
+  await select("aac-64");
+  audio.dispatchEvent(new Event("loadedmetadata"));
+  audio.currentTime = 60;
+  audio.dispatchEvent(new Event("timeupdate"));
+  assert.match(timer.dataset.tooltip, /End of chapter/);
+  audio.currentTime = 90;
+  audio.dispatchEvent(new Event("timeupdate"));
+  assert.equal(timer.dataset.tooltip, "Sleep timer");
+});
+
 test("reconnecting retries failed embedded chapters without a WebVTT URL", async (t) => {
   for (const mode of ["embedded", "auto"]) {
     await t.test(mode, async (t) => {
@@ -155,7 +229,7 @@ test("reconnecting retries failed embedded chapters without a WebVTT URL", async
       };
       const metadata = rangedFetch(neroMetadata());
       const requests = [];
-      const { audio, elements, navigator, window } = await openPlayerPage(t, book, (url, options) => {
+      const { audio, elements, navigator, window } = await openPlayerPage(book, (url, options) => {
         requests.push({ url, range: options.headers?.Range });
         if (requests.length === 1) return new Response(null, { status: 404 });
         return metadata(url, options);
@@ -190,7 +264,7 @@ test("an unordered embedded cache reloads the chapter list and current title fro
     cues: [{ start: 30, end: null, title: "Later" }, { start: 0, end: 30, title: "Opening" }] })]]);
   const requests = [];
   const range = rangedFetch(neroMetadata());
-  const { elements } = await openPlayerPage(t, book, (url, options) => {
+  const { elements } = await openPlayerPage(book, (url, options) => {
     requests.push(url);
     return range(url, options);
   }, saved);
@@ -232,7 +306,7 @@ test("a late cover image load after a language change cannot replace the current
   const { file } = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
   const range = rangedFetch(file);
   const revoked = t.mock.method(URL, "revokeObjectURL");
-  const { elements, audio } = await openPlayerPage(t, {
+  const { elements, audio } = await openPlayerPage({
     id: "sample", defaultLanguage: "en", title: { en: "One", da: "To" }, coverSource: "embedded",
     languages: { en: { sources: { aac: { 96: "en.m4b" } } }, da: { sources: { aac: { 96: "da.m4b" } } } },
   }, range);

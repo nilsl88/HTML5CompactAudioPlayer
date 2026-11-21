@@ -21,7 +21,7 @@ test("chapter navigation uses platform-independent icons", async () => {
 });
 
 test("vertical arrow shortcuts use the configured skip interval", async () => {
-  const source = await readFile(new URL("player.js", root), "utf8");
+  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   assert.match(source, /event\.code === "ArrowUp"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) \+ uiPrefs\.skipSeconds\);/);
   assert.match(source, /event\.code === "ArrowDown"[^{]*\{[^}]*event\.preventDefault\(\);[^}]*media\.seek\(media\.position\(\) - uiPrefs\.skipSeconds\);/);
 });
@@ -62,7 +62,7 @@ test("popup close buttons use inverse theme colors", async () => {
 
 test("control tooltips support mouse and keyboard users", async () => {
   const css = await readFile(new URL("player.css", root), "utf8");
-  const source = await readFile(new URL("player.js", root), "utf8");
+  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   assert.match(css, /\[data-tooltip\]::after\s*{[^}]*content:\s*attr\(data-tooltip\)/s);
   assert.match(css, /\[data-tooltip\]:focus-visible::after/);
   assert.match(css, /\[data-tooltip\]:hover::after/);
@@ -158,7 +158,7 @@ test("production HTML has no runtime dependencies", async () => {
 });
 
 test("library titles are requested only from Options", async () => {
-  const source = await readFile(new URL("player.js", root), "utf8");
+  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
   assert.ok(library.books.every((item) => item.id && !item.title && !item.label));
   assert.match(source, /bookConfigs = new BookConfigStore\(/);
@@ -169,7 +169,7 @@ test("library titles are requested only from Options", async () => {
 });
 
 test("onboarding policy belongs to the library", async () => {
-  const source = await readFile(new URL("player.js", root), "utf8");
+  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
   const book = JSON.parse(await readFile(new URL("media/episode-001/book.json", root), "utf8"));
   assert.equal(library.ui.onboardingEnabled, true);
@@ -199,7 +199,7 @@ test("service worker keeps online requests first and serves cached byte ranges",
 
 test("service-worker shell and versioned entry points stay in sync", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
-  const source = await readFile(new URL("player.js", root), "utf8");
+  const source = await readFile(new URL("js/player-app.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
   const version = worker.match(/const SHELL_VERSION = "v(\d+)"/)?.[1];
   assert.ok(version);
@@ -208,7 +208,7 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const strings = "./i18n.js?v=" + version;
   assert.ok(html.includes('src="' + script + '"'));
   assert.ok(html.includes('href="' + style + '"'));
-  assert.ok(source.includes('from "' + strings + '"'));
+  assert.ok(source.includes('from ".' + strings + '"'));
   const urls = worker.match(/const SHELL_URLS = \[([\s\S]*?)\];/)[1];
   const paths = new Set([...urls.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
   const modules = (await readdir(new URL("js/", root))).filter((name) => name.endsWith(".js"));

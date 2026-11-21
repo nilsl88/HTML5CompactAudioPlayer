@@ -10,7 +10,8 @@ Keep the existing configuration schema and static deployment model compatible. P
 
 - `index.html`: semantic markup, controls, dialogs, and the `<audio>` element.
 - `player.css`: design tokens, responsive layout, control states, tooltips, and reduced-motion rules.
-- `player.js`: application coordinator, DOM rendering, event wiring, localization, and feature orchestration.
+- `player.js` starts the browser player.
+- `js/player-app.js` coordinates startup, DOM rendering, events, localization, and features.
 - `sw.js`: network-first application shell and byte-range responses from downloaded audio chunks.
 - `i18n.js`: interface strings for English, Danish, Norwegian Bokmål, and Swedish.
 - `js/config.js`: configuration parsing, validation, URL resolution, and localization helpers.
@@ -18,7 +19,8 @@ Keep the existing configuration schema and static deployment model compatible. P
 - `js/media-controller.js`: the only owner of audio source changes, loading, seeking, play/pause state, and fallback transitions.
 - `js/offline.js`: service-worker registration, storage preflight, chunk downloads, resume state, and offline manifests.
 - `js/source-selection.js`: codec evidence, quality ordering, and deterministic fallback queues.
-- `js/availability.js`: abortable HTTP HEAD and Range availability probes.
+- `js/availability.js` performs abortable HTTP HEAD and Range probes.
+- `js/availability-session.js` schedules probes for the selected language after chapter loading and records successful playback.
 - `js/chapters.js`: cached chapter requests and WebVTT loading.
 - `js/mp4-chapters.js`: bounded Range-based MP4 chapter and cover-art parsing.
 - `js/storage.js`: guarded localStorage access, migrations, progress, preferences, chapter text, and availability cache.

@@ -2,8 +2,8 @@ import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { createCustomSelects } from "../js/custom-select.js";
-import { Element, openPlayerPage } from "./player-page.mjs";
-import { PlayerStorage } from "../js/storage.js";
+import { deferred, Element, openPlayerPage } from "./player-page.mjs";
+import { OfflineManager } from "../js/offline.js";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
@@ -52,11 +52,9 @@ test("custom selects commit a keyboard choice and restore focus on Escape", () =
 test("reset clears only this installation's progress, even for a shared book ID", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map([["compactPlayer:sample", JSON.stringify({ progressByLang: { en: 45 } })]]);
-  const restore = [];
-  t.after(() => { for (const cleanup of restore.reverse()) cleanup(); });
   async function visit(path, reload = assert.fail) {
     const location = Object.assign(new URL(path, "https://example.test"), { reload });
-    const page = await openPlayerPage({ after: (cleanup) => restore.push(cleanup) },
+    const page = await openPlayerPage(
       { ...book, duration: 600 }, assert.fail, saved, { location });
     return page.elements;
   }
@@ -88,9 +86,7 @@ test("a passive tab and a delayed progress save preserve the latest listening po
   t.mock.timers.enable({ apis: ["setTimeout"] });
   t.mock.method(Date, "now", () => 1_800_000_000_000);
   const saved = new Map();
-  const restore = [];
-  t.after(() => { for (const cleanup of restore.reverse()) cleanup(); });
-  const visit = () => openPlayerPage({ after: (cleanup) => restore.push(cleanup) }, { ...book, duration: 600 }, assert.fail, saved);
+  const visit = () => openPlayerPage({ ...book, duration: 600 }, assert.fail, saved);
   function listen(page, seconds) {
     page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
     page.audio.duration = 600;
@@ -132,7 +128,7 @@ function queueListeningPosition(page) {
 
 test("reset discards its pending position before pause, pagehide or a delayed save", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const page = await openPlayerPage(t, book, assert.fail, new Map(), {
+  const page = await openPlayerPage(book, assert.fail, new Map(), {
     location: Object.assign(new URL("https://example.test/"), { reload() {} }),
   });
   queueListeningPosition(page);
@@ -141,16 +137,41 @@ test("reset discards its pending position before pause, pagehide or a delayed sa
   page.audio.dispatchEvent(new Event("timeupdate"));
   page.window.dispatchEvent(new Event("pagehide"));
   t.mock.timers.tick(5000);
-  assert.equal(PlayerStorage.fromBrowser().getProgress(book.id, "en"), 0);
+  assert.equal(page.storage.getProgress(book.id, "en"), 0);
+});
+
+test("reset prevents late chapter and probe results from repopulating local storage", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const offlineReset = deferred();
+  t.mock.method(OfflineManager.prototype, "reset", () => offlineReset.promise);
+  const saved = new Map();
+  const chapter = deferred();
+  const probes = [];
+  const config = { ...book, languages: { en: { ...book.languages.en, chapters: "chapters.vtt" } } };
+  const location = Object.assign(new URL("https://example.test"), { reload: t.mock.fn() });
+  const { elements, window } = await openPlayerPage(config, (url) => {
+    if (url.endsWith(".vtt")) return chapter.promise;
+    probes.push(url);
+    return new Response(null, { status: 200 });
+  }, saved, { location });
+  elements.get("resetOk").dispatchEvent(new Event("click"));
+  window.dispatchEvent(new Event("online"));
+  chapter.resolve(new Response(chapterText));
+  await settle();
+  t.mock.timers.tick(5000);
+  await settle();
+  offlineReset.resolve();
+  await settle();
+  assert.equal(location.reload.mock.callCount(), 1);
+  assert.deepEqual([...saved.keys()], ["compactPlayer@%2F:reset"]);
+  assert.deepEqual(probes, []);
 });
 
 test("a reset invalidates queued positions from another tab, including after a second reset", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map();
-  const restore = [];
-  t.after(() => { for (const cleanup of restore.reverse()) cleanup(); });
   const visit = (location = new URL("https://example.test/")) => openPlayerPage(
-    { after: (cleanup) => restore.push(cleanup) }, book, assert.fail, saved, { location });
+    book, assert.fail, saved, { location });
   for (let attempt = 0; attempt < 2; attempt++) {
     const listener = await visit();
     queueListeningPosition(listener);
@@ -170,14 +191,14 @@ test("a reset invalidates queued positions from another tab, including after a s
 
 test("a queued position preserves a subsequent quality selection", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const page = await openPlayerPage(t, { ...book,
+  const page = await openPlayerPage({ ...book,
     languages: { en: { sources: { aac: { 96: "high.m4b", 64: "low.m4b" } } } } }, assert.fail);
   queueListeningPosition(page);
   const quality = page.elements.get("qualitySelect");
   quality.value = "aac-64";
   quality.dispatchEvent(new Event("change"));
   page.window.dispatchEvent(new Event("pagehide"));
-  const saved = PlayerStorage.fromBrowser();
+  const saved = page.storage;
   assert.equal(saved.readBook(book.id).quality, "aac-64");
   assert.equal(saved.getProgress(book.id, "en"), 20);
 });
@@ -185,13 +206,11 @@ test("a queued position preserves a subsequent quality selection", async (t) => 
 test("chapter updates keep one WebVTT copy and discard older versions", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map();
-  const restore = [];
-  t.after(() => { for (const cleanup of restore.reverse()) cleanup(); });
   const chapterUrl = "https://example.test/media/sample/chapters.vtt";
   const text = "WEBVTT\n\n00:00.000 --> 00:10.000\nOpening";
   const series = { ...book, languages: { en: { ...book.languages.en, chapters: "chapters.vtt" } } };
   let requests = 0;
-  const visit = (cacheVersion) => openPlayerPage({ after: (cleanup) => restore.push(cleanup) },
+  const visit = (cacheVersion) => openPlayerPage(
     { ...series, cacheVersion }, (url) => { assert.equal(url, chapterUrl); requests++; return new Response(text); }, saved);
   await visit(1);
   await visit(2);
@@ -204,7 +223,7 @@ test("chapter updates keep one WebVTT copy and discard older versions", async (t
 
 test("pausing while offline keeps playback paused after reconnecting", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { audio, elements, navigator, window } = await openPlayerPage(t, book, assert.fail);
+  const { audio, elements, navigator, window } = await openPlayerPage(book, assert.fail);
   const button = elements.get("playPauseBtn");
   const play = t.mock.method(audio, "play");
   function setOnline(online) {
@@ -239,7 +258,7 @@ test("a blocked Media Session leaves playback and chapter controls available", a
   const navigator = { language: "en", onLine: true,
     get mediaSession() { throw new DOMException("Blocked", "SecurityError"); },
   };
-  const { elements, audio } = await openPlayerPage(t, { ...book,
+  const { elements, audio } = await openPlayerPage({ ...book,
     languages: { en: { ...book.languages.en, chapters: "en.vtt" } } }, () => new Response(chapterText), new Map(), { navigator });
   elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   assert.ok(audio.src.endsWith("/sample.m4b"));
@@ -248,8 +267,8 @@ test("a blocked Media Session leaves playback and chapter controls available", a
 
 test("the player starts and accepts Play when accessing localStorage throws", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { audio, elements } = await openPlayerPage(t, book, assert.fail, null);
-  assert.throws(() => globalThis.localStorage, { name: "SecurityError" });
+  const { audio, elements, window } = await openPlayerPage(book, assert.fail, null);
+  assert.throws(() => window.localStorage, { name: "SecurityError" });
   assert.equal(elements.get("bookTitle").textContent, book.title.en);
   assert.ok(!audio.src);
 
@@ -264,7 +283,7 @@ test("the player starts and accepts Play when accessing localStorage throws", as
 
 test("the player starts and plays online when access to Cache Storage is blocked", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { audio, elements } = await openPlayerPage(t, book, assert.fail, new Map(), {
+  const { audio, elements } = await openPlayerPage(book, assert.fail, new Map(), {
     navigator: { onLine: true, language: "en", serviceWorker: {} },
     get caches() { throw new DOMException("Cache Storage is blocked.", "SecurityError"); },
   });
@@ -281,7 +300,7 @@ test("the player starts and plays online when access to Cache Storage is blocked
 
 test("click and Space can pause the first play request while it is loading", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { audio, elements, document, navigator, window } = await openPlayerPage(t, book, assert.fail);
+  const { audio, elements, document, navigator, window } = await openPlayerPage(book, assert.fail);
   const button = elements.get("playPauseBtn");
   let finishPlay;
   const play = t.mock.method(audio, "play", () => new Promise((resolve) => { finishPlay = resolve; }));
@@ -312,7 +331,7 @@ const invalidLanguageBook = { ...book, languages: {
 
 test("an unusable preferred audio language falls back to the book default at startup", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { elements, audio } = await openPlayerPage(t, invalidLanguageBook, assert.fail, new Map(), {
+  const { elements, audio } = await openPlayerPage(invalidLanguageBook, assert.fail, new Map(), {
     navigator: { onLine: true, language: "da" },
   });
   assert.equal(elements.get("bookTitle").textContent, book.title.en);
@@ -323,7 +342,7 @@ test("an unusable preferred audio language falls back to the book default at sta
 
 test("a rejected language switch preserves the playing source and its listening position", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const page = await openPlayerPage(t, invalidLanguageBook, assert.fail);
+  const page = await openPlayerPage(invalidLanguageBook, assert.fail);
   queueListeningPosition(page);
   const src = page.audio.src;
   const language = page.elements.get("langSelect");
@@ -334,7 +353,7 @@ test("a rejected language switch preserves the playing source and its listening 
   page.window.dispatchEvent(new Event("pagehide"));
   assert.equal(language.value, "en");
   assert.equal(page.audio.src, src);
-  assert.deepEqual(PlayerStorage.fromBrowser().readBook(book.id).progressByLang, { en: 42 });
+  assert.deepEqual(page.storage.readBook(book.id).progressByLang, { en: 42 });
 });
 
 const chapterText = "WEBVTT\n\n00:00.000 --> 00:10.000\nIntroduction";
@@ -347,9 +366,8 @@ for (const button of ["prevChapterBtn", "nextChapterBtn"]) {
       da: { ...book.languages.en, chapters: "da.vtt" },
     } };
     const saved = new Map([["compactPlayer:sample", JSON.stringify({ progressByLang: { en: 10 } })]]);
-    const { elements } = await openPlayerPage(t, config, (_url, { signal }) =>
+    const { elements, storage } = await openPlayerPage(config, (_url, { signal }) =>
       new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })), saved);
-    const storage = PlayerStorage.fromBrowser();
     storage.writeChapters(book.id, "da", 1, "https://example.test/media/sample/da.vtt",
       "WEBVTT\n\n00:00.000 --> 00:30.000\nStart\n\n00:30.000 --> 01:00.000\nAndet kapitel");
     elements.get(button).dispatchEvent(new Event("click"));
@@ -365,7 +383,7 @@ for (const button of ["prevChapterBtn", "nextChapterBtn"]) {
 test("chapter sleep respects a newer timer choice while the chapter file is loading", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   let finish;
-  const { elements } = await openPlayerPage(t, { ...book, languages: { en: { ...book.languages.en, chapters: "en.vtt" } } },
+  const { elements } = await openPlayerPage({ ...book, languages: { en: { ...book.languages.en, chapters: "en.vtt" } } },
     () => new Promise((resolve) => { finish = resolve; }));
   const choices = elements.get("sleepList");
   choices.children[0].dispatchEvent(new Event("click"));
@@ -382,7 +400,7 @@ test("chapter sleep respects a newer timer choice while the chapter file is load
 
 test("chapter sleep requires a current chapter even when book duration is known", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { elements } = await openPlayerPage(t, { ...book, duration: 28800 }, assert.fail);
+  const { elements } = await openPlayerPage({ ...book, duration: 28800 }, assert.fail);
   elements.get("sleepList").children[0].dispatchEvent(new Event("click"));
   await settle();
   assert.equal(elements.get("sleepBtn").dataset.tooltip, "Sleep timer");
@@ -392,7 +410,7 @@ test("chapter sleep requires a current chapter even when book duration is known"
 test("switching language loads WebVTT while the new audio play request is still pending", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const calls = [];
-  const { elements, audio } = await openPlayerPage(t, { ...book, languages: { en: book.languages.en,
+  const { elements, audio } = await openPlayerPage({ ...book, languages: { en: book.languages.en,
     da: { chapters: "da.vtt", sources: { aac: { 96: "da.m4b" } } },
   } }, (url) => { calls.push(new URL(url).pathname); return new Response(chapterText); });
   elements.get("playPauseBtn").dispatchEvent(new Event("click"));
@@ -415,7 +433,7 @@ test("reconnection restores a missing catalog without interrupting the active bo
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const navigator = { onLine: false, language: "en" };
   const counts = { library: 0, book: 0 };
-  const { window, elements, audio } = await openPlayerPage(t, book, assert.fail, new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]), {
+  const { window, elements, audio } = await openPlayerPage(book, assert.fail, new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]), {
     navigator, location: new URL("https://example.test/?book=sample"),
     fetch: async (url) => {
       if (url.endsWith("/library.json")) {
@@ -453,7 +471,7 @@ test("reconnection restores a missing catalog without interrupting the active bo
 test("chapter gaps clear the active title and still allow previous-chapter navigation", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const vtt = chapterText + "\n\n00:20.000 --> 00:30.000\nFinale";
-  const { elements, audio } = await openPlayerPage(t, { ...book, duration: 60,
+  const { elements, audio } = await openPlayerPage({ ...book, duration: 60,
     languages: { en: { ...book.languages.en, chapters: "en.vtt" } } }, () => new Response(vtt));
   elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   audio.duration = 60;
@@ -479,7 +497,7 @@ test("reconnection opens the only catalog book after offline startup failed", as
   t.mock.method(console, "error", () => {});
   const navigator = { onLine: false, language: "en" };
   const requests = [];
-  const { window, elements, audio } = await openPlayerPage(t, book, assert.fail, new Map(), {
+  const { window, elements, audio } = await openPlayerPage(book, assert.fail, new Map(), {
     navigator, fetch: async (url) => {
       if (!navigator.onLine) return new Response(null, { status: 404 });
       requests.push(new URL(url).pathname);
@@ -511,7 +529,7 @@ test("invalid cached and downloaded chapter text remains retryable until valid W
   const saved = new Map([[key, JSON.stringify({ kind: "vtt", url, text: "<html>Old error</html>" })]]);
   const texts = ["<html>Temporary error</html>", "<html>Still unavailable</html>", "WEBVTT\n"];
   let calls = 0;
-  const { window, elements } = await openPlayerPage(t, { ...book, languages: {
+  const { window, elements } = await openPlayerPage({ ...book, languages: {
     en: { ...book.languages.en, chapterSource: "vtt", chapters: "en.vtt" },
   } }, (requestedUrl, options) => {
     assert.equal(requestedUrl, url);
@@ -539,7 +557,7 @@ test("a successfully loaded empty catalog stays empty on reconnect", async (t) =
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const navigator = { onLine: false, language: "en" };
   let catalogs = 0;
-  const { window, elements } = await openPlayerPage(t, book, assert.fail, new Map(), {
+  const { window, elements } = await openPlayerPage(book, assert.fail, new Map(), {
     navigator, location: new URL("https://example.test/?book=sample"), fetch: async (url) => {
       if (!url.endsWith("/library.json")) return Response.json(book);
       catalogs++;
