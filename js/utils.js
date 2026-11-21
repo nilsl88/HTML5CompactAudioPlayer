@@ -38,7 +38,7 @@ export function createAbortError(message = "Operation canceled") {
   catch { const error = new Error(message); error.name = "AbortError"; return error; }
 }
 
-export async function fetchWithRetry(url, options = {}) {
+export async function fetchWithRetry(url, options = {}, readResponse) {
   const {
     fetchImpl = globalThis.fetch,
     retries = 2,
@@ -55,16 +55,22 @@ export async function fetchWithRetry(url, options = {}) {
     const abort = () => controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
     try {
-      const response = await fetchImpl(url, { ...fetchOptions, signal: controller.signal });
-      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === retries - 1) return response;
+      response = await fetchImpl(url, { ...fetchOptions, signal: controller.signal });
+      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === retries - 1) {
+        return readResponse ? await readResponse(response) : response;
+      }
       lastError = new Error(`Request failed with HTTP ${response.status}`);
+      controller.abort();
     } catch (error) {
+      // Once headers arrive, the caller decides how to handle a failed body or invalid range.
+      if (response || signal?.aborted || attempt === retries - 1) throw error;
       lastError = error;
-      if (signal?.aborted || attempt === retries - 1) throw error;
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
+      if (readResponse) controller.abort();
     }
     await new Promise((resolve, reject) => {
       const finish = () => { signal?.removeEventListener("abort", abort); resolve(); };
@@ -74,6 +80,12 @@ export async function fetchWithRetry(url, options = {}) {
     });
   }
   throw lastError || new Error("Request failed");
+}
+
+export function fetchTextWithRetry(url, options) {
+  return fetchWithRetry(url, options, async (response) => ({
+    ok: response.ok, status: response.status, text: response.ok ? await response.text() : "",
+  }));
 }
 
 export function clearChildren(element) {

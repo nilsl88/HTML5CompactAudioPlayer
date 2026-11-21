@@ -47,6 +47,11 @@ export function normalizeBook(raw, { bookBaseUrl, documentBaseUrl }) {
     if (!value || typeof value !== "object") continue;
     const code = normalizeLanguageTag(rawCode);
     if (!code) continue;
+    const baseUrl = value.basePath
+      ? safeUrl(value.basePath, documentBaseUrl)
+      : bookBaseUrl;
+    if (!baseUrl) continue;
+    const directory = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
     const sources = {};
     for (const codec of CODECS) {
       const configured = value.sources?.[codec];
@@ -54,20 +59,16 @@ export function normalizeBook(raw, { bookBaseUrl, documentBaseUrl }) {
       const byBitrate = {};
       for (const [bitrate, path] of Object.entries(configured)) {
         const parsedBitrate = Number.parseInt(bitrate, 10);
-        if (!Number.isFinite(parsedBitrate) || parsedBitrate <= 0 || !String(path || "").trim()) continue;
+        if (!Number.isFinite(parsedBitrate) || parsedBitrate <= 0 || !safeUrl(path, directory)) continue;
         byBitrate[String(parsedBitrate)] = String(path).trim();
       }
       if (Object.keys(byBitrate).length) sources[codec] = byBitrate;
     }
     if (!Object.keys(sources).length) continue;
-    const baseUrl = value.basePath
-      ? safeUrl(value.basePath, documentBaseUrl)
-      : bookBaseUrl;
-    if (!baseUrl) continue;
     languages[code] = {
       code,
       label: String(value.label || rawCode),
-      baseUrl: baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`,
+      baseUrl: directory,
       chapters: String(value.chapters || ""),
       chapterSource: ["vtt", "embedded", "auto", "none"].includes(value.chapterSource)
         ? value.chapterSource

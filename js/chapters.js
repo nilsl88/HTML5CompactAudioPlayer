@@ -1,4 +1,4 @@
-import { fetchWithRetry } from "./utils.js";
+import { fetchTextWithRetry } from "./utils.js";
 import { parseWebVtt } from "./vtt.js";
 import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js";
 
@@ -14,7 +14,7 @@ export async function loadChapterFile(url, {
   signal,
   timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS,
 } = {}) {
-  const response = await fetchWithRetry(url, {
+  const response = await fetchTextWithRetry(url, {
     fetchImpl,
     cache: "default",
     credentials: "same-origin",
@@ -22,7 +22,7 @@ export async function loadChapterFile(url, {
     timeoutMs,
   });
   if (!response.ok) throw new Error(`Chapter request failed with HTTP ${response.status}.`);
-  return parseChapterText(await response.text());
+  return parseChapterText(response.text);
 }
 
 export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS } = {}) {
@@ -38,19 +38,21 @@ export async function loadChapters({ mode = "none", vttUrl = "", sourceUrl = "",
     return { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs }) };
   }
   if (mode === "auto") {
+    let vttError;
     if (vttUrl) {
       try {
         const result = { kind: "vtt", ...await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs }) };
         if (result.cues.length) return result;
       } catch (error) {
-        if (error?.name === "AbortError") throw error;
+        if (signal?.aborted) throw error;
+        vttError = error;
       }
     }
-    try { return await loadEmbedded(); }
-    catch (error) {
-      if (error?.name === "AbortError") throw error;
-      return { kind: "none", text: "", cues: [] };
+    if (canReadEmbedded && sourceUrl) {
+      const result = await loadEmbedded();
+      if (result.cues.length || !vttError) return result;
     }
+    if (vttError) throw vttError;
   }
   return { kind: "none", text: "", cues: [] };
 }

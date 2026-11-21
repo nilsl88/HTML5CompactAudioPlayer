@@ -48,7 +48,7 @@ export function buildSources(language, audioElement) {
         codec,
         bitrate,
         extension,
-        mime: selected.mime,
+        mime: selected.mime || mimeCandidates.at(-1),
         url: resolveLanguageAsset(language, path),
         support: selected.support,
         availability: "unknown",

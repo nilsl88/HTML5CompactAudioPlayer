@@ -7,7 +7,11 @@ function focusableElements(container) {
 
 function fallbackKeydown(event) {
   const dialog = event.currentTarget;
-  if (event.key === "Escape") { event.preventDefault(); closeDialog(dialog); return; }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (dialog.dispatchEvent(new Event("cancel", { cancelable: true }))) closeDialog(dialog);
+    return;
+  }
   if (event.key !== "Tab") return;
   const items = focusableElements(dialog);
   if (!items.length) { event.preventDefault(); return; }
@@ -45,10 +49,11 @@ export function closeDialog(dialog) {
 }
 
 export function bindDialogDismiss(dialog, closeButton, onClose) {
-  closeButton?.addEventListener("click", () => { onClose?.(); closeDialog(dialog); });
-  dialog?.addEventListener("cancel", (event) => { event.preventDefault(); onClose?.(); closeDialog(dialog); });
+  const dismiss = () => { if (onClose?.() !== false) closeDialog(dialog); };
+  closeButton?.addEventListener("click", dismiss);
+  dialog?.addEventListener("cancel", (event) => { event.preventDefault(); dismiss(); });
   dialog?.addEventListener("click", (event) => {
-    if (event.target === dialog) { onClose?.(); closeDialog(dialog); }
+    if (event.target === dialog) dismiss();
   });
 }
 

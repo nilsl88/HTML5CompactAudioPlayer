@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { setImmediate as settle } from "node:timers/promises";
+import { openPlayerPage } from "./player-page.mjs";
 import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
 import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
 
@@ -87,12 +89,68 @@ test("chapter requests report HTTP failures", async () => {
   );
 });
 
+for (const [format, load] of [["WebVTT", loadChapterFile], ["MP4", loadEmbeddedMp4Chapters]]) {
+  test(`canceling a ${format} chapter request interrupts a body that is already being read`, async () => {
+    const outer = new AbortController();
+    let transport, response, body;
+    const fetchImpl = async (_url, { signal }) => {
+      transport = signal;
+      const stream = new ReadableStream({ start(controller) { body = controller; } });
+      signal.addEventListener("abort", () => body.error(signal.reason), { once: true });
+      response = new Response(stream, { status: 206, headers: { "content-range": "bytes 0-7/8" } });
+      return response;
+    };
+    const result = load("https://example.test/chapters", { fetchImpl, signal: outer.signal });
+    await settle();
+    assert.ok(response.bodyUsed);
+    outer.abort();
+    const aborted = transport.aborted;
+    if (!aborted) body.close();
+    await assert.rejects(result, { name: "AbortError" });
+    assert.ok(aborted);
+  });
+}
+
 test("reads Nero embedded chapters with one metadata range", async () => {
   const chapters = await loadEmbeddedMp4Chapters("https://example.test/book.m4b", { fetchImpl: rangedFetch(neroMetadata()) });
   assert.deepEqual(chapters, [
     { start: 0, end: 60, title: "Intro" },
     { start: 60, end: null, title: "Chapter 1" },
   ]);
+});
+
+test("reconnecting retries failed embedded chapters without a WebVTT URL", async (t) => {
+  for (const mode of ["embedded", "auto"]) {
+    await t.test(mode, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const errors = t.mock.method(console, "error", () => {});
+      const book = {
+        id: "book", defaultLanguage: "en",
+        languages: { en: { chapterSource: mode, sources: { aac: { 128: "book.m4b" } } } },
+      };
+      const metadata = rangedFetch(neroMetadata());
+      const requests = [];
+      const { audio, elements, navigator, window } = await openPlayerPage(t, book, (url, options) => {
+        requests.push({ url, range: options.headers?.Range });
+        if (requests.length === 1) return new Response(null, { status: 404 });
+        return metadata(url, options);
+      });
+      const list = elements.get("chaptersList");
+      assert.equal(requests.length, 1);
+      assert.equal(list.children[0].className, "chapter-load-error");
+      navigator.onLine = false;
+      window.dispatchEvent(new Event("offline"));
+      navigator.onLine = true;
+      window.dispatchEvent(new Event("online"));
+      window.dispatchEvent(new Event("online"));
+      await settle();
+      assert.equal(requests.length, 2);
+      assert.deepEqual(requests[1], requests[0]);
+      assert.equal(list.children[0].children[0].textContent, "Intro");
+      assert.ok(!audio.src);
+      assert.equal(errors.mock.callCount(), 1);
+    });
+  }
 });
 
 test("finds MP4 metadata after a large media-data atom", async () => {

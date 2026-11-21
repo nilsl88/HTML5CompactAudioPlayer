@@ -17,6 +17,11 @@ function stateFromStatus(status) {
   return "unknown";
 }
 
+function combineProbeResults(head, range) {
+  if (head === "available" || range === "available") return "available";
+  return head === "missing" && range === "missing" ? "missing" : "unknown";
+}
+
 export async function probeUrl(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 8000 } = {}) {
   if (!url || signal?.aborted) return "unknown";
   let headState = "unknown";
@@ -33,7 +38,7 @@ export async function probeUrl(url, { fetchImpl = globalThis.fetch, signal, time
     const range = await requestProbe(fetchImpl, url, { method: "GET", headers: { Range: "bytes=0-0" } }, signal, timeoutMs);
     const rangeState = stateFromStatus(range.status);
     await cancelBody(range);
-    return rangeState === "unknown" ? (headState === "missing" ? "unknown" : headState) : rangeState;
+    return combineProbeResults(headState, rangeState);
   } catch (error) {
     if (signal?.aborted) throw error;
     return "unknown";
@@ -42,12 +47,13 @@ export async function probeUrl(url, { fetchImpl = globalThis.fetch, signal, time
 
 export async function scanSources(sources, options = {}) {
   const { concurrency = 3, signal, onResult } = options;
+  const results = sources.map((source) => ({ ...source }));
   let next = 0;
   async function worker() {
     while (next < sources.length && !signal?.aborted) {
       const index = next;
       next += 1;
-      const source = sources[index];
+      const source = results[index];
       const availability = await probeUrl(source.url, options);
       if (signal?.aborted) return;
       source.availability = availability;
@@ -55,5 +61,5 @@ export async function scanSources(sources, options = {}) {
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, sources.length) }, worker));
-  return sources;
+  return results;
 }
