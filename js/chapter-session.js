@@ -2,9 +2,10 @@ import { loadChapters } from "./chapters.js";
 import { resolveLanguageAsset } from "./config.js";
 
 export class ChapterSession {
-  constructor({ fetchImpl, openCache, onStart, onLoaded, onFailure }) {
+  constructor({ fetchImpl, openCache, isOnline = () => globalThis.navigator?.onLine !== false, onStart, onLoaded, onFailure }) {
     this.fetchImpl = fetchImpl;
     this.openCache = openCache;
+    this.isOnline = isOnline;
     this.onStart = onStart;
     this.onLoaded = onLoaded;
     this.onFailure = onFailure;
@@ -18,6 +19,7 @@ export class ChapterSession {
     this.controller = null;
     this.pending = null;
     this.notifyFailure = false;
+    this.retryVtt = false;
     this.status = "idle";
     this.cues = [];
     this.activeIndex = -1;
@@ -45,18 +47,28 @@ export class ChapterSession {
     return this.mode === "none" || (this.mode === "vtt" && !this.url);
   }
 
-  accept(result) {
+  accept(result, pending = false) {
     this.status = "loaded";
+    this.retryVtt = Boolean(result.retryVtt);
     this.cues = result.cues;
-    this.onLoaded(result);
+    this.onLoaded(result, pending);
+  }
+
+  async reconnect() {
+    const generation = this.generation;
+    if (this.status === "loading") await this.pending;
+    if (generation === this.generation && this.isOnline() && (this.status === "failed" || this.retryVtt)) {
+      return this.load({ force: true, notifyFailure: false });
+    }
   }
 
   load({ force = false, notifyFailure = true } = {}) {
+    if (this.status === "loaded" && !(force && this.retryVtt)) return Promise.resolve();
     if (this.pending) {
       this.notifyFailure ||= notifyFailure;
       return this.pending;
     }
-    if (this.status === "loaded" || (this.status === "failed" && !force)) return Promise.resolve();
+    if (this.status === "failed" && !force) return Promise.resolve();
     if (this.unavailable) {
       this.accept({ kind: "none", cues: [], text: "" });
       return Promise.resolve();
@@ -66,7 +78,7 @@ export class ChapterSession {
     const controller = new AbortController();
     this.controller = controller;
     this.generation += 1;
-    this.status = "loading";
+    if (!this.retryVtt) this.status = "loading";
     this.notifyFailure = notifyFailure;
     this.onStart();
     this.pending = this.fetch(controller, force, cache);
@@ -78,6 +90,8 @@ export class ChapterSession {
       const result = await loadChapters({
         mode: this.mode, vttUrl: this.url, sourceUrl: this.source?.url, sourceMime: this.source?.mime,
         cacheVersion: this.cacheVersion, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate, cache,
+        online: this.isOnline(), fallbackCues: this.retryVtt ? this.cues : null,
+        onFallback: (result) => { if (!controller.signal.aborted) this.accept(result, true); },
       });
       if (controller.signal.aborted) return;
       this.accept(result);
@@ -106,9 +120,10 @@ export class ChapterSession {
 
   seekTarget(direction, position, duration) {
     if (direction === "next") return this.cues.find((cue) => cue.start > position + .05)?.start;
-    const index = this.lastStarted(position);
-    const restart = index >= 0 && (position >= this.end(index, duration) || position - this.cues[index].start > 3);
-    return this.cues[restart ? index : Math.max(0, index - 1)]?.start;
+    const active = this.indexAt(position, duration);
+    if (active < 0) return this.cues[Math.max(0, this.lastStarted(position))]?.start;
+    if (position - this.cues[active].start > 3) return this.cues[active].start;
+    return this.cues[Math.max(0, active - 1)].start;
   }
 
   lastStarted(position) {

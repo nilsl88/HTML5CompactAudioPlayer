@@ -1,5 +1,8 @@
+import { normalizeLanguageTag } from "./js/utils.js";
+
 export const UI_STRINGS = {
   en: {
+    languageName: "English",
     openCover: "Open cover image",
     loading: "Loading audio files and languages…",
     audio: "Audio",
@@ -144,6 +147,7 @@ export const UI_STRINGS = {
     offlinePersistenceWarning: "The browser may remove this download when storage is low.",
   },
   da: {
+    languageName: "Dansk",
     openCover: "Åbn forsidebillede",
     loading: "Indlæser lydfiler og sprog…",
     audio: "Lyd",
@@ -288,6 +292,7 @@ export const UI_STRINGS = {
     offlinePersistenceWarning: "Browseren kan fjerne denne download, hvis lagerpladsen bliver lav.",
   },
   nb: {
+    languageName: "Norsk (bokmål)",
     openCover: "Åpne omslagsbilde",
     loading: "Laster lydfiler og språk…",
     audio: "Lyd",
@@ -432,6 +437,7 @@ export const UI_STRINGS = {
     offlinePersistenceWarning: "Nettleseren kan fjerne nedlastingen hvis det blir lite lagringsplass.",
   },
   sv: {
+    languageName: "Svenska",
     openCover: "Öppna omslagsbild",
     loading: "Laddar ljudfiler och språk…",
     audio: "Ljud",
@@ -576,3 +582,23 @@ export const UI_STRINGS = {
     offlinePersistenceWarning: "Webbläsaren kan ta bort nedladdningen om lagringsutrymmet blir lågt.",
   }
 };
+
+export function resolveUiLocale(preference, browser) {
+  if (preference !== "auto") {
+    const normalized = normalizeLanguageTag(preference);
+    return UI_STRINGS[normalized] ? normalized : "en";
+  }
+  const candidates = [...(browser.languages || []), browser.language || ""];
+  return candidates.map(normalizeLanguageTag).find((value) => UI_STRINGS[value]) || "en";
+}
+
+export function translateAt(language, key, variables = {}) {
+  let value = UI_STRINGS[language]?.[key] ?? UI_STRINGS.en[key] ?? key;
+  for (const [name, replacement] of Object.entries(variables)) value = value.replaceAll(`{${name}}`, String(replacement));
+  return value;
+}
+
+export function uiLanguageOptions(locale) {
+  const languages = Object.entries(UI_STRINGS).map(([value, strings]) => ({ value, label: strings.languageName }));
+  return [{ value: "auto", label: translateAt(locale, "uiLanguageAuto") }, ...languages];
+}

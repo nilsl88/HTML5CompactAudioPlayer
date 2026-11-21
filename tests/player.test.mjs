@@ -2,13 +2,156 @@ import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { createCustomSelects } from "../js/custom-select.js";
+import { openPanel } from "../js/dialogs.js";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
 import { OfflineManager } from "../js/offline.js";
+import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js";
+import { BookSelection } from "../js/book-selection.js";
+import { normalizeBook } from "../js/config.js";
+import { buildSources } from "../js/source-selection.js";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
   languages: { en: { sources: { aac: { 96: "sample.m4b" } } } },
 };
+
+test("regional recordings keep separate identities and reopen saved and downloaded language choices", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const edition = { id: "regional", defaultLanguage: "en-US", title: { "en-US": "American", "en-GB": "British" },
+    languages: { "en-GB": { sources: { mp3: { 64: "british.mp3" } } }, "en-US": { sources: { mp3: { 64: "american.mp3" } } } } };
+  const saved = new Map([["compactPlayer:regional", JSON.stringify({ language: "en", quality: "mp3-64", progressByLang: { en: 24 }, lastTime: 8 })]]);
+  const visit = (language, values = saved) => openPlayerPage(edition, assert.fail, values, { navigator: { onLine: true, language } });
+  const page = await visit("da");
+  const select = page.elements.get("langSelect");
+  const selectedTrack = (page) => page.elements.get("langSelect").children.find((option) => option.selected)?.value;
+  assert.deepEqual(select.children.map((option) => option.value), ["en-GB", "en-US"]);
+  assert.equal(selectedTrack(page), "en-US");
+  assert.equal(page.elements.get("timeCur").textContent, "0:24");
+  select.value = "en-GB";
+  select.dispatchEvent(new Event("change"));
+  assert.equal(page.elements.get("bookTitle").textContent, "British");
+  const reopened = await visit("en-US");
+  assert.equal(selectedTrack(reopened), "en-GB");
+  reopened.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.ok(reopened.audio.src.endsWith("/british.mp3"));
+  assert.equal(selectedTrack(await visit("en-gb", new Map())), "en-GB");
+  assert.equal(selectedTrack(await visit("en-AU", new Map())), "en-US");
+  const bilingual = await openPlayerPage({ ...edition, languages: { ...edition.languages, da: { sources: { mp3: { 64: "danish.mp3" } } } } },
+    assert.fail, new Map(), { navigator: { onLine: true, languages: ["da-DK", "en-US"] } });
+  assert.equal(selectedTrack(bilingual), "da");
+
+  const root = "https://example.test/";
+  const bookBaseUrl = root + "media/regional/";
+  const book = normalizeBook(edition, { bookBaseUrl, documentBaseUrl: root });
+  const sources = new Map(Object.values(book.languages).map((lang) => [lang.code, buildSources(lang)]));
+  const legacy = { episodeId: book.id, languageCode: "en", cacheVersion: 1, sourceId: "mp3-64", sourceUrl: bookBaseUrl + "british.mp3" };
+  const offline = new BookSelection({ bookId: book.id, book, sources, preferences: {}, downloaded: legacy,
+    browserLanguages: ["en-US"], saveSelection: assert.fail });
+  assert.equal(offline.languageCode, "en-GB");
+  assert.equal(offline.source.url, legacy.sourceUrl);
+  assert.equal(validateOfflineBookConfig(JSON.stringify(edition), bookBaseUrl + "book.json", root, legacy), book.id);
+  const selected = { ...legacy, languageCode: "en-GB" };
+  assert.ok(sameOfflineSelection(legacy, selected));
+  assert.equal(sameOfflineSelection({ ...selected, languageCode: "en-US" }, selected), false);
+  assert.equal(sameOfflineSelection({ ...legacy, languageTag: "en" }, selected), false);
+});
+
+test("opening a panel sets initial focus unless the user has already moved it or closed it", () => {
+  const trigger = new Element();
+  const panel = new Element();
+  const first = new Element();
+  const chapter = new Element();
+  let draw;
+  const document = { activeElement: trigger, defaultView: { requestAnimationFrame: (fn) => { draw = fn; } } };
+  panel.ownerDocument = document;
+  first.focus = () => { document.activeElement = first; };
+  for (const action of ["open", "choose chapter", "close"]) {
+    document.activeElement = trigger;
+    openPanel(panel, trigger, first);
+    if (action === "choose chapter") document.activeElement = chapter;
+    if (action === "close") panel.hidden = true;
+    draw();
+    const expected = { open: first, "choose chapter": chapter, close: trigger };
+    assert.equal(document.activeElement, expected[action]);
+  }
+});
+
+test("holding Space toggles playback once per press while repeated arrow keys continue seeking", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { document, audio, storage, ready } = await openPlayerPage(book, assert.fail);
+  await ready;
+  const press = (code, repeat = false) => {
+    const event = Object.assign(new Event("keydown", { cancelable: true }), { code, repeat });
+    document.dispatchEvent(event);
+    assert.ok(event.defaultPrevented);
+  };
+  audio.play = async () => { audio.paused = false; };
+  audio.pause = () => { audio.paused = true; };
+  press("Space");
+  assert.equal(audio.paused, false);
+  press("Space", true);
+  assert.equal(audio.paused, false);
+  press("Space");
+  assert.equal(audio.paused, true);
+  press("Space", true);
+  assert.equal(audio.paused, true);
+  press("ArrowRight");
+  press("ArrowRight", true);
+  assert.equal(storage.getProgress(book.id, "en"), 10);
+});
+
+test("arrow shortcuts use the configured interval and leave focused controls alone", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { document, elements, storage, ready } = await openPlayerPage(book, assert.fail);
+  await ready;
+  const skip = elements.get("skipSelect");
+  skip.value = "30";
+  skip.dispatchEvent(new Event("change"));
+  const press = (code) => {
+    const event = Object.assign(new Event("keydown", { cancelable: true }), { code });
+    document.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  for (const [code, expected] of [["ArrowUp", 30], ["ArrowRight", 35], ["ArrowDown", 5], ["ArrowLeft", 0]]) {
+    assert.ok(press(code));
+    assert.equal(storage.getProgress(book.id, "en"), expected);
+  }
+  document.closest = () => skip;
+  assert.equal(press("ArrowUp"), false);
+  assert.equal(storage.getProgress(book.id, "en"), 0);
+});
+
+test("translated control tooltips follow the accessible labels after a language change", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { elements, ready } = await openPlayerPage(book, assert.fail);
+  await ready;
+  const select = elements.get("uiLangSelect");
+  const options = elements.get("optionsBtn");
+  const english = options.dataset.tooltip;
+  select.value = "da";
+  select.dispatchEvent(new Event("change"));
+  assert.notEqual(options.dataset.tooltip, english);
+  for (const id of ["playPauseBtn", "skipBackBtn", "skipForwardBtn", "sleepBtn", "prevChapterBtn",
+    "nextChapterBtn", "chaptersBtn", "optionsBtn", "resetBtn"]) {
+    const button = elements.get(id);
+    assert.ok(button.dataset.tooltip, id);
+    assert.equal(button.dataset.tooltip, button.getAttribute("aria-label") || button.textContent, id);
+  }
+});
+
+test("first-visit onboarding follows the catalog setting and saved acknowledgement", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const [enabled, seen] of [[true, false], [false, false], [true, true]]) {
+    const saved = seen ? new Map([["compactAudioPlayer.onboardingShown.v1", "1"]]) : new Map();
+    const { elements, ready } = await openPlayerPage(book, assert.fail, saved, {
+      fetch: async (url) => Response.json(url.endsWith("/library.json")
+        ? { books: [{ id: book.id }], ui: { onboardingEnabled: enabled } }
+        : { ...book, ui: { onboardingEnabled: !enabled } }),
+    });
+    await ready;
+    assert.equal(elements.get("onboardingDialog").getAttribute("open") !== null, enabled && !seen);
+  }
+});
 
 test("changing playback speed in another tab preserves the chosen theme", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -749,6 +892,24 @@ test("reconnection restores a missing catalog without interrupting the active bo
   selector.dispatchEvent(new Event("change"));
   await settle();
   assert.equal(elements.get("bookTitle").textContent, "Another book");
+});
+
+test("Previous follows the displayed chapter after an overlapping cue ends", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const vtt = "WEBVTT\n\n00:00.000 --> 00:30.000\nOpening\n\n00:05.000 --> 00:10.000\nNote\n\n00:40.000 --> 00:50.000\nFinale";
+  const { elements, audio } = await openPlayerPage({ ...book, duration: 60,
+    languages: { en: { ...book.languages.en, chapters: "en.vtt" } } }, () => new Response(vtt));
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  audio.duration = 60;
+  audio.dispatchEvent(new Event("loadedmetadata"));
+  for (const [position, title, target] of [[12, "Opening", 0], [9, "Note", 5], [7, "Note", 0], [51, "", 40]]) {
+    audio.currentTime = position;
+    audio.dispatchEvent(new Event("timeupdate"));
+    assert.equal(elements.get("bookMeta").textContent, ["en", "Low quality", title].filter(Boolean).join(" • "));
+    elements.get("prevChapterBtn").dispatchEvent(new Event("click"));
+    await settle();
+    assert.equal(audio.currentTime, target, "Previous at " + position);
+  }
 });
 
 test("chapter gaps clear the active title and still allow previous-chapter navigation", async (t) => {

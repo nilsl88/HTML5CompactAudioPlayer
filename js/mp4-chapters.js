@@ -1,143 +1,9 @@
-import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js";
-import "./offline-manifest.js";
-
-const { checkResponseVersion } = globalThis.CompactPlayerOfflineManifest;
-
-export const MP4_METADATA_CHUNK_BYTES = 256 * 1024;
-export const MP4_METADATA_LIMIT_BYTES = 16 * 1024 * 1024;
+import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js";
+import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js";
+export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js";
 export const MP4_COVER_LIMIT_BYTES = 10 * 1024 * 1024;
-const MP4_METADATA_CACHE_MS = 30000;
-const metadataRequestsByFetch = new WeakMap();
-
-const CONTAINER_TYPES = new Set(["moov", "trak", "mdia", "minf", "stbl", "stsd", "edts", "dinf", "udta", "tref", "ilst", "meta"]);
-
-function uint32(view, offset) { return view.getUint32(offset, false); }
-
-function uint64(view, offset) {
-  const high = view.getUint32(offset, false);
-  const low = view.getUint32(offset + 4, false);
-  const value = high * 4294967296 + low;
-  return Number.isSafeInteger(value) ? value : Number.NaN;
-}
-
-function atomType(bytes, offset) {
-  return new TextDecoder("ascii").decode(bytes.subarray(offset, offset + 4));
-}
-
-function parseBoxes(buffer, absoluteStart = 0, { skipPrefix = 0 } = {}) {
-  const bytes = new Uint8Array(buffer);
-  const view = new DataView(buffer);
-  const atoms = [];
-  let offset = skipPrefix;
-  while (offset + 8 <= bytes.byteLength) {
-    const start = offset;
-    let size = uint32(view, offset);
-    const type = atomType(bytes, offset + 4);
-    let headerSize = 8;
-    if (size === 1) {
-      if (offset + 16 > bytes.byteLength) break;
-      size = uint64(view, offset + 8);
-      headerSize = 16;
-    } else if (size === 0) size = bytes.byteLength - offset;
-    if (!Number.isSafeInteger(size) || size < headerSize) break;
-    if (offset + size > bytes.byteLength) {
-      atoms.push({ type, start: absoluteStart + start, size, headerSize, payloadStart: start + headerSize, payloadEnd: bytes.byteLength, buffer, truncated: true });
-      break;
-    }
-    atoms.push({ type, start: absoluteStart + start, size, headerSize, payloadStart: start + headerSize, payloadEnd: start + size, buffer });
-    offset += size;
-  }
-  return atoms;
-}
-
-function payload(atom) { return atom.buffer.slice(atom.payloadStart, atom.payloadEnd); }
-
-function findAtoms(buffer, type, options) {
-  const found = [];
-  const visit = (atoms, depth = 0) => {
-    if (depth > 12) return;
-    for (const atom of atoms) {
-      if (atom.type === type) found.push(atom);
-      if (CONTAINER_TYPES.has(atom.type)) {
-        const prefix = atom.type === "meta" ? 4 : 0;
-        visit(parseBoxes(payload(atom), atom.start + atom.headerSize, { skipPrefix: prefix }), depth + 1);
-      }
-    }
-  };
-  visit(parseBoxes(buffer, options?.absoluteStart || 0));
-  return found;
-}
-
-function parseContentRange(value) {
-  const match = String(value || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
-  if (!match || match[3] === "*") return null;
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  const total = Number(match[3]);
-  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && Number.isSafeInteger(total) && end >= start && total > end
-    ? { start, end, total }
-    : null;
-}
-
-class RangeReader {
-  constructor(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 20000, cacheVersion } = {}) {
-    this.url = url;
-    this.fetchImpl = fetchImpl;
-    this.signal = signal;
-    this.timeoutMs = timeoutMs;
-    this.cacheVersion = cacheVersion;
-    this.total = 0;
-  }
-
-  async read(start, end) {
-    if (this.signal?.aborted) throw createAbortError();
-    if (end <= start || end - start > MP4_METADATA_LIMIT_BYTES) throw new Error("MP4 metadata range is invalid or too large.");
-    return fetchWithRetry(this.url, {
-      fetchImpl: this.fetchImpl,
-      cache: metadataRequestCache(this.cacheVersion),
-      credentials: "same-origin",
-      headers: { Range: `bytes=${start}-${end - 1}` },
-      signal: this.signal,
-      timeoutMs: this.timeoutMs,
-      retries: 2,
-    }, (response) => this.readRange(response, start, end));
-  }
-
-  async readRange(response, start, end) {
-    if (response.status !== 206) throw new Error("The audio server does not support metadata byte ranges.");
-    checkResponseVersion(response, this.cacheVersion);
-    const range = parseContentRange(response.headers?.get?.("Content-Range"));
-    if (!range) throw new Error("The audio server returned an invalid metadata range.");
-    const expectedEnd = Math.min(end, range.total) - 1;
-    if (range.start !== start || range.end !== expectedEnd) throw new Error("The audio server returned an invalid metadata range.");
-    this.total = range.total;
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength !== range.end - start + 1) throw new Error("The audio metadata range was truncated.");
-    return bytes;
-  }
-}
-
-async function findTopLevelAtom(reader, first, expectedType) {
-  let start = 0;
-  for (let count = 0; count < 1000 && start + 8 <= reader.total; count += 1) {
-    let bytes = start + 16 <= first.byteLength ? first.subarray(start, start + 16) : null;
-    if (!bytes) bytes = await reader.read(start, Math.min(reader.total, start + 16));
-    if (bytes.byteLength < 8) break;
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    let size = uint32(view, 0);
-    const type = atomType(bytes, 4);
-    let headerSize = 8;
-    if (size === 1) {
-      if (bytes.byteLength < 16) break;
-      size = uint64(view, 8);
-      headerSize = 16;
-    } else if (size === 0) size = reader.total - start;
-    if (!Number.isSafeInteger(size) || size < headerSize || start + size > reader.total) break;
-    if (type === expectedType) return { type, start, size, headerSize };
-    start += size;
-  }
-  return null;
-}
+const MAX_QUICKTIME_SAMPLES = 10_000;
+const MAX_SAMPLE_GAP_BYTES = 4096;
 
 export function decodeMp4ChapterTitle(bytes) {
   if (!bytes.length) return "";
@@ -146,14 +12,11 @@ export function decodeMp4ChapterTitle(bytes) {
     const declared = (value[0] << 8) | value[1];
     if (declared > 0 && declared <= value.length - 2) value = value.subarray(2, declared + 2);
   }
-  let text;
-  if (value.length >= 2 && ((value[0] === 0xfe && value[1] === 0xff) || (value[0] === 0xff && value[1] === 0xfe))) {
-    text = new TextDecoder("utf-16").decode(value);
-  } else if (value.length >= 2 && value[0] === 0 && value[1] !== 0) {
-    const swapped = new Uint8Array(value.length);
-    for (let index = 0; index + 1 < value.length; index += 2) { swapped[index] = value[index + 1]; swapped[index + 1] = value[index]; }
-    text = new TextDecoder("utf-16").decode(swapped);
-  } else text = new TextDecoder("utf-8", { fatal: false }).decode(value);
+  let encoding = "utf-8";
+  if ((value[0] === 0xfe && value[1] === 0xff) || (value.length >= 2 && value[0] === 0 && value[1] !== 0)) {
+    encoding = "utf-16be";
+  } else if (value[0] === 0xff && value[1] === 0xfe) encoding = "utf-16le";
+  const text = new TextDecoder(encoding).decode(value);
   return text.replace(/\0/g, "").replace(/\s+/g, " ").trim();
 }
 
@@ -200,15 +63,14 @@ function chapterReferences(trak) {
   return values;
 }
 
-function tableEntries(atom, entryWidth, mapper) {
-  if (!atom) return [];
-  const bytes = new Uint8Array(payload(atom));
-  if (bytes.length < 8) return [];
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+function tableEntries(atom, entryWidth, limit, mapper) {
+  const view = new DataView(atom.buffer, atom.payloadStart, atom.payloadEnd - atom.payloadStart);
+  if (view.byteLength < 8) return [];
   const count = view.getUint32(4, false);
+  if (8 + count * entryWidth > view.byteLength) return [];
   const entries = [];
-  let offset = 8;
-  for (let index = 0; index < count && offset + entryWidth <= bytes.length; index += 1, offset += entryWidth) entries.push(mapper(view, offset));
+  const end = Math.min(count, limit);
+  for (let index = 0; index < end; index += 1) entries.push(mapper(view, 8 + index * entryWidth));
   return entries;
 }
 
@@ -228,112 +90,46 @@ function parseChapterTrack(trak) {
   const stco = findAtoms(payload(stbl), "stco", { absoluteStart: stbl.start + stbl.headerSize })[0];
   const co64 = findAtoms(payload(stbl), "co64", { absoluteStart: stbl.start + stbl.headerSize })[0];
   if (!stts || !stsc || !stsz || (!stco && !co64)) return null;
-  const durations = [];
-  for (const entry of tableEntries(stts, 8, (view, offset) => ({ count: view.getUint32(offset, false), delta: view.getUint32(offset + 4, false) }))) {
-    for (let index = 0; index < entry.count && durations.length < 10000; index += 1) durations.push(entry.delta);
-  }
-  const sizeBytes = new Uint8Array(payload(stsz));
-  const sizeView = new DataView(sizeBytes.buffer, sizeBytes.byteOffset, sizeBytes.byteLength);
+  const sizeView = new DataView(stsz.buffer, stsz.payloadStart, stsz.payloadEnd - stsz.payloadStart);
+  if (sizeView.byteLength < 12) return null;
   const fixedSize = sizeView.getUint32(4, false);
-  const sampleCount = sizeView.getUint32(8, false);
-  const sizes = fixedSize ? Array(sampleCount).fill(fixedSize) : Array.from({ length: Math.min(sampleCount, 10000) }, (_, index) => sizeView.getUint32(12 + index * 4, false));
-  const offsets = tableEntries(co64 || stco, co64 ? 8 : 4, (view, offset) => co64 ? uint64(view, offset) : view.getUint32(offset, false));
-  const chunks = tableEntries(stsc, 12, (view, offset) => ({ firstChunk: view.getUint32(offset, false), samplesPerChunk: view.getUint32(offset + 4, false) }));
-  const sampleOffsets = [];
+  const declaredCount = sizeView.getUint32(8, false);
+  if (!fixedSize && 12 + declaredCount * 4 > sizeView.byteLength) return null;
+  const sampleCount = Math.min(declaredCount, MAX_QUICKTIME_SAMPLES);
+  const durations = [];
+  for (const entry of tableEntries(stts, 8, sampleCount, (view, offset) => ({ count: view.getUint32(offset, false), delta: view.getUint32(offset + 4, false) }))) {
+    for (let index = 0; index < entry.count && durations.length < sampleCount; index += 1) durations.push(entry.delta);
+  }
+  if (durations.length !== sampleCount) return null;
+  const offsets = tableEntries(co64 || stco, co64 ? 8 : 4, sampleCount, (view, offset) => co64 ? uint64(view, offset) : view.getUint32(offset, false));
+  const chunks = tableEntries(stsc, 12, sampleCount, (view, offset) => ({ firstChunk: view.getUint32(offset, false), samplesPerChunk: view.getUint32(offset + 4, false) }));
+  const samples = [];
+  let timestamp = 0;
   let sampleIndex = 0;
-  for (let chunkIndex = 0; chunkIndex < offsets.length && sampleIndex < sizes.length; chunkIndex += 1) {
+  let mapping = 0;
+  for (let chunkIndex = 0; chunkIndex < offsets.length && sampleIndex < sampleCount; chunkIndex += 1) {
     const chunkNumber = chunkIndex + 1;
-    const entry = [...chunks].reverse().find((item) => item.firstChunk <= chunkNumber);
-    if (!entry) continue;
+    while (mapping + 1 < chunks.length && chunks[mapping + 1].firstChunk <= chunkNumber) mapping += 1;
+    const entry = chunks[mapping];
+    if (!entry || entry.firstChunk > chunkNumber) return null;
     let offset = offsets[chunkIndex];
-    for (let count = 0; count < entry.samplesPerChunk && sampleIndex < sizes.length; count += 1) {
-      sampleOffsets.push({ offset, size: sizes[sampleIndex] });
-      offset += sizes[sampleIndex]; sampleIndex += 1;
+    for (let count = 0; count < entry.samplesPerChunk && sampleIndex < sampleCount; count += 1) {
+      const size = fixedSize || sizeView.getUint32(12 + sampleIndex * 4, false);
+      if (Number.isSafeInteger(offset) && size > 0 && size <= MP4_METADATA_LIMIT_BYTES) {
+        samples.push({ offset, size, start: timestamp / timescale });
+      }
+      timestamp += durations[sampleIndex];
+      offset += size;
+      sampleIndex += 1;
     }
   }
-  const starts = [];
-  let timestamp = 0;
-  for (let index = 0; index < sampleOffsets.length; index += 1) { starts.push(timestamp / timescale); timestamp += durations[index] || 0; }
-  return sampleOffsets.map((sample, index) => ({ ...sample, start: starts[index] })).filter((sample) => Number.isSafeInteger(sample.offset) && sample.size > 0 && sample.size <= MP4_METADATA_LIMIT_BYTES);
+  return samples;
 }
 
 function normalizeChapters(chapters) {
   const sorted = chapters.filter((chapter) => Number.isFinite(chapter.start) && chapter.start >= 0 && chapter.title).sort((a, b) => a.start - b.start);
   const unique = sorted.filter((chapter, index) => index === 0 || chapter.start !== sorted[index - 1].start || chapter.title !== sorted[index - 1].title);
   return unique.map((chapter, index) => ({ start: chapter.start, end: Number.isFinite(chapter.end) && chapter.end >= chapter.start ? chapter.end : (unique[index + 1]?.start ?? null), title: chapter.title }));
-}
-
-async function readMp4Metadata(url, options = {}) {
-  const reader = new RangeReader(url, options);
-  const firstEnd = Math.min(MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES);
-  const first = await reader.read(0, firstEnd);
-  if (!reader.total) throw new Error("The MP4 file size is unknown.");
-  const moov = await findTopLevelAtom(reader, first, "moov");
-  if (!moov) throw new Error("The MP4 metadata box was not found.");
-  let moovBytes;
-  if (moov.start + moov.size <= first.byteLength) moovBytes = first.subarray(moov.start, moov.start + moov.size);
-  else moovBytes = await reader.read(moov.start, moov.start + moov.size);
-  const moovBuffer = moovBytes.buffer.slice(moovBytes.byteOffset, moovBytes.byteOffset + moovBytes.byteLength);
-  return moovBuffer;
-}
-
-function metadataRequestMap(fetchImpl) {
-  let requests = metadataRequestsByFetch.get(fetchImpl);
-  if (!requests) {
-    requests = new Map();
-    metadataRequestsByFetch.set(fetchImpl, requests);
-  }
-  return requests;
-}
-
-function consumeMetadataRequest(entry, requests, key, signal) {
-  if (signal?.aborted) return Promise.reject(createAbortError());
-  entry.consumers += 1;
-  return new Promise((resolve, reject) => {
-    let finished = false;
-    const finish = (callback, value) => {
-      if (finished) return;
-      finished = true;
-      signal?.removeEventListener("abort", abort);
-      entry.consumers -= 1;
-      if (!entry.settled && entry.consumers === 0) {
-        entry.controller.abort();
-        if (requests.get(key) === entry) requests.delete(key);
-      }
-      callback(value);
-    };
-    const abort = () => finish(reject, createAbortError());
-    signal?.addEventListener("abort", abort, { once: true });
-    entry.promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
-  });
-}
-
-function loadMp4Metadata(url, options = {}) {
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
-  if (typeof fetchImpl !== "function") return Promise.reject(new Error("Fetch is unavailable."));
-  const requests = metadataRequestMap(fetchImpl);
-  const version = options.cacheVersion == null ? null : String(options.cacheVersion);
-  const key = JSON.stringify([String(url), version, Number(options.timeoutMs) || 20000]);
-  let entry = requests.get(key);
-  if (!entry) {
-    const controller = new AbortController();
-    entry = { controller, consumers: 0, settled: false, promise: null };
-    entry.promise = readMp4Metadata(url, { ...options, fetchImpl, signal: controller.signal }).then(
-      (value) => {
-        entry.settled = true;
-        const timer = setTimeout(() => { if (requests.get(key) === entry) requests.delete(key); }, MP4_METADATA_CACHE_MS);
-        timer?.unref?.();
-        return value;
-      },
-      (error) => {
-        entry.settled = true;
-        if (requests.get(key) === entry) requests.delete(key);
-        throw error;
-      },
-    );
-    requests.set(key, entry);
-  }
-  return consumeMetadataRequest(entry, requests, key, options.signal);
 }
 
 function embeddedCoverMime(bytes) {
@@ -344,7 +140,7 @@ function embeddedCoverMime(bytes) {
 }
 
 export async function loadEmbeddedMp4Cover(url, options = {}) {
-  const moovBuffer = await loadMp4Metadata(url, options);
+  const { moovBuffer } = await loadMp4Metadata(url, options);
   for (const cover of findAtoms(moovBuffer, "covr")) {
     const dataAtoms = parseBoxes(payload(cover)).filter((atom) => atom.type === "data" && !atom.truncated);
     for (const dataAtom of dataAtoms) {
@@ -359,7 +155,8 @@ export async function loadEmbeddedMp4Cover(url, options = {}) {
 }
 
 export async function loadEmbeddedMp4Chapters(url, options = {}) {
-  const moovBuffer = await loadMp4Metadata(url, options);
+  const metadata = await loadMp4Metadata(url, options);
+  const { moovBuffer } = metadata;
   const nero = findAtoms(moovBuffer, "chpl");
   const neroChapters = nero.flatMap(parseNeroChapters);
   if (neroChapters.length) return normalizeChapters(neroChapters);
@@ -370,11 +167,25 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
   if (!chapterTrack) return [];
   const samples = parseChapterTrack(chapterTrack);
   if (!samples?.length) return [];
-  const reader = new RangeReader(url, options);
+  const reader = new RangeReader(url, options, metadata);
   const chapters = [];
-  for (const sample of samples) {
-    const bytes = await reader.read(sample.offset, sample.offset + sample.size);
-    chapters.push({ start: sample.start, end: null, title: decodeMp4ChapterTitle(bytes) });
+  for (let i = 0; i < samples.length;) {
+    const start = samples[i].offset;
+    let end = start + samples[i].size;
+    let next = i + 1;
+    while (next < samples.length) {
+      const { offset, size } = samples[next];
+      if (offset < end || offset - end > MAX_SAMPLE_GAP_BYTES || offset + size - start > MP4_METADATA_CHUNK_BYTES) break;
+      end = offset + size;
+      next++;
+    }
+    const bytes = await reader.read(start, end);
+    for (; i < next; i++) {
+      const sample = samples[i];
+      const offset = sample.offset - start;
+      const title = decodeMp4ChapterTitle(bytes.subarray(offset, offset + sample.size));
+      chapters.push({ start: sample.start, end: null, title });
+    }
   }
   return normalizeChapters(chapters);
 }

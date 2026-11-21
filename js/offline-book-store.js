@@ -1,6 +1,7 @@
 import "./offline-manifest.js";
-import { validateOfflineBookConfig } from "./book-config.js";
-import { OfflineDownloadError, sameAudioRevision, checkCanceled } from "./offline-transfer.js";
+import { sameOfflineSelection, manifestMatchesSelection, validateOfflineBookConfig } from "./offline-selection.js";
+export { sameOfflineSelection, manifestMatchesSelection } from "./offline-selection.js";
+import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled } from "./offline-transfer.js";
 
 const { validManifest, audioMimeType, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
   offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
@@ -20,19 +21,6 @@ export function jsonResponse(value) {
 
 export function isQuotaError(error) {
   return error?.name === "QuotaExceededError" || error?.code === 22 || error?.code === 1014;
-}
-
-export function sameOfflineSelection(manifest, selection) {
-  return Boolean(manifest && selection) && manifest.episodeId === selection.episodeId
-    && (!manifest.configBookId || !selection.configBookId || manifest.configBookId === selection.configBookId)
-    && manifest.languageCode === selection.languageCode
-    && manifest.sourceId === selection.sourceId
-    && manifest.sourceUrl === selection.sourceUrl
-    && String(manifest.cacheVersion) === String(selection.cacheVersion);
-}
-
-export function manifestMatchesSelection(manifest, selection) {
-  return validManifest(manifest) && sameOfflineSelection(manifest, selection);
 }
 
 export function canResumeTransfer(staging, selection, preflight) {
@@ -83,11 +71,71 @@ function recoverDownloads(manifests, saved, publishedStaging) {
   return { active, damaged, staging };
 }
 
+function createDownloadId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export class OfflineBookStore {
   constructor(baseUrl, cacheStorage) {
     this.baseUrl = baseUrl;
     this.cacheStorage = cacheStorage;
     this.bookCachePrefix = OFFLINE_BOOK_CACHE_PREFIX + encodeURIComponent(new URL(baseUrl).pathname) + ":";
+  }
+
+  stagingManifest(selection, preflight) {
+    const downloadId = createDownloadId();
+    const manifest = {
+      schemaVersion: OFFLINE_SCHEMA_VERSION,
+      status: "downloading",
+      downloadId,
+      cacheName: `${this.bookCachePrefix}${downloadId}`,
+      episodeId: selection.episodeId,
+      configBookId: selection.configBookId || selection.episodeId,
+      episodeTitle: String(selection.episodeTitle || selection.episodeId),
+      languageCode: selection.languageCode,
+      languageTag: selection.languageTag || (selection.downloadId ? undefined : selection.languageCode),
+      languageLabel: String(selection.languageLabel || selection.languageCode),
+      sourceId: selection.sourceId,
+      sourceLabel: String(selection.sourceLabel || selection.sourceId),
+      sourceUrl: selection.sourceUrl,
+      mime: audioMimeType(preflight.mime ?? selection.mime),
+      assets: (selection.assets || [])
+        .map((asset) => ({ url: String(asset.url || ""), required: Boolean(asset.required) }))
+        .filter((asset) => {
+          try { return asset.url && new URL(asset.url).origin === new URL(this.baseUrl).origin; }
+          catch { return false; }
+        }),
+      cacheVersion: String(selection.cacheVersion),
+      totalSize: preflight.totalSize,
+      chunkSize: OFFLINE_CHUNK_SIZE,
+      totalChunks: Math.ceil(preflight.totalSize / OFFLINE_CHUNK_SIZE),
+      completed: [],
+      etag: preflight.etag,
+      lastModified: preflight.lastModified,
+      responseDate: preflight.responseDate,
+      createdAt: Date.now(),
+      downloadedAt: 0,
+    };
+    if (!validManifest(manifest, "downloading")) throw new OfflineDownloadError("manifest", "Invalid offline download manifest.");
+    return manifest;
+  }
+
+  async openStagingFiles(manifest) {
+    const cache = await this.cacheStorage.open(manifest.cacheName);
+    return {
+      writeManifest: (current) => cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(current)),
+      writeChunk: (index, response) => cache.put(offlineChunkUrl(this.baseUrl, manifest.downloadId, index), response),
+      writeAsset: (url, response) => cache.put(url, response),
+    };
+  }
+
+  async clearDownloads() {
+    const saved = await this.readRecord("active", true);
+    const partial = await this.readRecord("staging", true);
+    for (const name of await this.ownedBookCacheNames(saved, partial)) await this.cacheStorage.delete(name);
+    await this.writeRecord("active", null);
+    await this.writeRecord("staging", null);
   }
 
   async metaCache() { return this.cacheStorage.open(OFFLINE_META_CACHE); }

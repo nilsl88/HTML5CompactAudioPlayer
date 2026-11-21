@@ -1,8 +1,8 @@
 import "./offline-manifest.js";
 import { createAbortError, fetchWithRetry } from "./utils.js";
-import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection, jsonResponse } from "./offline-book-store.js";
+import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js";
 import { withOfflineLock } from "./offline-lock.js";
-import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange } from "./offline-transfer.js";
+import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange } from "./offline-transfer.js";
 export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js";
 
 const PREPARATION_TIMEOUT_MS = 20_000;
@@ -10,7 +10,7 @@ const MEBIBYTE = 1024 * 1024;
 
 const {
   schemaVersion: OFFLINE_SCHEMA_VERSION, metaCache: OFFLINE_META_CACHE, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
-  audioMimeType, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength,
+  validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength,
 } = globalThis.CompactPlayerOfflineManifest;
 export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
 export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js";
@@ -22,11 +22,6 @@ export function completedBytes(manifest) {
 
 function offlineConflict() {
   throw new OfflineDownloadError("conflict", "Another tab is updating or has changed the offline book.");
-}
-
-function createDownloadId() {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function isAccessDenied(error) {
@@ -301,53 +296,21 @@ export class OfflineManager {
     return current;
   }
 
-  async putManifest(cache, manifest) {
-    await cache.put(offlineManifestUrl(this.baseUrl), jsonResponse(manifest));
+  async putManifest(files, manifest) {
+    await files.writeManifest(manifest);
     this.staging = manifest;
     await this.writeRecord("staging", manifest);
   }
 
   async createStaging(selection, preflight) {
-    const downloadId = createDownloadId();
-    const manifest = {
-      schemaVersion: OFFLINE_SCHEMA_VERSION,
-      status: "downloading",
-      downloadId,
-      cacheName: `${this.store.bookCachePrefix}${downloadId}`,
-      episodeId: selection.episodeId,
-      configBookId: selection.configBookId || selection.episodeId,
-      episodeTitle: String(selection.episodeTitle || selection.episodeId),
-      languageCode: selection.languageCode,
-      languageLabel: String(selection.languageLabel || selection.languageCode),
-      sourceId: selection.sourceId,
-      sourceLabel: String(selection.sourceLabel || selection.sourceId),
-      sourceUrl: selection.sourceUrl,
-      mime: audioMimeType(preflight.mime ?? selection.mime),
-      assets: (selection.assets || [])
-        .map((asset) => ({ url: String(asset.url || ""), required: Boolean(asset.required) }))
-        .filter((asset) => {
-          try { return asset.url && new URL(asset.url).origin === new URL(this.baseUrl).origin; }
-          catch { return false; }
-        }),
-      cacheVersion: String(selection.cacheVersion),
-      totalSize: preflight.totalSize,
-      chunkSize: OFFLINE_CHUNK_SIZE,
-      totalChunks: Math.ceil(preflight.totalSize / OFFLINE_CHUNK_SIZE),
-      completed: [],
-      etag: preflight.etag,
-      lastModified: preflight.lastModified,
-      responseDate: preflight.responseDate,
-      createdAt: Date.now(),
-      downloadedAt: 0,
-    };
-    if (!validManifest(manifest, "downloading")) throw new OfflineDownloadError("manifest", "Invalid offline download manifest.");
+    const manifest = this.store.stagingManifest(selection, preflight);
     if (this.staging) await this.removeStagingLocked();
-    const cache = await this.cacheStorage.open(manifest.cacheName);
-    await this.putManifest(cache, manifest);
-    return { cache, manifest };
+    const files = await this.store.openStagingFiles(manifest);
+    await this.putManifest(files, manifest);
+    return { files, manifest };
   }
 
-  async cacheSupportingAssets(cache, assets, configUrl, signal) {
+  async cacheSupportingAssets(files, assets, configUrl, signal) {
     for (const asset of assets || []) {
       const url = String(asset?.url || "");
       if (!url || url === configUrl || new URL(url).origin !== new URL(this.baseUrl).origin) continue;
@@ -360,7 +323,7 @@ export class OfflineManager {
           signal,
         }, async (response) => {
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          await cache.put(url, response);
+          await files.writeAsset(url, response);
         });
       } catch (error) {
         if (signal.aborted) throw error;
@@ -459,7 +422,7 @@ export class OfflineManager {
     return this.store.saveConfig(candidate, url, text);
   }
 
-  async prepareBookAssets(cache, manifest, selection, signal) {
+  async prepareBookAssets(files, manifest, selection, signal) {
     const url = this.store.checkConfigUrl(manifest, this.store.configUrl(selection));
     if (url) {
       const expected = { ...manifest, configBookId: manifest.configBookId || selection.configBookId };
@@ -467,10 +430,10 @@ export class OfflineManager {
       if (!manifest.configBookId) {
         // Legacy downloads may record the catalog alias without the ID inside the configuration.
         manifest = { ...manifest, configBookId: id };
-        await this.putManifest(cache, manifest);
+        await this.putManifest(files, manifest);
       }
     }
-    await this.cacheSupportingAssets(cache, selection.assets, url, signal);
+    await this.cacheSupportingAssets(files, selection.assets, url, signal);
     return manifest;
   }
 
@@ -518,20 +481,20 @@ export class OfflineManager {
   async runDownload(selection, preflight, signal, waitForPriority) {
     this.setPhase("preparing");
     try {
-      let cache;
+      let files;
       let manifest;
       if (preflight.canResume && canResumeTransfer(this.staging, selection, preflight)) {
         manifest = this.staging;
-        cache = await this.cacheStorage.open(manifest.cacheName);
-      } else ({ cache, manifest } = await this.createStaging(selection, preflight));
-      manifest = await this.prepareBookAssets(cache, manifest, selection, signal);
+        files = await this.store.openStagingFiles(manifest);
+      } else ({ files, manifest } = await this.createStaging(selection, preflight));
+      manifest = await this.prepareBookAssets(files, manifest, selection, signal);
       const completed = new Set(manifest.completed);
       this.setPhase("downloading");
       for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
-        await cache.put(offlineChunkUrl(this.baseUrl, manifest.downloadId, index), chunk);
+        await files.writeChunk(index, chunk);
         completed.add(index);
         manifest = { ...manifest, completed: [...completed].sort((a, b) => a - b) };
-        await this.putManifest(cache, manifest);
+        await this.putManifest(files, manifest);
         this.setPhase("downloading");
       }
       manifest = await this.checkStaging(manifest, selection);
@@ -602,12 +565,7 @@ export class OfflineManager {
     this.abortController?.abort();
     try { await this.currentPromise; } catch {}
     await this.withLock(async () => {
-      const saved = await this.readRecord("active", true);
-      const partial = await this.readRecord("staging", true);
-      const names = await this.store.ownedBookCacheNames(saved, partial);
-      for (const name of names) await this.cacheStorage.delete(name);
-      await this.writeRecord("active", null);
-      await this.writeRecord("staging", null);
+      await this.store.clearDownloads();
       this.active = null;
       this.repairable = null;
       this.staging = null;

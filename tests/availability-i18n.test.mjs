@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { setImmediate as settle } from "node:timers/promises";
 import { probeUrl } from "../js/availability.js";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { UI_STRINGS } from "../i18n.js";
+import { resolveUiLocale, translateAt, uiLanguageOptions, UI_STRINGS } from "../i18n.js";
 
 function response(status) {
   return { status, ok: status >= 200 && status < 300, body: { cancel: async () => {} } };
@@ -157,10 +157,25 @@ test("editions with the same book and quality IDs only reuse probes for their ow
   assert.equal(first.storage.readAvailability("book", 1, 100).en["opus-96"], "available");
 });
 
-test("English contains every literal translation key used by the coordinator", async () => {
-  const source = await readFile(new URL("../js/player-app.js", import.meta.url), "utf8");
-  const keys = new Set([...source.matchAll(/\bt\("([A-Za-z0-9]+)"/g)].map((match) => match[1]));
+test("English contains the literal translation keys used by the player and its panels", async () => {
+  const modules = new URL("../js/", import.meta.url);
+  const files = (await readdir(modules)).filter((file) => file.endsWith(".js"));
+  const sources = await Promise.all(files.map((file) => readFile(new URL(file, modules), "utf8")));
+  const keys = new Set(sources.flatMap((source) => [...source.matchAll(/\b(?:t|ot)\("([A-Za-z0-9]+)"/g)].map((match) => match[1])));
   assert.deepEqual([...keys].filter((key) => !(key in UI_STRINGS.en)), []);
+});
+
+test("the language picker keeps native names and localizes the automatic choice", () => {
+  const browser = { languages: ["fr", "no-NO"], language: "da" };
+  const locale = resolveUiLocale("auto", browser);
+  assert.equal(locale, "nb");
+  assert.equal(resolveUiLocale("dk", browser), "da");
+  assert.equal(resolveUiLocale("fr", browser), "en");
+  const [automatic, ...choices] = uiLanguageOptions(locale);
+  assert.deepEqual(automatic, { value: "auto", label: translateAt("nb", "uiLanguageAuto") });
+  assert.equal(choices.find(({ value }) => value === "nb").label, "Norsk (bokmål)");
+  assert.deepEqual(choices.map(({ value }) => value), Object.keys(UI_STRINGS));
+  assert.deepEqual(uiLanguageOptions("da").slice(1), choices);
 });
 
 test("all bundled locales contain the full English key set", () => {

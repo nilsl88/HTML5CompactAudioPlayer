@@ -61,7 +61,11 @@ export function openPanel(panel, trigger, firstFocus) {
   panel.hidden = false;
   trigger?.setAttribute("aria-expanded", "true");
   trigger?.classList.add("is-active");
-  panel.ownerDocument.defaultView.requestAnimationFrame(() => (firstFocus || focusableElements(panel)[0])?.focus?.());
+  const document = panel.ownerDocument;
+  const previous = document.activeElement;
+  document.defaultView.requestAnimationFrame(() => {
+    if (!panel.hidden && document.activeElement === previous) (firstFocus || focusableElements(panel)[0])?.focus?.();
+  });
 }
 
 export function closePanel(panel, trigger, restoreFocus = false) {

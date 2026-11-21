@@ -67,7 +67,11 @@ export class SleepTimer {
     const generation = this.generation;
     await request;
     if (this.generation !== generation) return;
-    const end = getEnd();
+    this.updateChapterEnd(getEnd());
+  }
+
+  updateChapterEnd(end) {
+    if (this.completing) return;
     if (Number.isFinite(end) && end > this.media.position()) this.chapterEnd = end;
     else this.cancel();
   }

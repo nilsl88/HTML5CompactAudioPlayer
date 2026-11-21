@@ -1,16 +1,26 @@
-importScripts("./js/offline-manifest.js");
+importScripts("./js/offline-manifest.js", "./js/offline-media-response.js");
 const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue,
-  offlineMetaUrl, offlineChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v16";
+  offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
+const SHELL_VERSION = "v17";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
+const SHELL_NETWORK_WAIT_MS = 3000;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=16",
-  "./player.js?v=16",
-  "./i18n.js?v=16",
+  "./player.css?v=17",
+  "./player.js?v=17",
+  "./i18n.js?v=17",
   "./js/player-app.js",
+  "./js/availability-cache.js",
+  "./js/chapter-cache.js",
+  "./js/chapter-panel.js",
+  "./js/http-range.js",
+  "./js/mp4-atoms.js",
+  "./js/mp4-metadata.js",
+  "./js/offline-media-response.js",
+  "./js/offline-panel.js",
+  "./js/offline-selection.js",
   "./js/availability-session.js",
   "./js/availability.js",
   "./js/chapters.js",
@@ -39,6 +49,7 @@ const SHELL_URLS = [
   "./js/vtt.js",
 ];
 const SHELL_PATHS = new Set(SHELL_URLS.map((path) => new URL(path, self.registration.scope).pathname));
+const PLAYER_PAGES = new Set(["./", "index.html"].map((path) => new URL(path, self.registration.scope).pathname));
 
 function scopeUrl(path) {
   return new URL(path, self.registration.scope).href;
@@ -58,69 +69,8 @@ async function activeManifest() {
   } catch { return null; }
 }
 
-function parseRange(value, totalSize) {
-  if (!value) return { start: 0, end: totalSize - 1, partial: false };
-  const match = String(value).match(/^bytes=(\d*)-(\d*)$/i);
-  if (!match || (!match[1] && !match[2])) return null;
-  let start;
-  let end;
-  if (!match[1]) {
-    const suffixLength = Number(match[2]);
-    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
-    start = Math.max(0, totalSize - suffixLength);
-    end = totalSize - 1;
-  } else {
-    start = Number(match[1]);
-    end = match[2] ? Number(match[2]) : totalSize - 1;
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= totalSize || end < start) return null;
-    end = Math.min(end, totalSize - 1);
-  }
-  return { start, end, partial: true };
-}
-
-async function cachedMediaResponse(request, manifest, cache) {
-  if (request.method === "HEAD") {
-    return new Response(null, { headers: {
-      "accept-ranges": "bytes",
-      "content-length": String(manifest.totalSize),
-      "content-type": manifest.mime,
-    } });
-  }
-  const range = parseRange(request.headers.get("range"), manifest.totalSize);
-  if (!range) {
-    return new Response(null, { status: 416, headers: { "content-range": `bytes */${manifest.totalSize}` } });
-  }
-  const firstChunk = Math.floor(range.start / manifest.chunkSize);
-  const lastChunk = Math.floor(range.end / manifest.chunkSize);
-  let index = firstChunk;
-  let firstResponse = await cache.match(chunkUrl(manifest.downloadId, index));
-  if (!firstResponse) return null;
-  let canceled = false;
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const response = firstResponse || await cache.match(chunkUrl(manifest.downloadId, index));
-      firstResponse = null;
-      if (canceled) return;
-      if (!response) throw new Error("A downloaded audio chunk is missing.");
-      const data = new Uint8Array(await response.arrayBuffer());
-      if (canceled) return;
-      const chunkStart = index * manifest.chunkSize;
-      if (data.length !== chunkByteLength(manifest, index)) throw new Error("A downloaded audio chunk is incomplete.");
-      const from = Math.max(0, range.start - chunkStart);
-      const to = Math.min(data.length, range.end - chunkStart + 1);
-      controller.enqueue(data.subarray(from, to));
-      if (++index > lastChunk) controller.close();
-    },
-    cancel() { canceled = true; firstResponse = null; },
-  }, { highWaterMark: 0 });
-  const headers = {
-    "accept-ranges": "bytes",
-    [versionHeader]: versionHeaderValue(manifest.cacheVersion),
-    "content-length": String(range.end - range.start + 1),
-    "content-type": manifest.mime,
-  };
-  if (range.partial) headers["content-range"] = `bytes ${range.start}-${range.end}/${manifest.totalSize}`;
-  return new Response(stream, { status: range.partial ? 206 : 200, headers });
+function cachedMediaResponse(request, manifest, cache) {
+  return downloadedMediaResponse(request, manifest, (index) => cache.match(chunkUrl(manifest.downloadId, index)));
 }
 
 async function cachedBookResponse(request) {
@@ -141,24 +91,47 @@ async function cachedBookResponse(request) {
   return null;
 }
 
-async function cachedFallback(request) {
-  if (!SHELL_PATHS.has(new URL(request.url).pathname)) {
-    if (request.mode !== "navigate") return cachedBookResponse(request);
-    try {
-      const asset = await cachedBookResponse(request);
-      if (asset) return asset;
-    } catch (error) { console.warn("[CompactAudioPlayer] Could not read the downloaded book during navigation.", error); }
-  }
+function cachedFallback(request) {
+  return SHELL_PATHS.has(new URL(request.url).pathname) ? cachedShell(request) : cachedBookResponse(request);
+}
+
+async function cachedShell(request) {
   const shell = await caches.open(SHELL_CACHE);
-  if (request.mode === "navigate") return await shell.match(scopeUrl("index.html")) || shell.match(scopeUrl("./"));
+  if (request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname)) {
+    return await shell.match(scopeUrl("index.html")) || shell.match(scopeUrl("./"));
+  }
   return shell.match(request, { ignoreSearch: true });
+}
+
+async function fetchShell(request) {
+  const controller = typeof AbortSignal.any === "function" ? new AbortController() : null;
+  const network = controller
+    ? fetch(request, { signal: AbortSignal.any([request.signal, controller.signal]) })
+    : fetch(request);
+  let timer;
+  try {
+    const deadline = new Promise((resolve) => { timer = setTimeout(resolve, SHELL_NETWORK_WAIT_MS); });
+    const response = await Promise.race([network, deadline]);
+    if (response) return response;
+    // Keep the network in the race while Cache Storage opens, including on a cache miss.
+    const cached = await Promise.race([network.then(() => null), cachedShell(request).catch((error) => {
+      console.warn("[CompactAudioPlayer] Could not read the installed player.", error);
+      return null;
+    })]);
+    if (!cached?.ok) return network;
+    controller?.abort();
+    return cached;
+  } finally { clearTimeout(timer); }
 }
 
 async function networkFirst(request) {
   let response;
   let networkError;
   try {
-    response = await fetch(request);
+    const path = new URL(request.url).pathname;
+    const paths = request.mode === "navigate" ? PLAYER_PAGES : SHELL_PATHS;
+    const useShell = request.method === "GET" && paths.has(path);
+    response = await (useShell ? fetchShell(request) : fetch(request));
     if (response.ok) return response;
   } catch (error) { networkError = error; }
   try {

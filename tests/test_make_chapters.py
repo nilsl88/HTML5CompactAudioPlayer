@@ -22,6 +22,11 @@ def write_sample(audio, seconds):
 
 
 class ChapterScriptTest(unittest.TestCase):
+    def test_pause_log_pairs_boundaries_and_ignores_unfinished_intervals(self):
+        parse_pauses = runpy.run_path(str(SCRIPT))["parse_pauses"]
+        log = "silence_end: 0\rsilence_start: -0.01\nsilence_end: 1.2\nprogress\nsilence_start: 8"
+        self.assertEqual(parse_pauses(log), [(0.0, 1.2)])
+
     def test_failed_copy_on_mount_removes_only_the_partial_output(self):
         publish = runpy.run_path(str(SCRIPT))["publish_new_file"]
         with tempfile.TemporaryDirectory() as folder:

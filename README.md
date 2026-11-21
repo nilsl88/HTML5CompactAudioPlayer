@@ -30,7 +30,7 @@ Production uses plain HTML, CSS, and JavaScript. There is no build step and no r
 - User-initiated offline download for one selected audiobook, language, and quality
 - Keyboard controls, focus management, offline feedback, and reduced-motion support
 
-Keyboard shortcuts outside focused controls are Space for play/pause, Left/Right Arrow for a five-second seek, Up Arrow for the configured skip forward, and Down Arrow for the configured skip backward. Escape closes open panels.
+Outside focused controls, Space toggles playback once per press. Left/Right Arrow seeks five seconds and Up/Down Arrow uses the configured skip interval. Hold an arrow key to keep seeking. Escape closes open panels.
 
 The first-visit **How this player works** dialog explains playback, chapters, shortcuts, Options, sleep timer, saved progress, chapter caching, and offline downloads. It also lets the user choose the interface language and audio language before starting. Set `ui.onboardingEnabled` to `false` in `library.json` to disable it for the whole player.
 
@@ -86,14 +86,17 @@ Afterwards, edit the language in `book.json`: set `chapterSource` to `vtt`, poin
 index.html              Semantic player markup and dialogs
 player.css              Responsive layout and design tokens
 player.js               Starts the player with the current browser window and storage
-sw.js                   Network-first app shell and offline ranged-audio responses
-i18n.js                 Interface strings
+sw.js                   Network-first requests, app shell installation, and offline routing
+i18n.js                 Interface strings, language selection, and native language names
 js/
   player-app.js         Player startup, DOM event wiring, and feature coordination
   availability.js       HEAD and Range availability probes
+  availability-cache.js  Saved probe results and confirmed playback by audio URL
   availability-session.js  Schedules scans after chapters load and records source availability
   chapters.js           WebVTT and embedded chapter loading
-  chapter-session.js    Chapter cache, active source, navigation, and request cancellation
+  chapter-session.js    Active source, navigation, and chapter request cancellation
+  chapter-cache.js      Chapter records, edition cleanup, and legacy cache migration
+  chapter-panel.js      Chapter list, retry focus, and native WebVTT track
   codecs.js             Codec families, MIME hints, and quality labels
   preferences.js        Supported skip intervals and default
   config.js             Configuration validation and normalization
@@ -104,9 +107,16 @@ js/
   dialogs.js            Dialog, panel, and focus behavior
   media-session.js      Browser media keys, metadata, and lock-screen position
   media-controller.js   Sole owner of audio source, seek, and play transitions
-  mp4-chapters.js       Bounded Range-based MP4 chapter and cover parser
-  offline.js            Offline preflight, quota checks, chunk downloads, and manifests
-  offline-book-store.js  Stored download records, validation, and recovery after interruption
+  http-range.js         Parsing of HTTP Content-Range response headers
+  mp4-atoms.js          MP4 box traversal
+  mp4-metadata.js       Bounded reads and shared requests for MP4 metadata
+  mp4-chapters.js       QuickTime and Nero chapters and embedded cover art
+  offline.js            Download lifecycle, quota checks, cancellation, and recovery
+  offline-book-store.js  Stored manifests, audio chunks, validation, and cleanup
+  offline-selection.js  Match a saved download to the selected book edition and audio
+  offline-panel.js      Download, resume, repair, and remove controls
+  offline-media-response.js  Stream full or partial audio responses from saved chunks
+  offline-lock.js       Coordinate offline writes across tabs
   offline-manifest.js   Offline storage addresses and manifest validation shared with the worker
   offline-transfer.js   Version checks, range validation, and streamed audio chunks
   progress-writer.js    Batches listening positions and cancels pending writes on reset
@@ -134,6 +144,8 @@ Required fields:
 - `id`: stable book identifier
 - `defaultLanguage`: language code used when no saved or browser match exists
 - `languages`: map of language code to language configuration
+
+Use separate keys such as `en-GB` and `en-US` for regional recordings. The player remembers the full tag. If an older preference or a browser language matches only the base language, the player uses the base track when available, then the book's default recording in that language, then the first matching recording. Older downloads also identify the recording by its audio URL and quality.
 
 Common optional fields:
 
@@ -243,7 +255,9 @@ Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder
 
 `ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Book-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
 
-The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `book.json` again. Options lists the catalog IDs as soon as the catalog arrives, even while the startup book is loading or retrying. You can select another book immediately. Each title replaces its ID when its lookup finishes. A failed optional title request does not prevent the current book from playing.
+The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. The player reuses configurations loaded from the server for the rest of the page session. Options lists the catalog IDs as soon as the catalog arrives, even while the startup book is loading or retrying. You can select another book immediately. Each title replaces its ID when its lookup finishes. A failed optional title request does not prevent the current book from playing.
+
+If the service worker supplies a downloaded configuration, the player checks the server again when the connection returns or when you select that book online. A failed check leaves the downloaded configuration available. A valid update changes the title in Options. Selecting the book again applies the updated configuration to playback.
 
 Library-level `title` and `label` values remain accepted for backward compatibility and as initial fallback labels. Legacy `audiofiles`, `episodes`, and `items` collections are accepted in that order when `books` is absent. If `books` is present, it takes precedence, even when empty; an invalid non-array `books` value produces an empty catalog rather than revealing a legacy list. Existing `defaultId`, `path`, `episode`, `key`, and `label` aliases remain supported.
 
@@ -253,7 +267,7 @@ Startup still prefers a downloaded book while offline, then a valid query, a sav
 
 ## Migrating existing sites
 
-1. Deploy the updated player files, including the new book-loading module and service worker, before renaming configuration files.
+1. Deploy the complete `js/` directory and the player entry files before publishing `sw.js`. The worker fetches the listed modules during installation. Then rename any book configuration files you want to migrate.
 2. Optionally rename each `episode.json` to `book.json`. Keep the JSON fields, book ID, folder, audio paths, and `cacheVersion` unchanged for a filename-only migration.
 3. Prefer `books` for the catalog collection and `?book=<id>` for new links. Replace the old collection key instead of adding a second competing list.
 
@@ -279,7 +293,9 @@ Introduction
 Chapter 1
 ```
 
-The parser accepts cue identifiers, cue settings, multiline titles, comma or period millisecond separators, and NOTE, STYLE, and REGION blocks. Malformed cues are skipped. Chapter text is rendered as text, not HTML. The active chapter title appears after language and quality in the player summary; it is omitted before the first cue, in gaps between cues, and after the last explicit end time. In a gap, Previous chapter returns to the preceding cue and the chapter sleep timer is unavailable. When a quality change or automatic fallback supplies different chapters, the timer follows the current chapter in the new source. It turns off if that chapter has no usable end time. Minute timers keep their original deadline.
+Use `mm:ss.mmm` or `hh:mm:ss.mmm` for both timestamps. Hours can exceed 99. The parser accepts a comma or period before the three millisecond digits. It skips a cue if either timestamp is malformed or the end is at or before the start.
+
+WebVTT files can use LF, CRLF or CR line endings. The parser accepts cue identifiers, cue settings, multiline titles, and NOTE, STYLE, and REGION blocks. The player displays each title as plain text. The active chapter title appears after language and quality in the player summary. It is omitted before the first cue, in gaps between cues, and after the last explicit end time. When cues overlap, Previous chapter uses the chapter shown in the summary. In a gap, it returns to the preceding cue and the chapter sleep timer is unavailable. When a quality change or automatic fallback supplies different chapters, the timer follows the current chapter in the new source. It turns off if that chapter has no usable end time. Minute timers keep their original deadline.
 
 ## Source selection and fallback
 
@@ -356,6 +372,10 @@ The player checks `navigator.storage.estimate()` before confirmation and again u
 
 Online audio requests go directly through the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt chapter seeking. When the browser reports that it is offline, the service worker serves the downloaded audio's byte ranges. Other requests, including chapter and cover metadata, remain network-first with cached fallback. If the browser still reports an online connection during an outage, native audio requests cannot use the saved copy until it detects the offline state.
 
+When opening the player page or loading its scripts and styles, the service worker gives the server three seconds to send response headers. It then uses the installed copy if available. If the file is missing from the cache, the original request can still finish. Only the installation root and `index.html` open the cached player page. Other URLs can serve their own cached content, and a missing page keeps the server's 404 response.
+
+When serving downloaded audio, the worker honors `If-Range` for a matching strong ETag or reliable Last-Modified date. If the saved version differs or cannot be verified, it streams the full saved file with status 200. An ordinary range request can still seek within an older download that has no version validator.
+
 The player and service worker use the same rules to validate a completed download. When offline, the service worker can serve the player page, styles, and scripts even if the book manifest is unreadable. It reads one cached audio chunk at a time as the audio element requests data. Canceling a request during a seek stops further chunk reads for that request. Change `cacheVersion` when replacing an audio file. An older completed copy remains usable offline until the user replaces or removes it.
 
 ## Availability probing
@@ -375,9 +395,9 @@ Each probe result expires seven days after that source was checked. Scanning ano
 
 ## Chapter loading
 
-When a book opens or the audio language changes, the selected language's WebVTT file starts loading before cover or availability checks, even if the audio is still buffering. It does not assign or preload an audio source. The player checks localStorage for the book, audio language, chapter URL, and `cacheVersion` first. On a miss it asks the server to revalidate the HTTP-cached file, even if the file still has time left in its cache lifetime. Repeat visits to the same edition use the saved chapters without a request.
+When a book opens or the audio language changes, the selected language's WebVTT file starts loading before cover or availability checks, even if the audio is still buffering. It does not assign or preload an audio source. The player checks localStorage for the book, audio language, chapter URL, and `cacheVersion` first. On a miss it asks the server to revalidate the HTTP-cached file, even if the file still has time left in its cache lifetime. Repeat visits to the same edition reuse validated WebVTT files.
 
-Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, an empty file leads to an embedded chapter lookup even when the WebVTT text came from the cache.
+Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, a valid empty WebVTT file leads to embedded chapters for that edition. If the WebVTT request fails, the player keeps the embedded list available offline and checks WebVTT again on reconnection or the next online visit.
 
 If the chapter server is unavailable, a downloaded WebVTT file can supply chapters for the same book version. With a different version, the chapter panel offers Retry. Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
 
@@ -396,7 +416,9 @@ Set a language's `chapterSource` to `embedded` to read QuickTime chapter tracks 
 
 When Opus or MP3 is selected, embedded chapters are unavailable for that source. Selecting an M4A/M4B quality loads its chapters. Use WebVTT for chapters shared across formats.
 
-Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. QuickTime text samples are trimmed to their declared title length so trailing format records do not appear in chapter names.
+The first MP4 request reads up to 256 KiB. QuickTime chapter titles inside that range use the bytes already in memory. For titles farther into the file, the player groups nearby samples in reads of up to 256 KiB and skips gaps larger than 4 KiB. A single larger sample keeps its own range.
+
+Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. The player reads up to the first 10,000 samples of a QuickTime chapter track and skips tracks with incomplete sample-size tables. QuickTime titles use the declared text length and honor the UTF-16 byte-order mark. The player reloads cached titles that carry a reversed byte-order mark.
 
 The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. If loading fails, the Chapters panel offers Retry and the player tries again when the connection returns. This also works for books whose only chapter source is the audio file. Embedded cues are cached per book, language, cache version, and source URL.
 
