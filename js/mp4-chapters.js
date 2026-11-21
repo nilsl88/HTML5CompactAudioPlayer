@@ -1,4 +1,7 @@
-import { createAbortError, fetchWithRetry } from "./utils.js";
+import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js";
+import "./offline-manifest.js";
+
+const { checkResponseVersion } = globalThis.CompactPlayerOfflineManifest;
 
 export const MP4_METADATA_CHUNK_BYTES = 256 * 1024;
 export const MP4_METADATA_LIMIT_BYTES = 16 * 1024 * 1024;
@@ -77,11 +80,12 @@ function parseContentRange(value) {
 }
 
 class RangeReader {
-  constructor(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 20000 } = {}) {
+  constructor(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 20000, cacheVersion } = {}) {
     this.url = url;
     this.fetchImpl = fetchImpl;
     this.signal = signal;
     this.timeoutMs = timeoutMs;
+    this.cacheVersion = cacheVersion;
     this.total = 0;
   }
 
@@ -90,7 +94,7 @@ class RangeReader {
     if (end <= start || end - start > MP4_METADATA_LIMIT_BYTES) throw new Error("MP4 metadata range is invalid or too large.");
     return fetchWithRetry(this.url, {
       fetchImpl: this.fetchImpl,
-      cache: "default",
+      cache: metadataRequestCache(this.cacheVersion),
       credentials: "same-origin",
       headers: { Range: `bytes=${start}-${end - 1}` },
       signal: this.signal,
@@ -101,6 +105,7 @@ class RangeReader {
 
   async readRange(response, start, end) {
     if (response.status !== 206) throw new Error("The audio server does not support metadata byte ranges.");
+    checkResponseVersion(response, this.cacheVersion);
     const range = parseContentRange(response.headers?.get?.("Content-Range"));
     if (!range) throw new Error("The audio server returned an invalid metadata range.");
     const expectedEnd = Math.min(end, range.total) - 1;
@@ -307,7 +312,8 @@ function loadMp4Metadata(url, options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   if (typeof fetchImpl !== "function") return Promise.reject(new Error("Fetch is unavailable."));
   const requests = metadataRequestMap(fetchImpl);
-  const key = `${String(url)}|${Number(options.timeoutMs) || 20000}`;
+  const version = options.cacheVersion == null ? null : String(options.cacheVersion);
+  const key = JSON.stringify([String(url), version, Number(options.timeoutMs) || 20000]);
   let entry = requests.get(key);
   if (!entry) {
     const controller = new AbortController();

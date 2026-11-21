@@ -70,6 +70,29 @@ test("initial buffering stays in loading state", async () => {
   media.destroy();
 });
 
+test("each Play after pause gets a deadline until playback advances again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const audio = new FakeAudio();
+  const media = new MediaController(audio, {}, { sourceTimeoutMs: 100 });
+  t.after(() => media.destroy());
+  await media.setSelection(sources, "opus-128", 12, true);
+  audio.emit("loadedmetadata");
+  audio.emit("playing");
+  media.requestPause();
+  audio.playImpl = () => new Promise(() => {});
+  void media.requestPlay();
+  audio.currentTime = 13;
+  audio.emit("timeupdate");
+  t.mock.timers.tick(100);
+  assert.equal(media.state, "playing");
+  assert.equal(media.currentSource().id, "opus-128");
+  media.requestPause();
+  void media.requestPlay();
+  t.mock.timers.tick(100);
+  assert.equal(media.currentSource().id, "opus-96");
+  assert.equal(media.position(), 13);
+});
+
 test("buffering after playback starts is a stall", async () => {
   const audio = new FakeAudio();
   const media = new MediaController(audio, {}, { sourceTimeoutMs: 1000 });
@@ -138,6 +161,31 @@ test("a blocked Play stays paused past the source timeout and can retry the same
   assert.equal(media.state, "playing");
 });
 
+test("fallback defers missing URLs across codecs and skips every variant of a rejected codec", async (t) => {
+  for (const lateProbe of [false, true]) {
+    for (const code of [2, 3]) {
+      const audio = new FakeAudio();
+      const attempts = [];
+      const files = sources.map((source) => ({ ...source, availability: "available" }));
+      const media = new MediaController(audio, { onSourceChange: (source) => attempts.push(source.id) });
+      t.after(() => media.destroy());
+      if (!lateProbe) files[1].availability = "missing";
+      await media.setSelection(files, "opus-128", 20, true);
+      files[1].availability = "missing";
+      audio.error = { code };
+      audio.emit("error");
+      assert.equal(media.currentSource().id, "aac-128");
+      audio.error = { code: 2 };
+      for (let i = 0; i < files.length && media.state !== "error"; i++) audio.emit("error");
+      assert.deepEqual(attempts, ["opus-128", "aac-128", "mp3-128", ...(code === 2 ? ["opus-96"] : [])]);
+      assert.equal(media.state, "error");
+      await media.requestPlay();
+      assert.equal(media.currentSource().id, "opus-128");
+      media.destroy();
+    }
+  }
+});
+
 test("decode rejection skips the failed codec family", async () => {
   const audio = new FakeAudio();
   const fallbacks = [];
@@ -204,6 +252,80 @@ test("offline media errors preserve the active source for recovery", async () =>
   assert.equal(media.playbackIntent, true);
   online = true;
   media.destroy();
+});
+
+test("reconnect reloads a terminally failed source once and restores its position", async (t) => {
+  for (const pause of [false, true]) {
+    const audio = new FakeAudio();
+    let online = true;
+    const loads = [];
+    audio.load = () => {
+      loads.push(audio.src);
+      audio.error = null;
+      audio.currentTime = 0;
+    };
+    audio.playImpl = async () => {
+      if (audio.error) throw new DOMException("Failed resource", "NotSupportedError");
+    };
+    const media = new MediaController(audio, {}, { isOnline: () => online });
+    t.after(() => media.destroy());
+    await media.setSelection(sources, "aac-128", 30, true);
+    media.setPlaybackRate(1.5);
+    audio.emit("loadedmetadata");
+    audio.emit("playing");
+    audio.currentTime = 42;
+    audio.emit("timeupdate");
+    online = false;
+    audio.error = { code: 4 };
+    audio.emit("error");
+    if (pause) media.requestPause();
+    online = true;
+    await media.handleReconnect();
+    if (pause) {
+      assert.deepEqual(loads, ["audio.m4a"]);
+      await media.requestPlay();
+    }
+    await media.handleReconnect();
+    assert.deepEqual(loads, ["audio.m4a", "audio.m4a"]);
+    audio.emit("loadedmetadata");
+    audio.emit("playing");
+    assert.equal(media.state, "playing");
+    assert.equal(audio.currentTime, 42);
+    assert.equal(audio.playbackRate, 1.5);
+    audio.error = { code: 4 };
+    audio.emit("error");
+    assert.equal(loads.at(-1), "opus.webm");
+  }
+});
+
+test("a stall that timed out offline gets a new fallback deadline on reconnect", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const outcome of ["pause", "progress", "still stalled"]) {
+    let online = true;
+    const audio = new FakeAudio();
+    const media = new MediaController(audio, {}, { sourceTimeoutMs: 100, isOnline: () => online });
+    t.after(() => media.destroy());
+    await media.setSelection(sources, "opus-128", 0, true);
+    audio.emit("playing");
+    audio.currentTime = 12;
+    audio.emit("timeupdate");
+    online = false;
+    audio.emit("waiting");
+    t.mock.timers.tick(100);
+    assert.equal(media.currentSource().id, "opus-128");
+    if (outcome === "pause") media.requestPause();
+    online = true;
+    await media.handleReconnect();
+    if (outcome === "progress") {
+      audio.currentTime = 13;
+      audio.emit("timeupdate");
+    }
+    t.mock.timers.tick(100);
+    assert.equal(media.currentSource().id, outcome === "still stalled" ? "opus-96" : "opus-128");
+    assert.equal(media.playbackIntent, outcome !== "pause");
+    assert.equal(media.position(), outcome === "progress" ? 13 : 12);
+    media.destroy();
+  }
 });
 
 test("source reload time updates cannot erase a pending chapter seek", async () => {

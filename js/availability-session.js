@@ -2,12 +2,11 @@ import { scanSources } from "./availability.js";
 import { buildSources } from "./source-selection.js";
 
 export class AvailabilitySession {
-  constructor({ window, fetchImpl, isOnline, readCache, writeCache, onChange, onError }) {
+  constructor({ window, fetchImpl, isOnline, openCache, onChange, onError }) {
     this.window = window;
     this.isOnline = isOnline;
     this.fetchImpl = fetchImpl;
-    this.readCache = readCache;
-    this.writeCache = writeCache;
+    this.openCache = openCache;
     this.onChange = onChange;
     this.onError = onError;
     this.scanned = new Set();
@@ -16,45 +15,40 @@ export class AvailabilitySession {
   }
 
   prepareBook(book, audio) {
-    const cached = this.readCache(book.id, book.cacheVersion);
-    const played = new Set(cached.playedUrls);
+    const cache = this.openCache(book.id, book.cacheVersion);
+    const played = new Set();
     const sources = new Map();
     for (const language of Object.values(book.languages)) {
       const variants = buildSources(language, audio);
       for (const source of variants) {
-        const value = cached.byLanguage[language.code]?.[source.id];
-        if (played.has(source.url) || value === true) source.availability = "available";
-        else if (value === false) source.availability = "missing";
-        else if (["available", "missing", "unknown"].includes(value)) source.availability = value;
+        if (cache.hasPlayed(source.url)) played.add(source.url);
+        source.availability = played.has(source.url) ? "available" : cache.readProbe(language.code, source.id, source.url);
       }
       sources.set(language.code, variants);
     }
-    return { book, sources, played };
+    return { cache, sources, played };
   }
 
-  setBook({ book, sources, played }) {
+  setBook({ cache, sources, played }) {
     this.selectLanguage("");
     this.scanned.clear();
-    this.book = book;
+    this.cache = cache;
     this.sources = sources;
     this.played = played;
   }
 
-  save() {
-    const byLanguage = {};
-    for (const [code, sources] of this.sources) {
-      byLanguage[code] = Object.fromEntries(sources.map((source) => [source.id, source.availability]));
-    }
-    this.writeCache(this.book.id, this.book.cacheVersion, byLanguage, [...this.played]);
+  markPlayed(source) {
+    if (!this.language || !source) return;
+    this.cache.recordPlayback(source.url, this.language, source.id);
+    if (this.played.has(source.url)) return;
+    this.confirmAvailable(source.url);
   }
 
-  markPlayed(source) {
-    if (!this.language || !source || this.played.has(source.url)) return;
-    this.played.add(source.url);
+  confirmAvailable(url) {
+    this.played.add(url);
     for (const variants of this.sources.values()) {
-      for (const candidate of variants) if (candidate.url === source.url) candidate.availability = "available";
+      for (const candidate of variants) if (candidate.url === url) candidate.availability = "available";
     }
-    this.save();
   }
 
   cancel() {
@@ -106,14 +100,16 @@ export class AvailabilitySession {
     if (!this.isOnline()) return;
     const controller = new AbortController();
     this.controller = controller;
-    const sources = this.sources.get(this.language).filter((source) => !this.played.has(source.url));
+    const language = this.language;
+    const sources = this.sources.get(language).filter((source) => !this.played.has(source.url));
     try {
       await scanSources(sources, {
         signal: controller.signal, fetchImpl: this.fetchImpl,
         onResult: (result, index) => {
+          this.cache.recordProbe(language, result.id, result.availability, result.url);
           if (this.played.has(result.url)) return;
-          sources[index].availability = result.availability;
-          this.save();
+          if (this.cache.hasPlayed(result.url)) this.confirmAvailable(result.url);
+          else sources[index].availability = result.availability;
           this.onChange();
         },
       });

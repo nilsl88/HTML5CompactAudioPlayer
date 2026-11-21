@@ -7,7 +7,7 @@ import { readFile } from "node:fs/promises";
 import { BookConfigStore } from "../js/book-config.js";
 import { normalizeLibrary } from "../js/config.js";
 import { buildSources, chooseDefaultSource } from "../js/source-selection.js";
-import { openPlayerPage } from "./player-page.mjs";
+import { deferred, openPlayerPage } from "./player-page.mjs";
 import {
   OfflineManager,
   chunkBounds,
@@ -566,6 +566,50 @@ test("keeps completed chunks when a connection fails so download can resume", as
   assert.deepEqual(manifest.completed, [0, 1]);
 });
 
+test("a confirmed restart credits only the partial audio it can actually free under the write lock", async () => {
+  const mib = 1024 ** 2;
+  const total = 9 * mib;
+  for (const scenario of ["enough after restart", "less space after confirmation", "evicted chunk"]) {
+    const { manager, saved, options } = await savedBookFixture();
+    const selected = { ...selection(total), episodeId: "next" };
+    manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+    await assert.rejects(manager.start(selected), /connection lost/);
+    const staged = manager.staging;
+    const chunk = offlineChunkUrl(options.baseUrl, staged.downloadId, 0);
+    const cache = await options.cacheStorage.open(staged.cacheName);
+    const range = rangedFetch(total);
+    manager.fetchImpl = async (url, request) => {
+      const response = await range(url, request);
+      response.headers.set("etag", '"second"');
+      return response;
+    };
+    let free = scenario === "enough after restart" ? 20 : 30;
+    const estimates = [];
+    options.navigatorObject.storage.estimate = async () => {
+      estimates.push(heldLocks.size > 0);
+      return { quota: 100 * mib, usage: (100 - free) * mib };
+    };
+    const check = await manager.inspectSource(selected);
+    assert.equal(check.canResume, false);
+    assert.equal(await manager.start(selected, check, { confirmDownload: () => false }), null);
+    assert.ok(await cache.match(chunk));
+    if (scenario === "evicted chunk") await cache.delete(chunk);
+    const restart = manager.start(selected, check, { confirmDownload: () => {
+      free = scenario === "less space after confirmation" ? 16 : 20;
+      return true;
+    } });
+    if (scenario === "enough after restart") {
+      assert.equal((await restart).episodeId, selected.episodeId);
+      assert.ok(!(await options.cacheStorage.keys()).includes(staged.cacheName));
+    } else {
+      await assert.rejects(restart, { code: "quota" });
+      assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+      assert.equal((await manager.readRecord("staging")).downloadId, staged.downloadId);
+    }
+    assert.deepEqual(estimates, [false, true]);
+  }
+});
+
 test("an interrupted download never combines chunks from different revisions of the same size", async () => {
   const chunkSize = 8 * 1024 * 1024;
   const total = chunkSize + 4;
@@ -745,6 +789,8 @@ test("canceling an offline range stops reads at the last requested chunk", async
   const response = await context.cachedMediaResponse(request, manifest, cache);
   const reader = response.body.getReader();
   assert.equal(response.status, 206);
+  const { versionHeader, versionHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  assert.equal(response.headers.get(versionHeader), versionHeaderValue(manifest.cacheVersion));
   assert.equal(response.headers.get("content-length"), "9");
   assert.deepEqual([...(await reader.read()).value], [3]);
   assert.deepEqual([...(await reader.read()).value], [4, 5]);
@@ -829,6 +875,314 @@ async function savedBookFixture() {
   return { manager, saved, selected, options, config, configUrl };
 }
 
+test("a downloaded catalog remains usable and retries on reconnection or when Options opens", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { manager, selected, config, configUrl, options } = await savedBookFixture();
+  const url = new URL("media/library.json", options.baseUrl).href;
+  const old = { books: [{ id: "book" }], ui: { onboardingEnabled: false } };
+  manager.fetchImpl = (path, request) => path === url ? Response.json(old) : options.fetchImpl(path, request);
+  await manager.start({ ...selected, assets: [...selected.assets, { url, required: false }] });
+  for (const trigger of ["online", "options"]) {
+    let live = false;
+    let catalogs = 0;
+    const worker = await workerContext({ caches: options.cacheStorage, fetch: (request) => {
+      if (request.url === url) {
+        catalogs++;
+        return live ? Response.json({ ...old, books: [...old.books, { id: "new" }] }) : new Response(null, { status: 503 });
+      }
+      return request.url === configUrl ? Response.json(config) : Response.json({ ...config, id: "new" });
+    } });
+    const page = await openPlayerPage(config, assert.fail, new Map(), {
+      fetch: (path, init) => worker.networkFirst(new Request(path, init)),
+    });
+    await page.ready;
+    const ids = () => page.elements.get("bookSelect").children.map((option) => option.value);
+    assert.deepEqual(ids(), ["book"]);
+    page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+    const pauses = t.mock.method(page.audio, "pause");
+    page.window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.deepEqual(ids(), ["book"]);
+    assert.equal(catalogs, 2);
+    live = true;
+    if (trigger === "online") page.window.dispatchEvent(new Event("online"));
+    else page.elements.get("optionsBtn").dispatchEvent(new Event("click"));
+    await settle();
+    assert.deepEqual(ids(), ["book", "new"]);
+    page.window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.equal(catalogs, 3);
+    assert.equal(pauses.mock.callCount(), 0);
+    assert.equal(page.audio.src, selected.sourceUrl);
+  }
+});
+
+test("offline WebVTT is accepted only for the downloaded edition and retries when connectivity returns", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const chapter = (label) => `WEBVTT\n\n00:00.000 --> 00:15.000\n${label}`;
+  const { manager, selected, config, configUrl, options } = await savedBookFixture();
+  const url = new URL("chapter-list", configUrl).href;
+  config.languages.en.chapters = "chapter-list";
+  manager.fetchImpl = (path, request) => path === url ? new Response(chapter("First edition")) : options.fetchImpl(path, request);
+  await manager.start({ ...selected, assets: [...selected.assets, { url, required: false }] });
+  let healthy = false;
+  const worker = await workerContext({ caches: options.cacheStorage, fetch: () =>
+    healthy ? new Response(chapter("Second edition")) : new Response(null, { status: 503 }) });
+  const saved = new Map();
+  const visit = (cacheVersion) => openPlayerPage({ ...config, cacheVersion },
+    (path, init) => worker.networkFirst(new Request(path, init)), saved);
+  const original = await visit(1);
+  assert.equal(original.storage.readChapters("book", "en", 1, url), chapter("First edition"));
+  const next = await visit(2);
+  assert.equal(next.storage.readChapters("book", "en", 2, url), "");
+  assert.match(next.elements.get("chaptersList").children[0].className, /chapter-load-error/);
+  healthy = true;
+  next.window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(next.elements.get("chaptersList").children[0].children[0].textContent, "Second edition");
+  assert.equal(next.storage.readChapters("book", "en", 2, url), chapter("Second edition"));
+  healthy = false;
+  const reopened = await visit(2);
+  assert.equal(reopened.elements.get("chaptersList").children[0].children[0].textContent, "Second edition");
+});
+
+test("an idle audio range pauses the download and another tab resumes the missing bytes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const total = 8 * 1024 ** 2 + 4;
+  const lastRange = `bytes=${total - 4}-${total - 1}`;
+  const range = rangedFetch(total);
+  const selected = { ...selection(total), episodeId: "next" };
+  for (const stall of ["headers", "body"]) {
+    const { manager, options, saved } = await savedBookFixture();
+    const waiting = deferred();
+    const requests = [];
+    let stream;
+    manager.fetchImpl = async (url, request) => {
+      if (request.headers.Range !== lastRange) return range(url, request);
+      if (stall === "headers") {
+        waiting.resolve();
+        return new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(request.signal.reason)));
+      }
+      const body = new ReadableStream({
+        start(controller) { stream = controller; },
+        pull() { waiting.resolve(); },
+      });
+      return new Response(body, { status: 206, headers: { "content-range": `bytes ${total - 4}-${total - 1}/${total}` } });
+    };
+    const result = manager.start(selected).catch((error) => error);
+    await waiting.promise;
+    await settle();
+    if (stall === "body") {
+      for (const byte of [1, 2]) {
+        t.mock.timers.tick(15_000);
+        stream.enqueue(Uint8Array.of(byte));
+        await settle();
+        assert.equal(manager.phase, "downloading");
+      }
+    }
+    t.mock.timers.tick(60_000);
+    await settle();
+    assert.equal(manager.phase, "paused");
+    assert.equal((await result).code, "timeout");
+    assert.deepEqual(manager.staging.completed, [0]);
+    assert.equal(manager.active.downloadId, saved.downloadId);
+    const next = new OfflineManager({ ...options, fetchImpl: (url, request) => {
+      requests.push(request.headers.Range);
+      return range(url, request);
+    } });
+    await next.init();
+    assert.equal((await next.resume()).episodeId, selected.episodeId);
+    assert.deepEqual(requests, ["bytes=0-0", lastRange]);
+  }
+});
+
+test("resume reuses a validated configuration and validates any repair before overwriting cached text", async () => {
+  for (const cached of ["valid", "damaged"]) {
+    const { manager, options, selected, config, configUrl } = await savedBookFixture();
+    const total = 8 * 1024 ** 2 + 4;
+    const interrupted = rangedFetch(total, { failSecondChunk: true });
+    manager.fetchImpl = (url, request) => url === configUrl ? Response.json(config) : interrupted(url, request);
+    await assert.rejects(manager.start(selected), /connection lost/);
+    const staged = manager.staging;
+    const cache = await options.cacheStorage.open(staged.cacheName);
+    if (cached === "damaged") await cache.put(configUrl, new Response("damaged copy"));
+    const audio = rangedFetch(total);
+    const ranges = [];
+    let configReads = 0;
+    let maintenance = true;
+    manager.fetchImpl = (url, request) => {
+      if (url === configUrl) {
+        configReads++;
+        return maintenance ? new Response("<html>Maintenance</html>") : Response.json(config);
+      }
+      ranges.push(request.headers.Range);
+      return audio(url, request);
+    };
+    if (cached === "damaged") {
+      await assert.rejects(manager.resume(), { code: "config" });
+      assert.equal(await (await cache.match(configUrl)).text(), "damaged copy");
+      assert.deepEqual(manager.staging.completed, [0]);
+      maintenance = false;
+      ranges.length = 0;
+    }
+    assert.equal((await manager.resume()).downloadId, staged.downloadId);
+    assert.equal(configReads, cached === "valid" ? 0 : 2);
+    assert.deepEqual(ranges, ["bytes=0-0", "bytes=8388608-8388611"]);
+    assert.deepEqual(await (await cache.match(configUrl)).json(), config);
+  }
+});
+
+test("a published book with a missing chunk keeps its intact audio for a version-checked repair", async () => {
+  const chunkSize = 8 * 1024 ** 2;
+  for (const scenario of ["missing chunk", "missing manifest", "short survivor", "changed revision", "separate download"]) {
+    const total = (scenario === "short survivor" ? 2 : 1) * chunkSize + 4;
+    const { manager, options, selected, config, configUrl } = await savedBookFixture();
+    const audio = rangedFetch(total);
+    manager.fetchImpl = (url, request) => url === configUrl ? Response.json(config) : audio(url, request);
+    const saved = await manager.start(selected);
+    if (scenario === "separate download") {
+      manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+      await assert.rejects(manager.start({ ...selection(), episodeId: "replacement" }), /connection lost/);
+    }
+    const cache = await options.cacheStorage.open(saved.cacheName);
+    await cache.delete(offlineChunkUrl(options.baseUrl, saved.downloadId, saved.totalChunks - 1));
+    if (scenario === "short survivor") {
+      await cache.put(offlineChunkUrl(options.baseUrl, saved.downloadId, 1),
+        new Response(Uint8Array.of(1), { headers: { "content-length": String(chunkSize) } }));
+    }
+    if (scenario === "missing manifest") await cache.delete(offlineManifestUrl(options.baseUrl));
+    const ranges = [];
+    const reopened = new OfflineManager({ ...options, fetchImpl: async (url, request) => {
+      if (url === configUrl) return Response.json(config);
+      ranges.push(request.headers.Range);
+      const response = await audio(url, request);
+      if (scenario === "changed revision") response.headers.set("etag", '"new"');
+      return response;
+    } });
+    await reopened.init();
+    assert.equal(reopened.active, null);
+    assert.equal(await (await workerContext({ caches: options.cacheStorage })).activeManifest(), null);
+    assert.ok((await options.cacheStorage.keys()).includes(saved.cacheName));
+    if (scenario === "separate download") {
+      assert.equal(reopened.staging.downloadId, manager.staging.downloadId);
+      assert.deepEqual(reopened.staging.completed, [0]);
+      assert.equal(reopened.repairable.status, "needs-audio");
+      await reopened.cancel();
+    }
+    assert.equal(reopened.staging.downloadId, saved.downloadId);
+    await reopened.refresh();
+    assert.equal(reopened.staging.downloadId, saved.downloadId);
+    assert.deepEqual(reopened.staging.completed, [0]);
+    assert.deepEqual(ranges, []);
+    const repaired = await reopened.resume();
+    assert.equal(repaired.sourceUrl, saved.sourceUrl);
+    const expectedRanges = ["bytes=0-0"];
+    if (scenario === "changed revision") expectedRanges.push("bytes=0-8388607");
+    if (scenario === "short survivor") expectedRanges.push("bytes=8388608-16777215", "bytes=16777216-16777219");
+    else expectedRanges.push("bytes=8388608-8388611");
+    assert.deepEqual(ranges, expectedRanges);
+    assert.equal((await reopened.readRecord("active")).downloadId, repaired.downloadId);
+  }
+});
+
+test("startup rebuilds a missing local manifest from the published book and verified chunks", async () => {
+  for (const damage of ["manifest", "legacy manifest", "invalid manifest", "config", "short chunk", "removed"]) {
+    const { manager, options, saved, configUrl } = await savedBookFixture();
+    const manifest = damage === "legacy manifest"
+      ? { ...saved, cacheName: "compact-player-offline-book-v1-" + saved.downloadId } : saved;
+    const cache = await options.cacheStorage.open(manifest.cacheName);
+    const chunk = offlineChunkUrl(options.baseUrl, saved.downloadId, 0);
+    const local = offlineManifestUrl(options.baseUrl);
+    if (manifest !== saved) {
+      const original = await options.cacheStorage.open(saved.cacheName);
+      for (const key of [chunk, configUrl]) await cache.put(key, await original.match(key));
+      await manager.writeRecord("active", manifest);
+      await options.cacheStorage.delete(saved.cacheName);
+    }
+    await cache.delete(local);
+    if (damage === "invalid manifest") await cache.put(local, Response.json({}));
+    if (damage === "config") await cache.delete(configUrl);
+    if (damage === "short chunk") await cache.put(chunk, new Response(new Uint8Array(2)));
+    if (damage === "removed") await cache.put(local, Response.json({ status: "removed", downloadId: saved.downloadId }));
+    const reopened = new OfflineManager({ ...options, fetchImpl: assert.fail });
+    const state = await reopened.init();
+    if (damage === "short chunk" || damage === "removed") {
+      assert.equal(state.active, null, damage);
+      assert.equal(await reopened.readRecord("active"), null, damage);
+    } else {
+      assert.equal((state.active || state.repairable)?.downloadId, saved.downloadId, damage);
+      assert.equal(Boolean(state.repairable), damage === "config");
+      assert.deepEqual(await (await cache.match(local)).json(), manifest);
+      assert.ok((await options.cacheStorage.keys()).includes(manifest.cacheName));
+    }
+  }
+});
+
+test("startup reads an unchanged download without writing and a quota error keeps controls available", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { manager, options, saved, configUrl } = await savedBookFixture();
+  const meta = await manager.metaCache();
+  const put = t.mock.method(meta, "put", () => { throw new DOMException("Full", "QuotaExceededError"); });
+  const remove = t.mock.method(meta, "delete");
+  const reopened = new OfflineManager(options);
+  const state = await reopened.init();
+  assert.equal(state.supported, true);
+  assert.equal(state.active.downloadId, saved.downloadId);
+  assert.equal(put.mock.callCount(), 0);
+  assert.equal(remove.mock.callCount(), 0);
+
+  const cache = await options.cacheStorage.open(saved.cacheName);
+  await cache.delete(configUrl);
+  const damaged = await reopened.refresh();
+  assert.equal(put.mock.callCount(), 1);
+  assert.equal(damaged.supported, true);
+  assert.equal(damaged.active, null);
+  assert.equal(damaged.repairable?.downloadId, saved.downloadId);
+  await reopened.removeActive();
+  assert.ok(!(await options.cacheStorage.keys()).includes(saved.cacheName));
+  assert.equal((await new OfflineManager(options).init()).active, null);
+});
+
+test("a partial download resumes from verified chunks after its local manifest disappears", async () => {
+  const chunkSize = 8 * 1024 ** 2;
+  const total = chunkSize + 4;
+  for (const damage of ["missing manifest", "legacy cache", "short chunk"]) {
+    const { manager, options, saved } = await savedBookFixture();
+    manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+    await assert.rejects(manager.start({ ...selection(total), episodeId: "other" }), /connection lost/);
+    let staging = manager.staging;
+    const chunk = offlineChunkUrl(options.baseUrl, staging.downloadId, 0);
+    let cache = await options.cacheStorage.open(staging.cacheName);
+    if (damage === "legacy cache") {
+      const original = cache;
+      const name = "compact-player-offline-book-v1-" + staging.downloadId;
+      cache = await options.cacheStorage.open(name);
+      await cache.put(chunk, await original.match(chunk));
+      await options.cacheStorage.delete(staging.cacheName);
+      staging = { ...staging, cacheName: name };
+      await manager.writeRecord("staging", staging);
+    }
+    await cache.delete(offlineManifestUrl(options.baseUrl));
+    if (damage === "short chunk") await cache.put(chunk, new Response(new Uint8Array(2)));
+
+    const ranges = [];
+    const fetchRange = rangedFetch(total);
+    const reopened = new OfflineManager({ ...options, fetchImpl: (url, request) => {
+      ranges.push(request.headers.Range);
+      return fetchRange(url, request);
+    } });
+    const state = await reopened.init();
+    assert.equal(state.active?.downloadId, saved.downloadId);
+    assert.equal(state.staging?.downloadId, staging.downloadId, damage);
+    assert.deepEqual(state.staging.completed, damage === "short chunk" ? [] : [0]);
+    assert.deepEqual(await (await cache.match(offlineManifestUrl(options.baseUrl))).json(), state.staging);
+    assert.deepEqual(ranges, []);
+    assert.equal((await reopened.resume()).downloadId, staging.downloadId);
+    assert.deepEqual(ranges, ["bytes=0-0", ...(damage === "short chunk" ? ["bytes=0-8388607"] : []), "bytes=8388608-8388611"]);
+  }
+});
+
 test("reopening after interrupted cancellation discards the partial book and keeps the ready one", async (t) => {
   for (const failure of ["staging record", "book cache"]) {
     const { manager, options, saved } = await savedBookFixture();
@@ -845,6 +1199,34 @@ test("reopening after interrupted cancellation discards the partial book and kee
     assert.equal(reopened.snapshot().staging, null);
     assert.equal(reopened.snapshot().active.downloadId, saved.downloadId);
     assert.ok(!(await options.cacheStorage.keys()).includes(cacheName));
+  }
+});
+
+test("cancel at full quota frees partial audio and survives an interrupted staging-record deletion", async (t) => {
+  for (const interrupt of [false, true]) {
+    const { manager, options, saved } = await savedBookFixture();
+    manager.fetchImpl = rangedFetch(9 * 1024 ** 2, { failSecondChunk: true });
+    await assert.rejects(manager.start({ ...selection(), episodeId: "other" }), /connection lost/);
+    const { cacheName, downloadId } = manager.staging;
+    const chunk = await options.cacheStorage.match(offlineChunkUrl(options.baseUrl, downloadId, 0), { cacheName });
+    assert.equal((await chunk.arrayBuffer()).byteLength, 8 * 1024 ** 2);
+    const put = t.mock.method(MemoryCache.prototype, "put", () => { throw new DOMException("Full", "QuotaExceededError"); });
+    if (interrupt) {
+      const meta = await manager.metaCache();
+      const remove = t.mock.method(meta, "delete", () => { throw new Error("Cleanup interrupted"); });
+      await assert.rejects(manager.cancel(), /Cleanup interrupted/);
+      remove.mock.restore();
+    } else await manager.cancel();
+
+    assert.equal(manager.snapshot().staging, null);
+    assert.ok(!(await options.cacheStorage.keys()).includes(cacheName));
+    const reopened = new OfflineManager(options);
+    const state = await reopened.init();
+    assert.equal(state.active.downloadId, saved.downloadId);
+    assert.equal(state.staging, null);
+    assert.equal(await reopened.readRecord("staging", true), null);
+    assert.ok((await options.cacheStorage.keys()).includes(saved.cacheName));
+    put.mock.restore();
   }
 });
 
@@ -1074,6 +1456,139 @@ test("download preparation can be canceled or time out before any chunks are wri
   assert.equal(restarted.staging, null);
 });
 
+async function interruptedReplacement(t) {
+  const fixture = await savedBookFixture();
+  const { manager, options, selected } = fixture;
+  const replacement = { ...selected, sourceId: "mp3-64", mime: "audio/mpeg",
+    sourceUrl: new URL("alternate.mp3", selected.sourceUrl).href };
+  manager.fetchImpl = async (url, request) => {
+    const response = await options.fetchImpl(url, request);
+    response.headers.delete("etag");
+    return response;
+  };
+  const put = MemoryCache.prototype.put;
+  const interrupted = t.mock.method(MemoryCache.prototype, "put", async function (key, value) {
+    if (key === offlineManifestUrl(options.baseUrl) && (await value.clone().json()).status === "ready") {
+      throw new Error("Ready manifest write interrupted");
+    }
+    return put.call(this, key, value);
+  });
+  await assert.rejects(manager.start(replacement), /Ready manifest write interrupted/);
+  interrupted.mock.restore();
+  return fixture;
+}
+
+test("a damaged replacement keeps the published audiobook playable until its audio is repaired", async (t) => {
+  for (const marker of ["downloading", "ready"]) {
+    for (const action of ["reload", "resume"]) {
+      const { manager, options, saved } = await interruptedReplacement(t);
+      const replacement = manager.staging;
+      const cache = await options.cacheStorage.open(replacement.cacheName);
+      if (marker === "ready") {
+        await cache.put(offlineManifestUrl(options.baseUrl), Response.json({ ...replacement, status: marker }));
+      }
+      const chunkUrl = (manifest) => offlineChunkUrl(options.baseUrl, manifest.downloadId, 0);
+      const length = marker === "ready" ? 11 : 2;
+      await cache.put(chunkUrl(replacement), new Response(new Uint8Array(length), { headers: { "content-length": "10" } }));
+      options.navigatorObject.onLine = false;
+      const player = action === "reload" ? new OfflineManager(options) : manager;
+      if (action === "reload") await player.init();
+      else await assert.rejects(player.resume(), { code: "offline" });
+      assert.equal((await player.readRecord("active")).downloadId, saved.downloadId);
+      assert.deepEqual((await player.readRecord("staging")).completed, []);
+      const old = await options.cacheStorage.match(chunkUrl(saved), { cacheName: saved.cacheName });
+      assert.equal((await old.arrayBuffer()).byteLength, 10);
+
+      options.navigatorObject.onLine = true;
+      player.fetchImpl = options.fetchImpl;
+      const repaired = await player.resume();
+      assert.equal(repaired.sourceUrl, replacement.sourceUrl);
+      assert.equal((await player.readRecord("active")).downloadId, repaired.downloadId);
+      const audio = await options.cacheStorage.match(chunkUrl(repaired), { cacheName: repaired.cacheName });
+      assert.equal((await audio.arrayBuffer()).byteLength, 10);
+    }
+  }
+});
+
+test("a replacement with a damaged asset list must reopen from its recorded configuration before publication", async (t) => {
+  for (const action of ["reload", "resume"]) {
+    const { manager, options, saved, configUrl, config } = await interruptedReplacement(t);
+    const staged = manager.staging;
+    const cache = await options.cacheStorage.open(staged.cacheName);
+    const otherUrl = new URL("episode.json", configUrl).href;
+    const assets = action === "reload" ? [] : [{ url: otherUrl, required: true }];
+    await cache.put(offlineManifestUrl(options.baseUrl), Response.json({ ...staged, status: "ready", assets }));
+    await cache.put(otherUrl, Response.json(config));
+    await cache.delete(configUrl);
+    options.navigatorObject.onLine = false;
+    const player = action === "reload" ? new OfflineManager(options) : manager;
+    if (action === "reload") await player.init();
+    assert.equal((await player.readRecord("active")).downloadId, saved.downloadId);
+    await assert.rejects(player.resume(), { code: "offline" });
+    assert.ok(await options.cacheStorage.match(offlineChunkUrl(options.baseUrl, saved.downloadId, 0), { cacheName: saved.cacheName }));
+    options.navigatorObject.onLine = true;
+    const requests = [];
+    player.fetchImpl = (url) => { requests.push(url); return Response.json(config); };
+    assert.equal((await player.resume()).downloadId, staged.downloadId);
+    assert.deepEqual(requests, [configUrl]);
+    assert.equal(player.downloadedConfig.url, configUrl);
+  }
+});
+
+test("a staged book with complete audio needs only its missing configuration", async (t) => {
+  const { manager, options, saved, configUrl, config } = await interruptedReplacement(t);
+  const staged = manager.staging;
+  const cache = await options.cacheStorage.open(staged.cacheName);
+  await cache.delete(configUrl);
+  const requests = [];
+  options.navigatorObject.onLine = false;
+  let replacementConfig = { ...config, cacheVersion: 9 };
+  const reopened = new OfflineManager({ ...options, fetchImpl: async (url) => {
+    requests.push(url);
+    return Response.json(replacementConfig);
+  } });
+  await reopened.init();
+  assert.equal(reopened.snapshot().canFinishOffline, false);
+  await assert.rejects(reopened.resume(), { code: "offline" });
+  assert.deepEqual(requests, []);
+  options.navigatorObject.onLine = true;
+  await assert.rejects(reopened.resume(), /configuration/);
+  assert.equal((await reopened.readRecord("active")).downloadId, saved.downloadId);
+  assert.equal(reopened.staging.downloadId, staged.downloadId);
+  replacementConfig = config;
+  assert.equal((await reopened.resume()).downloadId, staged.downloadId);
+  assert.deepEqual(requests, [configUrl, configUrl]);
+  assert.ok(await cache.match(offlineChunkUrl(options.baseUrl, staged.downloadId, 0)));
+});
+
+test("all cached chunks can be activated offline after interruption before the ready manifest", async (t) => {
+  for (const recovery of ["resume", "reload", "missing chunk", "missing config"]) {
+    const { manager, options, saved, configUrl } = await interruptedReplacement(t);
+    const staged = manager.staging;
+    const cache = await options.cacheStorage.open(staged.cacheName);
+    const chunk = offlineChunkUrl(options.baseUrl, staged.downloadId, 0);
+    assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+    assert.equal((await (await cache.match(offlineManifestUrl(options.baseUrl))).json()).status, "downloading");
+    const offlineFetch = t.mock.fn(() => { throw new Error("Offline"); });
+    options.navigatorObject.onLine = false;
+    if (recovery === "resume") {
+      manager.fetchImpl = offlineFetch;
+      assert.equal((await manager.resume()).downloadId, staged.downloadId);
+    } else {
+      if (recovery === "missing chunk") await cache.delete(chunk);
+      if (recovery === "missing config") await cache.delete(configUrl);
+      const state = await new OfflineManager({ ...options, fetchImpl: offlineFetch }).init();
+      assert.equal(state.active.downloadId, recovery === "reload" ? staged.downloadId : saved.downloadId);
+    }
+    assert.equal(offlineFetch.mock.callCount(), 0);
+    if (recovery === "resume" || recovery === "reload") {
+      assert.equal((await manager.readRecord("active")).downloadId, staged.downloadId);
+      assert.equal(await manager.readRecord("staging"), null);
+      assert.equal((await (await cache.match(chunk)).arrayBuffer()).byteLength, 10);
+    }
+  }
+});
+
 test("a completed replacement survives a failed active record write on resume and reload", async (t) => {
   for (const recovery of ["resume", "reload"]) {
     const { manager, options, selected, saved } = await savedBookFixture();
@@ -1129,6 +1644,28 @@ test("a published replacement stays successful when housekeeping fails and clean
     assert.equal(await reopened.readRecord("staging"), null);
     assert.ok(!(await storage.keys()).includes(saved.cacheName));
   }
+});
+
+test("startup keeps the published replacement usable when clearing staging fails", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { manager, options, saved } = await interruptedReplacement(t);
+  const replacement = manager.staging;
+  const meta = await manager.metaCache();
+  const remove = meta.delete.bind(meta);
+  const failure = t.mock.method(meta, "delete", (key) => {
+    if (key.endsWith("/staging.json")) throw new Error("Cleanup interrupted");
+    return remove(key);
+  });
+  const reopened = new OfflineManager(options);
+  const state = await reopened.init();
+  assert.equal((await reopened.readRecord("active")).downloadId, replacement.downloadId);
+  assert.equal(state.supported, true);
+  assert.equal(state.active.downloadId, replacement.downloadId);
+  assert.equal(state.staging, null);
+  failure.mock.restore();
+  await reopened.refresh();
+  assert.equal(await reopened.readRecord("staging"), null);
+  assert.ok(!(await options.cacheStorage.keys()).includes(saved.cacheName));
 });
 
 test("retrying a local reset leaves the successfully cleared download store alone", async (t) => {
@@ -1192,7 +1729,8 @@ test("a non-audio chunk after a valid probe preserves the published book", async
   }
 });
 
-test("an unversioned download stores all chunks from one audio response", async () => {
+test("an unversioned download stores all chunks from one audio response while yielding to playback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const size = 8 * 1024 * 1024;
   const total = size + 4;
   const requests = [];
@@ -1211,7 +1749,7 @@ test("an unversioned download stores all chunks from one audio response", async 
   };
   const manager = new OfflineManager({ baseUrl: "https://example.test/", cacheStorage, navigatorObject: navigatorStub(), fetchImpl });
   await manager.init();
-  const saved = await manager.start(selection(total));
+  const saved = await manager.start(selection(total), undefined, { waitForPriority: () => t.mock.timers.tick(60_000) });
   const cache = await cacheStorage.open(saved.cacheName);
   for (const [index, length] of [size, 4].entries()) {
     const chunk = await cache.match(offlineChunkUrl(manager.baseUrl, saved.downloadId, index));

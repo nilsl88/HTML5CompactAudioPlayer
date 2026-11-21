@@ -1,6 +1,16 @@
-import { normalizeBook, parseJson } from "./config.js";
+import { normalizeBook, normalizeLibrary, parseJson } from "./config.js";
 import { buildSources } from "./source-selection.js";
-import { createAbortError, fetchTextWithRetry } from "./utils.js";
+import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js";
+import "./offline-manifest.js";
+
+export function fetchLibraryCatalog(url, fetchImpl) {
+  return fetchWithRetry(url, { fetchImpl, cache: "no-store", credentials: "same-origin" }, async (response) => {
+    if (!response.ok) return null;
+    const library = normalizeLibrary(parseJson(await response.text(), "media/library.json"));
+    const { versionHeader } = globalThis.CompactPlayerOfflineManifest;
+    return { library, fromDownload: response.headers?.get?.(versionHeader) != null };
+  });
+}
 
 function parseBookConfig(text, configUrl, documentBaseUrl) {
   const raw = parseJson(text, configUrl);
@@ -16,6 +26,7 @@ export function validateOfflineBookConfig(text, configUrl, documentBaseUrl, sele
     || !sources.some((source) => source.id === selection.sourceId && source.url === selection.sourceUrl)) {
     throw new Error("The cached book configuration no longer matches the selected audio.");
   }
+  return book.id;
 }
 
 function isBookId(id, library) {
@@ -51,9 +62,9 @@ export class BookConfigStore {
     this.titlesRequest = null;
   }
 
-  setLibrary(library) {
+  setLibrary(library, { fromDownload = false } = {}) {
     this.library = library;
-    this.downloadedConfig = null;
+    if (!fromDownload) this.downloadedConfig = null;
     const retained = new Set();
     for (const record of library.books) {
       const key = this.configKey(record.id);
@@ -62,6 +73,11 @@ export class BookConfigStore {
       if (cached) record.title = cached.book.title;
     }
     for (const key of this.cache.keys()) if (!retained.has(key)) this.cache.delete(key);
+    for (const [key, request] of this.requests) {
+      if (key === this.configKey(request.id)) continue;
+      this.requests.delete(key);
+      request.controller.abort();
+    }
   }
 
   configKey(id) {
@@ -69,25 +85,41 @@ export class BookConfigStore {
     return JSON.stringify([id, recordedUrl, this.library.byId.get(id)?.folder || id]);
   }
 
-  load(id, { signal } = {}) {
-    if (signal?.aborted) return Promise.reject(createAbortError());
-    const recordedUrl = this.downloadedConfig && this.downloadedConfig.id === id ? this.downloadedConfig.url : "";
-    if (!recordedUrl && !isBookId(id, this.library)) return Promise.reject(new Error("Invalid book identifier."));
-    const key = this.configKey(id);
-    if (this.cache.has(key)) return waitForConfig(Promise.resolve(this.cache.get(key)), signal);
-    if (!this.requests.has(key)) {
-      const request = this.fetchConfig(id, recordedUrl).then((result) => {
-        if (key !== this.configKey(id)) return result;
-        this.cache.set(key, result);
-        const record = this.library.byId.get(id);
-        if (record) record.title = result.book.title;
-        return result;
-      });
-      this.requests.set(key, request);
-      void request.then(() => this.requests.delete(key), () => this.requests.delete(key));
+  async load(id, { signal } = {}) {
+    while (!signal?.aborted) {
+      const recordedUrl = this.downloadedConfig?.id === id ? this.downloadedConfig.url : null;
+      if (!recordedUrl && !isBookId(id, this.library)) throw new Error("Invalid book identifier.");
+      const key = this.configKey(id);
+      try {
+        const lookup = this.sharedRequest(id, key, recordedUrl);
+        const result = await waitForConfig(lookup, signal);
+        if (result && !signal?.aborted && key === this.configKey(id)) return result;
+      } catch (error) {
+        if (signal?.aborted || key === this.configKey(id)) throw error;
+      }
     }
-    // Consumers can leave a shared title/selection request independently.
-    return waitForConfig(this.requests.get(key), signal);
+    throw createAbortError();
+  }
+
+  sharedRequest(id, key, recordedUrl) {
+    if (this.cache.has(key)) return Promise.resolve(this.cache.get(key));
+    if (this.requests.has(key)) return this.requests.get(key).promise;
+    const controller = new AbortController();
+    const request = { id, controller };
+    this.requests.set(key, request);
+    request.promise = waitForConfig(this.fetchConfig(id, recordedUrl, controller.signal), controller.signal).then((result) => {
+      if (controller.signal.aborted) return null;
+      this.cache.set(key, result);
+      const record = this.library.byId.get(id);
+      if (record) record.title = result.book.title;
+      return result;
+    }, (error) => {
+      if (controller.signal.aborted) return null;
+      throw error;
+    }).finally(() => {
+      if (this.requests.get(key) === request) this.requests.delete(key);
+    });
+    return request.promise;
   }
 
   configUrls(id, recordedUrl) {
@@ -105,16 +137,17 @@ export class BookConfigStore {
     return ["book.json", "episode.json"].map((name) => new URL(name, bookBaseUrl).href);
   }
 
-  async fetchConfig(id, recordedUrl) {
+  async fetchConfig(id, recordedUrl, signal) {
     const urls = this.configUrls(id, recordedUrl);
     for (const [index, configUrl] of urls.entries()) {
       const hasFallback = index + 1 < urls.length;
       let response;
       try {
-        response = await fetchTextWithRetry(configUrl, this.fetchOptions);
+        response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal });
+        if (signal?.aborted) throw createAbortError();
       } catch (error) {
         // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
-        if (hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
+        if (!signal?.aborted && hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
         throw error;
       }
       if (hasFallback && [404, 410].includes(response.status)) continue;
@@ -124,7 +157,7 @@ export class BookConfigStore {
     }
   }
 
-  loadTitles(onError = (id, error) => console.warn(`Could not load book title (${id}).`, error)) {
+  loadTitles(onError = (id, error) => console.warn(`Could not load book title (${id}).`, error), onTitle) {
     if (this.titlesRequest) return this.titlesRequest;
     const library = this.library;
     const records = library.books.filter((record) => !this.cache.has(this.configKey(record.id)));
@@ -134,13 +167,14 @@ export class BookConfigStore {
       while (library === this.library && cursor < records.length) {
         const record = records[cursor]; cursor += 1;
         try { await this.load(record.id); }
-        catch (error) { onError(record.id, error); }
+        catch (error) { onError(record.id, error); continue; }
+        if (library === this.library) onTitle?.(record);
       }
     };
     const request = Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker())).then(() => {
       if (library !== this.library) {
         this.titlesRequest = null;
-        return this.loadTitles(onError);
+        return this.loadTitles(onError, onTitle);
       }
     });
     this.titlesRequest = request;

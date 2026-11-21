@@ -27,6 +27,7 @@ One chapter file serves several encodings of the same recording (Opus, AAC, MP3)
 as long as they share one timeline.
 """
 import argparse
+import errno
 import math
 import os
 import re
@@ -124,6 +125,53 @@ def plan_chapters(total, max_len, pauses):
     return starts, notes
 
 
+def check_output(audio, output, force):
+    if os.path.exists(output) and os.path.samefile(audio, output):
+        sys.exit("The chapter output points to the input audio file. Choose a different output path.")
+    if not force and os.path.lexists(output):
+        sys.exit(f"{output} already exists. Use --force to replace it.")
+
+
+def publish_new_file(staged, output):
+    try:
+        os.link(staged, output)
+        return
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENOSYS):
+            raise
+    # Some mounted webroots have no hard links. Exclusive creation still protects an existing file.
+    with open(staged, "rb") as source:
+        created = None
+        try:
+            with open(output, "xb") as destination:
+                created = os.fstat(destination.fileno())
+                shutil.copyfileobj(source, destination)
+        except BaseException:
+            try:
+                if created is not None and os.path.samestat(created, os.lstat(output)):
+                    os.unlink(output)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def write_chapters(audio, output, text, force):
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(output))) as folder:
+        staged = os.path.join(folder, "chapters.vtt")
+        with open(staged, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        check_output(audio, output, force)
+        if force:
+            if os.path.isfile(output):
+                shutil.copymode(output, staged)
+            os.replace(staged, output)
+        else:
+            try:
+                publish_new_file(staged, output)
+            except FileExistsError:
+                sys.exit(f"{output} already exists. Use --force to replace it.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Create time-based WebVTT chapters, cut at pauses in the narration.",
@@ -152,8 +200,7 @@ def main():
     if not sample.strip() or "-->" in sample or "\n" in sample:
         sys.exit('--title must be one non-empty line without "-->"; use {n} for the chapter number.')
     output = args.output or os.path.join(os.path.dirname(os.path.abspath(args.audio)), "chapters.vtt")
-    if os.path.exists(output) and not args.force:
-        sys.exit(f"{output} already exists. Use --force to replace it.")
+    check_output(args.audio, output, args.force)
 
     probed = probe_duration(args.audio)
     pauses, decoded = find_pauses(args.audio, args.noise, args.min_pause, probed)
@@ -175,8 +222,7 @@ def main():
     for index, start in enumerate(starts):
         end = starts[index + 1] if index + 1 < len(starts) else total
         lines += [f"{stamp(start)} --> {stamp(end)}", args.title.format(n=index + 1), ""]
-    with open(output, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines))
+    write_chapters(args.audio, output, "\n".join(lines), args.force)
 
     lengths = [(starts[i + 1] if i + 1 < len(starts) else total) - start for i, start in enumerate(starts)]
     print(f"Audio length {stamp(total)}, {len(pauses)} pauses found.")

@@ -301,6 +301,46 @@ test("reads JPEG cover artwork from MP4 metadata", async () => {
   assert.deepEqual(cover.data, metadata.image);
 });
 
+test("an embedded cover follows a new quality or fallback after the first file fails", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const { file } = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
+  const range = rangedFetch(file);
+  for (const change of ["quality", "fallback", "external cover"]) {
+    const requests = [];
+    const book = { id: "sample", defaultLanguage: "en", coverSource: "auto", cover: "cover.jpg",
+      languages: { en: { sources: { aac: { 96: "new.m4b", 128: "old.m4b" } } } } };
+    const { audio, elements } = await openPlayerPage(book, (url, opts) => {
+      requests.push(new URL(url).pathname.split("/").at(-1));
+      return url.endsWith("old.m4b") ? new Response(null, { status: 404 }) : range(url, opts);
+    });
+    const image = elements.get("coverImg");
+    if (change === "external cover") image.onload();
+    else image.onerror();
+    await settle();
+    if (change === "fallback") {
+      elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+      audio.error = { code: 2 };
+      audio.dispatchEvent(new Event("error"));
+    } else {
+      const quality = elements.get("qualitySelect");
+      quality.value = "aac-96";
+      quality.dispatchEvent(new Event("change"));
+      assert.ok(!audio.src);
+    }
+    await settle();
+    if (change === "external cover") {
+      assert.deepEqual(requests, []);
+      assert.match(image.src, /cover\.jpg$/);
+    } else {
+      assert.deepEqual(requests, ["old.m4b", "new.m4b"], change);
+      assert.match(image.src, /^blob:/);
+      image.onload();
+    }
+    assert.equal(elements.get("coverButton").hidden, false);
+  }
+});
+
 test("a late cover image load after a language change cannot replace the current cover", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { file } = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
@@ -348,6 +388,75 @@ test("shares one MP4 metadata range between chapters and cover", async () => {
   assert.equal(chapters.length, 2);
   assert.equal(artwork.mime, "image/jpeg");
   assert.equal(requests, 1);
+});
+
+test("replacing an MP4 at the same URL refreshes chapters and artwork together for its cache version", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const url = "https://example.test/media/shared.m4b";
+  const edition = (version) => ({
+    id: "edition" + version, defaultLanguage: "en", cacheVersion: version, coverSource: "embedded",
+    languages: { en: { chapterSource: "embedded", sources: { aac: { 64: url } } } },
+  });
+  let version = 1;
+  const requests = [];
+  const page = await openPlayerPage(edition(1), assert.fail, new Map(), { fetch: async (requested, options) => {
+    if (requested.endsWith("/library.json")) return Response.json({
+      books: [{ id: "edition1" }, { id: "edition2" }], ui: { onboardingEnabled: false },
+    });
+    if (requested.endsWith("/book.json")) return Response.json(edition(requested.includes("/edition1/") ? 1 : 2));
+    assert.equal(requested, url);
+    requests.push(options.cache);
+    const cover = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, version]), 13);
+    const chapters = neroMetadata(version === 1 ? 60 : 90);
+    return rangedFetch(atom("moov", concatBytes(chapters.subarray(8), cover.file.subarray(8))))(requested, options);
+  } });
+  const sourceKey = "embedded:" + url;
+  for (const expected of [60, 90]) {
+    if (expected === 90) {
+      version = 2;
+      const select = page.elements.get("bookSelect");
+      select.value = "edition2";
+      select.dispatchEvent(new Event("change"));
+      await settle();
+    }
+    assert.equal(page.storage.readChapterData("edition" + version, "en", version, sourceKey).cues[1].start, expected);
+    const image = await fetch(page.elements.get("coverImg").src);
+    assert.equal(new Uint8Array(await image.arrayBuffer()).at(-1), version);
+  }
+  assert.deepEqual(requests, ["no-cache", "no-cache"]);
+
+  const { versionHeader, versionHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  const savedFile = rangedFetch(neroMetadata(60));
+  const offlineFetch = async (...args) => {
+    const response = await savedFile(...args);
+    response.headers = new Headers({ "Content-Range": response.headers.get("Content-Range"), [versionHeader]: versionHeaderValue(1) });
+    return response;
+  };
+  assert.equal((await loadEmbeddedMp4Chapters(url, { cacheVersion: 1, fetchImpl: offlineFetch }))[1].start, 60);
+  await assert.rejects(loadEmbeddedMp4Chapters(url, { cacheVersion: 2, fetchImpl: offlineFetch }), /different book version/);
+});
+
+test("auto mode falls back from cached empty WebVTT and reuses the embedded chapters offline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved = new Map();
+  const requests = [];
+  const range = rangedFetch(neroMetadata());
+  const visit = (chapterSource, online = true) => openPlayerPage({
+    id: "book", defaultLanguage: "en",
+    languages: { en: { chapterSource, chapters: "chapters.vtt", sources: { aac: { 64: "book.m4b" } } } },
+  }, (url, options) => {
+    requests.push(new URL(url).pathname);
+    return url.endsWith(".vtt") ? new Response("WEBVTT\n") : range(url, options);
+  }, saved, { navigator: { language: "en", onLine: online } });
+  const empty = await visit("vtt");
+  assert.equal(empty.elements.get("nextChapterBtn").disabled, true);
+  for (const online of [true, false]) {
+    const page = await visit("auto", online);
+    assert.equal(page.elements.get("chaptersList").children[0].children[0]?.textContent, "Intro");
+    assert.equal(page.elements.get("nextChapterBtn").disabled, false);
+    assert.ok(!page.audio.src);
+    assert.deepEqual(requests, ["/media/book/chapters.vtt", "/media/book/book.m4b"]);
+  }
 });
 
 test("auto mode keeps usable WebVTT ahead of embedded metadata", async () => {

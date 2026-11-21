@@ -10,6 +10,32 @@ const book = {
   languages: { en: { sources: { aac: { 96: "sample.m4b" } } } },
 };
 
+test("changing playback speed in another tab preserves the chosen theme", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved = new Map();
+  const first = await openPlayerPage(book, assert.fail, saved);
+  const second = await openPlayerPage(book, assert.fail, saved);
+  const theme = first.elements.get("themeSelect");
+  theme.value = "dark";
+  theme.dispatchEvent(new Event("change"));
+  const speed = second.elements.get("speedRange");
+  speed.value = "1.5";
+  speed.dispatchEvent(new Event("input"));
+  const write = second.window.localStorage.setItem;
+  t.mock.method(second.window.localStorage, "setItem", (key, value) => {
+    const volume = first.elements.get("volumeRange");
+    volume.value = "40";
+    volume.dispatchEvent(new Event("input"));
+    volume.dispatchEvent(new Event("change"));
+    write(key, value);
+  });
+  speed.dispatchEvent(new Event("change"));
+  const prefs = first.storage.readUi();
+  assert.equal(prefs.playbackRate, 1.5);
+  assert.equal(prefs.theme, "dark");
+  assert.equal(prefs.volume, 0.4);
+});
+
 test("custom selects commit a keyboard choice and restore focus on Escape", () => {
   const label = new Element();
   const document = { createElement() {
@@ -195,6 +221,54 @@ test("reset prevents late chapter and probe results from repopulating local stor
   assert.deepEqual(probes, []);
 });
 
+test("a late chapter response from an older edition preserves the newer tab's offline chapters", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved = new Map();
+  const config = { ...book, languages: { en: { ...book.languages.en, chapters: "chapters.vtt" } } };
+  const url = "https://example.test/media/sample/chapters.vtt";
+  const pending = deferred();
+  const visit = (version, fetch) => openPlayerPage({ ...config, cacheVersion: version }, fetch, saved);
+  const first = await visit("spring", () => pending.promise);
+  const current = chapterText.replace("Introduction", "New edition");
+  const second = await visit("autumn", () => new Response(current));
+  assert.equal(second.storage.readChapters(book.id, "en", "autumn", url), current);
+  pending.resolve(new Response(chapterText));
+  await settle();
+  assert.equal(first.storage.readChapters(book.id, "en", "autumn", url), current);
+  const requests = [];
+  const reopened = await visit("autumn", (url) => { requests.push(url); return new Response(null, { status: 503 }); });
+  assert.deepEqual(requests, []);
+  assert.equal(reopened.elements.get("nextChapterBtn").disabled, false);
+
+  // Opening a legacy copy upgrades its format without pruning editions in other tabs.
+  saved.set(first.storage.prefix + "compactPlayer:chapters:sample:en:spring", JSON.stringify({ url, text: chapterText }));
+  assert.equal(first.storage.readChapters(book.id, "en", "spring", url), chapterText);
+  assert.equal(second.storage.readChapters(book.id, "en", "autumn", url), current);
+});
+
+test("a chapter request from another tab cannot refill the cache after reset", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved = new Map();
+  const config = { ...book, languages: { en: { ...book.languages.en, chapters: "chapters.vtt" } } };
+  const url = "https://example.test/media/sample/chapters.vtt";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const chapter = deferred();
+    const old = await openPlayerPage(config, () => chapter.promise, saved);
+    const reset = deferred();
+    const tab = await openPlayerPage(book, assert.fail, saved, {
+      location: Object.assign(new URL("https://example.test/"), { reload: reset.resolve }),
+    });
+    tab.elements.get("resetOk").dispatchEvent(new Event("click"));
+    await reset.promise;
+    const fresh = await openPlayerPage({ ...config, cacheVersion: 2 }, () => new Response(chapterText), saved);
+    chapter.resolve(new Response(chapterText));
+    await settle();
+    assert.equal(old.storage.readChapters(book.id, "en", 1, url), "");
+    assert.equal(fresh.storage.readChapters(book.id, "en", 2, url), chapterText);
+    assert.equal([...saved.keys()].filter((key) => key.includes("chapters:")).length, 1);
+  }
+});
+
 test("a reset invalidates queued positions from another tab, including after a second reset", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map();
@@ -289,6 +363,27 @@ test("only a playing fallback changes the quality restored on the next visit", a
   assert.match(afterFallback.audio.src, /high\.m4b$/);
 });
 
+test("a new chapter edition revalidates a still-fresh HTTP response before saving WebVTT", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved = new Map();
+  const url = "https://example.test/media/sample/chapters.vtt";
+  const config = { ...book, languages: { en: { ...book.languages.en, chapters: "chapters.vtt" } } };
+  let httpCopy;
+  const requests = [];
+  const visit = (cacheVersion) => openPlayerPage({ ...config, cacheVersion }, (path, options) => {
+    assert.equal(path, url);
+    requests.push(options.cache);
+    if (!httpCopy || options.cache === "no-cache") httpCopy = chapterText.replace("Introduction", cacheVersion);
+    return new Response(httpCopy, { headers: { "cache-control": "public, max-age=3600" } });
+  }, saved);
+  await visit("spring");
+  const autumn = await visit("autumn");
+  assert.equal(autumn.storage.readChapters(book.id, "en", "autumn", url), chapterText.replace("Introduction", "autumn"));
+  const reopened = await visit("autumn");
+  assert.equal(reopened.elements.get("chaptersList").children[0].children[0].textContent, "autumn");
+  assert.equal(requests.length, 2);
+});
+
 test("chapter updates keep one WebVTT copy and discard older versions", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map();
@@ -336,6 +431,37 @@ test("pausing while offline keeps playback paused after reconnecting", async (t)
   assert.equal(play.mock.callCount(), 2, "reconnecting respects the latest pause");
   button.dispatchEvent(new Event("click"));
   assert.equal(play.mock.callCount(), 3, "the listener can resume manually");
+});
+
+test("a book switch clears the old system position until the new duration is known", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const positions = [];
+  const next = deferred();
+  const navigator = { language: "en", onLine: true, mediaSession: {
+    setPositionState(...args) { positions.push(args); }, setActionHandler() {},
+  } };
+  const page = await openPlayerPage(book, assert.fail, new Map(), { navigator, fetch: (url) => {
+    if (url.endsWith("/library.json")) return Response.json({ books: [{ id: book.id }, { id: "next" }], ui: { onboardingEnabled: false } });
+    return url.endsWith("/next/book.json") ? next.promise : Response.json({ ...book, duration: 600 });
+  } });
+  queueListeningPosition(page);
+  const select = page.elements.get("bookSelect");
+  select.value = "next";
+  select.dispatchEvent(new Event("change"));
+  assert.deepEqual(positions.at(-1), [{ duration: 600, position: 20, playbackRate: 1 }]);
+  next.resolve(Response.json({ ...book, id: "next" }));
+  await settle();
+  assert.deepEqual(positions.at(-1), []);
+  assert.ok(!page.audio.src);
+  page.audio.duration = NaN;
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  page.audio.duration = 30;
+  page.audio.dispatchEvent(new Event("loadedmetadata"));
+  assert.deepEqual(positions.at(-1), [{ duration: 30, position: 0, playbackRate: 1 }]);
+  select.value = book.id;
+  select.dispatchEvent(new Event("change"));
+  await settle();
+  assert.deepEqual(positions.at(-1), [{ duration: 600, position: 20, playbackRate: 1 }]);
 });
 
 test("a blocked Media Session leaves playback and chapter controls available", async (t) => {
@@ -513,6 +639,77 @@ test("switching language loads WebVTT while the new audio play request is still 
   finishPlay();
   await settle();
   assert.equal(calls.length, 1);
+});
+
+test("Options can open another catalog book while the failed startup book is retrying", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const retry = deferred();
+  let brokenRequests = 0;
+  let healthyRequests = 0;
+  const { ready, elements, audio } = await openPlayerPage(book, assert.fail, new Map(), {
+    fetch: (url) => {
+      if (url.endsWith("/library.json")) return Response.json({ books: [{ id: "broken" }, { id: book.id }], ui: { onboardingEnabled: false } });
+      if (url.endsWith("/broken/book.json")) return ++brokenRequests === 1 ? new Response(null, { status: 422 }) : retry.promise;
+      assert.ok(url.endsWith("/sample/book.json"));
+      healthyRequests++;
+      return Response.json(book);
+    },
+  });
+  await ready;
+  assert.equal(healthyRequests, 0);
+  elements.get("optionsBtn").dispatchEvent(new Event("click"));
+  await settle();
+  assert.equal(brokenRequests, 2);
+  const select = elements.get("bookSelect");
+  assert.equal(elements.get("bookRow").hidden, false);
+  assert.equal(elements.get("player").getAttribute("aria-busy"), "false");
+  assert.equal(elements.get("playPauseBtn").disabled, true);
+  assert.equal(select.disabled, false);
+  assert.deepEqual(select.children.map((option) => option.value), ["broken", book.id]);
+  assert.equal(select.children[1].textContent, book.title.en);
+  assert.equal(healthyRequests, 1);
+  select.value = book.id;
+  select.dispatchEvent(new Event("change"));
+  await settle();
+  assert.equal(elements.get("bookTitle").textContent, book.title.en);
+  retry.resolve(Response.json({ ...book, id: "broken", title: { en: "Late default" } }));
+  await settle();
+  assert.equal(elements.get("bookTitle").textContent, book.title.en);
+  assert.equal(healthyRequests, 1);
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.equal(audio.src, "https://example.test/media/sample/sample.m4b");
+});
+
+test("a catalog recovered during startup redirects the pending selection to the moved book", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const old = deferred();
+  const navigator = { onLine: false, language: "en" };
+  const requests = [];
+  const page = await openPlayerPage(book, assert.fail, new Map(), {
+    navigator, location: new URL("https://example.test/?book=sample"),
+    fetch: async (url) => {
+      requests.push(url);
+      if (url.endsWith("/library.json")) return navigator.onLine
+        ? Response.json({ books: [{ id: book.id, folder: "updated" }], ui: { onboardingEnabled: false } })
+        : new Response(null, { status: 404 });
+      if (url.endsWith("/sample/book.json")) return old.promise;
+      assert.ok(url.endsWith("/updated/book.json"), url);
+      return Response.json({ ...book, title: { en: "Moved book" } });
+    },
+  });
+  assert.ok(requests.some((url) => url.endsWith("/sample/book.json")));
+  navigator.onLine = true;
+  page.window.dispatchEvent(new Event("online"));
+  await settle();
+  assert.equal(page.elements.get("bookTitle").textContent, "Moved book");
+  old.resolve(Response.json(book));
+  await page.ready;
+  await settle();
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.equal(page.elements.get("bookTitle").textContent, "Moved book");
+  assert.ok(page.audio.src.endsWith("/updated/sample.m4b"));
+  assert.equal(requests.filter((url) => url.endsWith("/updated/book.json")).length, 1);
 });
 
 test("reconnection restores a missing catalog without interrupting the active book", async (t) => {

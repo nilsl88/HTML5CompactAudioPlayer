@@ -38,6 +38,10 @@ export function createAbortError(message = "Operation canceled") {
   catch { const error = new Error(message); error.name = "AbortError"; return error; }
 }
 
+export function metadataRequestCache(cacheVersion, revalidate = false) {
+  return revalidate || cacheVersion != null ? "no-cache" : "default";
+}
+
 export async function fetchWithRetry(url, options = {}, readResponse) {
   const {
     fetchImpl = globalThis.fetch,

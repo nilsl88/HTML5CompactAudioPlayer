@@ -1,11 +1,11 @@
-import { UI_STRINGS } from "../i18n.js?v=15";
-import { BookConfigStore, queryBookId } from "./book-config.js";
+import { UI_STRINGS } from "../i18n.js?v=16";
+import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js";
 import { BookSelection } from "./book-selection.js";
 import { AvailabilitySession } from "./availability-session.js";
 import { createCustomSelects } from "./custom-select.js";
 import { isMp4Audio, qualityLabelKey } from "./codecs.js";
 import { ChapterSession } from "./chapter-session.js";
-import { localizedValue, normalizeLibrary, parseJson, resolveCover } from "./config.js";
+import { localizedValue, normalizeLibrary, resolveCover } from "./config.js";
 import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./dialogs.js";
 import { createMediaSession } from "./media-session.js";
 import { MediaController } from "./media-controller.js";
@@ -15,7 +15,7 @@ import { visibleSources } from "./source-selection.js";
 import { SKIP_INTERVALS, skipInterval } from "./preferences.js";
 import { ProgressWriter } from "./progress-writer.js";
 import { SleepTimer } from "./sleep-timer.js";
-import { clearChildren, clamp, fetchTextWithRetry, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./utils.js";
+import { clearChildren, clamp, formatTime, normalizeLanguageTag, safeUrl, setText, UNKNOWN_TIME } from "./utils.js";
 
 export function startPlayer({ window, storage, fetchImpl }) {
   const { document, location, navigator } = window;
@@ -57,17 +57,16 @@ export function startPlayer({ window, storage, fetchImpl }) {
   let book = null;
   let bookConfigUrl = "";
   let bookSelection = null;
+  let requestedBookId = "";
   const availability = new AvailabilitySession({
     window, fetchImpl, isOnline,
-    readCache: storage.readAvailabilityCache.bind(storage),
-    writeCache: storage.writeAvailability.bind(storage),
+    openCache: storage.availabilityCache.bind(storage),
     onChange: populateQualitySelect,
     onError: (error) => reportError("availability scan", error),
   });
   const chapters = new ChapterSession({
     fetchImpl,
-    readCache: storage.readChapterData.bind(storage),
-    writeCache: storage.writeChapterData.bind(storage),
+    openCache: storage.chapterCache.bind(storage),
     onStart() {
       availability.waitForChapters();
       els.chaptersList.setAttribute("aria-busy", "true");
@@ -164,9 +163,10 @@ export function startPlayer({ window, storage, fetchImpl }) {
   }
 
   function setLoading(loading) {
-    document.body.classList.toggle("is-loading", loading);
-    els.player.classList.toggle("is-loading", loading);
-    els.player.setAttribute("aria-busy", String(loading));
+    const showSkeleton = loading && els.bookRow.hidden;
+    document.body.classList.toggle("is-loading", showSkeleton);
+    els.player.classList.toggle("is-loading", showSkeleton);
+    els.player.setAttribute("aria-busy", String(showSkeleton));
     els.playPauseBtn.disabled = loading || !book;
   }
 
@@ -178,8 +178,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
 
   function updateSelectionControlState() {
     const offlineLocked = !isOnline();
-    els.bookSelect.disabled = uiBusy || offlineLocked;
-    els.langSelect.disabled = uiBusy || offlineLocked;
+    els.bookSelect.disabled = offlineLocked || Boolean(resetRemaining);
+    els.langSelect.disabled = uiBusy || offlineLocked || !book;
     els.qualitySelect.disabled = uiBusy || offlineLocked || (book ? qualityOptionsForCurrentLanguage().length <= 1 : true);
     syncSelectionControls();
   }
@@ -254,6 +254,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
     const selection = currentOfflineSelection();
     const activeMatches = selection && manifestMatchesSelection(state.active, selection);
     const { busy } = state;
+    const repairMessage = state.repairable && t(state.repairable.status === "needs-audio" ? "offlineMissingAudio" : "offlineNeedsConfig",
+      { book: state.repairable.episodeTitle });
     const percent = Math.round(state.progress * 100);
     let status = "";
     let action = t("offlineDownload");
@@ -270,12 +272,15 @@ export function startPlayer({ window, storage, fetchImpl }) {
       showDownload = false;
     } else if (state.staging) {
       const partial = state.staging;
-      const details = [partial.episodeTitle || partial.episodeId, partial.languageLabel || partial.languageCode,
-        partial.sourceLabel || partial.sourceId, formatBytes(partial.totalSize), t("offlinePaused", { percent })];
+      const title = partial.episodeTitle || partial.episodeId;
+      const needsConfig = state.stagingStatus === "needs-config";
+      const details = needsConfig ? [t("offlineNeedsConfig", { book: title })]
+        : [title, partial.languageLabel || partial.languageCode, partial.sourceLabel || partial.sourceId,
+          formatBytes(partial.totalSize), t("offlinePaused", { percent })];
       if (state.active) details.unshift(manifestDescription(state.active));
-      else if (state.repairable) details.unshift(t("offlineNeedsConfig", { book: state.repairable.episodeTitle }));
+      else if (repairMessage) details.unshift(repairMessage);
       status = details.join(" · ");
-      action = t("offlineResume");
+      action = needsConfig ? t("offlineRepair") : t("offlineResume");
       els.offlineProgress.hidden = false;
     } else if (activeMatches) {
       status = t("offlineReady", { size: formatBytes(state.active.totalSize) });
@@ -284,7 +289,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
       status = manifestDescription(state.active);
       action = t("offlineReplace");
     } else if (state.repairable) {
-      status = t("offlineNeedsConfig", { book: state.repairable.episodeTitle });
+      status = repairMessage;
       showDownload = Boolean(selection);
       action = sameOfflineSelection(state.repairable, selection) ? t("offlineDownload") : t("offlineReplace");
     }
@@ -295,10 +300,10 @@ export function startPlayer({ window, storage, fetchImpl }) {
     setText(els.offlineCancelBtn, t("offlineCancel"));
     setText(els.offlineRemoveBtn, t("offlineRemove"));
     setText(els.offlineRepairBtn, t("offlineRepair"));
-    els.offlineRepairBtn.hidden = !state.repairable || busy;
+    els.offlineRepairBtn.hidden = state.repairable?.status !== "needs-config" || busy;
     els.offlineRepairBtn.disabled = !isOnline();
     els.offlineDownloadBtn.hidden = !showDownload;
-    els.offlineDownloadBtn.disabled = busy || (!selection && !state.staging) || !isOnline();
+    els.offlineDownloadBtn.disabled = busy || (!selection && !state.staging) || (!isOnline() && !state.canFinishOffline);
     els.offlineCancelBtn.hidden = !state.canCancel;
     els.offlineRemoveBtn.hidden = !showRemove;
   }
@@ -364,7 +369,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     setMeta([language?.label || bookSelection?.languageCode, sourceLabel(source, false), chapterTitle].filter(Boolean).join(" • "));
   }
 
-  const { optionsFrom, selectWithArrow, selectFocusTarget, setSelectValue, closeAllCustomSelects,
+  const { optionsFrom, selectWithArrow, selectFocusTarget, setSelectValue, updateOptionLabel, closeAllCustomSelects,
     syncCustomSelect, destroyCustomSelect, enhanceCustomSelect, syncSelectionControls, closeSelectOutside } = createCustomSelects(document, window);
 
   function initializeCustomSelects() {
@@ -375,10 +380,15 @@ export function startPlayer({ window, storage, fetchImpl }) {
 
   initializeCustomSelects();
 
+  function libraryLabel(record) { return localizedValue(record.title, locale, record.label || record.id); }
+
   function populateLibrarySelect() {
     const records = library.books.map((item) => ({ ...item, value: item.id }));
-    if (book && !library.byId.has(bookSelection.bookId)) records.unshift({ value: bookSelection.bookId, label: displayTitle() || bookSelection.bookId });
-    optionsFrom(els.bookSelect, records, bookSelection?.bookId, (item) => localizedValue(item.title, locale, item.label || item.id));
+    if (requestedBookId && !library.byId.has(requestedBookId)) {
+      const label = requestedBookId === bookSelection?.bookId ? displayTitle() : requestedBookId;
+      records.unshift({ value: requestedBookId, label });
+    }
+    optionsFrom(els.bookSelect, records, requestedBookId, libraryLabel);
     els.bookRow.hidden = records.length <= 1;
   }
 
@@ -409,7 +419,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
   }
 
   const { applyCover, clearCover } = createCoverView(els.coverImg, els.coverButton, {
-    fetchImpl, getEmbeddedSource: embeddedCoverAudioSource,
+    fetchImpl,
     onShown() {
       els.coverImg.alt = displayTitle();
       els.coverButton.setAttribute("aria-label", t("openCover"));
@@ -422,17 +432,15 @@ export function startPlayer({ window, storage, fetchImpl }) {
     },
   });
 
-  function embeddedCoverAudioSource() {
-    if (isMp4Audio(bookSelection.source)) return bookSelection.source;
+  function embeddedCoverAudioSource(source) {
+    if (isMp4Audio(source)) return source;
     if (!isOnline()) return null;
     return bookSelection.sources.find(isMp4Audio) || null;
   }
 
   async function loadLibrary() {
     try {
-      const response = await fetchTextWithRetry(libraryUrl, { fetchImpl, cache: "no-store", credentials: "same-origin" });
-      if (!response.ok) return null;
-      return normalizeLibrary(parseJson(response.text, "media/library.json"));
+      return await fetchLibraryCatalog(libraryUrl, fetchImpl);
     } catch (error) {
       if (error?.name !== "AbortError") reportError("library load", error);
       return null;
@@ -447,22 +455,23 @@ export function startPlayer({ window, storage, fetchImpl }) {
       if (libraryNeedsRetry) {
         const catalog = await loadLibrary();
         if (!catalog) return;
-        libraryNeedsRetry = false;
-        library = catalog;
-        bookConfigs.setLibrary(catalog);
+        libraryNeedsRetry = catalog.fromDownload;
+        library = catalog.library;
+        bookConfigs.setLibrary(library, { fromDownload: catalog.fromDownload });
         populateLibrarySelect();
+        if (!book && bookController) setLoading(true);
       } else if (bookConfigs.downloadedConfig) bookConfigs.setLibrary(library);
+      if (!els.optionsPanel.hidden) void loadLibraryTitles();
       await startupBookRequest;
       if (!book && !bookController && generation === bookGeneration) await loadStartupBook();
-      if (!els.optionsPanel.hidden) void loadLibraryTitles();
     })().finally(() => { libraryRetry = null; });
     return libraryRetry;
   }
 
-  async function loadLibraryTitles() {
+  function loadLibraryTitles() {
     if (library.books.length <= 1 || !isOnline()) return;
-    await bookConfigs.loadTitles((id, error) => reportError(`library title (${id})`, error));
-    populateLibrarySelect();
+    return bookConfigs.loadTitles((id, error) => reportError(`library title (${id})`, error),
+      (record) => updateOptionLabel(els.bookSelect, record.id, libraryLabel(record)));
   }
 
   async function loadBook(id) {
@@ -470,7 +479,10 @@ export function startPlayer({ window, storage, fetchImpl }) {
     bookController?.abort();
     bookController = new AbortController();
     const generation = ++bookGeneration;
-    if (!book) {
+    requestedBookId = id;
+    populateLibrarySelect();
+    const firstBook = !book;
+    if (firstBook) {
       setLoading(true);
       setText(els.bookTitle, t("audio"));
       setMeta(t("loading"));
@@ -486,7 +498,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
       const prepared = availability.prepareBook(loadedBook, els.audio);
       const next = new BookSelection({
         bookId: id, book: loadedBook, sources: prepared.sources,
-        preferences: storage.readBook(id), downloaded: isOnline() ? null : offline.snapshot().active,
+        preferences: storage.readBookSelection(id), downloaded: isOnline() ? null : offline.snapshot().active,
         browserLanguages: navigator.languages || [navigator.language], saveSelection: storage.setBookSelection.bind(storage),
       });
       progress.flush();
@@ -506,14 +518,16 @@ export function startPlayer({ window, storage, fetchImpl }) {
       populateQualitySelect();
       updateTitle();
       updateMeta();
-      void ensureChapters({ notifyFailure: false, showLoading: false });
-      applyCover(book);
       updateChapterButtons();
       storage.setLastBook(id);
       setBookUrl(id);
       renderOfflineUi();
+      if (firstBook && library.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
     } catch (error) {
       if (generation !== bookGeneration) return;
+      requestedBookId = bookSelection?.bookId || id;
+      populateLibrarySelect();
+      if (!book) setMeta(t("errorLoading"), true);
       throw error;
     } finally {
       if (generation === bookGeneration) { bookController = null; setLoading(false); setBusy(false); renderOfflineUi(); }
@@ -636,12 +650,17 @@ export function startPlayer({ window, storage, fetchImpl }) {
     els.nextChapterBtn.disabled = disabled;
   }
 
-  function refreshEmbeddedChaptersForSource(source) {
-    if (!book || !chapters.needsSource(source)) return;
-    resetChapters(book, bookSelection.languageCode, source);
-    updateMeta();
-    const request = ensureChapters({ notifyFailure: false, showLoading: false });
-    void sleep.refreshChapter(request, currentChapterEnd);
+  function refreshSourceMetadata(source) {
+    const changed = chapters.needsSource(source);
+    if (changed) {
+      resetChapters(book, bookSelection.languageCode, source);
+      updateMeta();
+    }
+    if (chapters.status === "idle") {
+      const request = ensureChapters({ notifyFailure: false, showLoading: false });
+      if (changed) void sleep.refreshChapter(request, currentChapterEnd);
+    }
+    applyCover(book, bookSelection.languageCode, embeddedCoverAudioSource(source));
   }
 
   async function seekChapter(direction) {
@@ -654,14 +673,15 @@ export function startPlayer({ window, storage, fetchImpl }) {
   }
 
   function updateTime(position, mediaDuration) {
-    const duration = durationUnlocked ? (mediaDuration || book?.duration || 0) : 0;
+    const knownDuration = mediaDuration || book?.duration || 0;
+    const duration = durationUnlocked ? knownDuration : 0;
     if (!seekDragging) els.seek.value = duration ? String(Math.round(clamp(position / duration, 0, 1) * 1000)) : "0";
     els.seek.disabled = !duration;
     els.seek.setAttribute("aria-valuetext", duration ? `${formatTime(position)} of ${formatTime(duration)}` : formatTime(position));
     setText(els.timeCur, formatTime(position));
     setText(els.timeDur, duration ? formatTime(duration) : UNKNOWN_TIME);
     markActiveChapter(position);
-    mediaSession.setPosition(position, duration, media.playbackRate);
+    mediaSession.setPosition(position, knownDuration, media.playbackRate);
     sleep.onTime(position);
   }
 
@@ -697,7 +717,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
       populateQualitySelect();
       updateMeta();
       renderOfflineUi();
-      refreshEmbeddedChaptersForSource(source);
+      refreshSourceMetadata(source);
     },
     onSourceSuccess: (source) => {
       if (resetRemaining || !source) return;
@@ -826,8 +846,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
     applySkipInterval(uiPrefs.skipSeconds);
     renderSleepOptions();
     renderResetBody();
+    populateLibrarySelect();
     if (book) {
-      populateLibrarySelect();
       populateQualitySelect();
       updateMeta();
       if (chapters.status === "failed") renderChapterFailure();
@@ -903,7 +923,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     storage.markOnboardingSeen();
     if (onboardingUiSelect && onboardingUiSelect.value !== uiPrefs.uiLanguage) {
       uiPrefs.uiLanguage = onboardingUiSelect.value;
-      storage.writeUi(uiPrefs);
+      storage.writeUiPreference("uiLanguage", uiPrefs.uiLanguage);
       locale = resolveUiLocale(uiPrefs.uiLanguage);
       applyStrings();
     }
@@ -980,8 +1000,6 @@ export function startPlayer({ window, storage, fetchImpl }) {
     resetChapters(book, bookSelection.languageCode, selected);
     updateTitle();
     updateMeta();
-    void ensureChapters({ notifyFailure: false, showLoading: false });
-    applyCover(book);
     storage.setProgress(bookSelection.bookId, bookSelection.languageCode, position);
     void media.setSelection(bookSelection.sources, selected.id, position, shouldPlay);
     renderOfflineUi();
@@ -1045,20 +1063,20 @@ export function startPlayer({ window, storage, fetchImpl }) {
     closeAllPanels(els.optionsPanel);
     openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? selectFocusTarget(els.langSelect) : selectFocusTarget(els.bookSelect));
     if (libraryNeedsRetry || !book) void recoverLibrary();
-    else void loadLibraryTitles();
+    void loadLibraryTitles();
     availability.request({ immediate: true });
   });
   els.closeChaptersBtn.addEventListener("click", () => closePanel(els.chaptersPanel, els.chaptersBtn, true));
   els.closeSleepBtn.addEventListener("click", () => closePanel(els.sleepPanel, els.sleepBtn, true));
   els.bookSelect.addEventListener("change", async () => {
     if (!isOnline()) {
-      setSelectValue(els.bookSelect, bookSelection?.bookId || "");
+      setSelectValue(els.bookSelect, requestedBookId);
       showToast(t("offlineSelectionLocked"), "warning", 5000, "offline-selection");
       return;
     }
     try { await loadBook(els.bookSelect.value); }
     catch (error) {
-      setSelectValue(els.bookSelect, bookSelection?.bookId || "");
+      setSelectValue(els.bookSelect, requestedBookId);
       reportError("book change", error, t("errorLoading"));
     }
   });
@@ -1070,18 +1088,18 @@ export function startPlayer({ window, storage, fetchImpl }) {
     setText(els.speedValue, `${Number(uiPrefs.playbackRate.toFixed(2))}×`);
     els.speedRange.setAttribute("aria-valuetext", els.speedValue.textContent);
   });
-  els.speedRange.addEventListener("change", () => storage.writeUi(uiPrefs));
+  els.speedRange.addEventListener("change", () => storage.writeUiPreference("playbackRate", uiPrefs.playbackRate));
   els.volumeRange.addEventListener("input", () => {
     uiPrefs.volume = clamp(Number(els.volumeRange.value) / 100, 0, 1);
     media.setVolume(uiPrefs.volume);
     setText(els.volumeValue, `${Math.round(uiPrefs.volume * 100)}%`);
     els.volumeRange.setAttribute("aria-valuetext", els.volumeValue.textContent);
   });
-  els.volumeRange.addEventListener("change", () => storage.writeUi(uiPrefs));
-  els.skipSelect.addEventListener("change", () => { applySkipInterval(Number(els.skipSelect.value)); storage.writeUi(uiPrefs); });
-  els.themeSelect.addEventListener("change", () => { uiPrefs.theme = els.themeSelect.value; storage.writeUi(uiPrefs); setAppearance(); });
-  els.fontSizeSelect.addEventListener("change", () => { uiPrefs.fontSize = els.fontSizeSelect.value; storage.writeUi(uiPrefs); setAppearance(); });
-  els.uiLangSelect.addEventListener("change", () => { uiPrefs.uiLanguage = els.uiLangSelect.value; storage.writeUi(uiPrefs); locale = resolveUiLocale(uiPrefs.uiLanguage); applyStrings(); updateTitle(); });
+  els.volumeRange.addEventListener("change", () => storage.writeUiPreference("volume", uiPrefs.volume));
+  els.skipSelect.addEventListener("change", () => { applySkipInterval(Number(els.skipSelect.value)); storage.writeUiPreference("skipSeconds", uiPrefs.skipSeconds); });
+  els.themeSelect.addEventListener("change", () => { uiPrefs.theme = els.themeSelect.value; storage.writeUiPreference("theme", uiPrefs.theme); setAppearance(); });
+  els.fontSizeSelect.addEventListener("change", () => { uiPrefs.fontSize = els.fontSizeSelect.value; storage.writeUiPreference("fontSize", uiPrefs.fontSize); setAppearance(); });
+  els.uiLangSelect.addEventListener("change", () => { uiPrefs.uiLanguage = els.uiLangSelect.value; storage.writeUiPreference("uiLanguage", uiPrefs.uiLanguage); locale = resolveUiLocale(uiPrefs.uiLanguage); applyStrings(); updateTitle(); });
   els.optionsPanel.addEventListener("submit", (event) => event.preventDefault());
   els.offlineDownloadBtn.addEventListener("click", () => void downloadOfflineSelection());
   els.offlineRepairBtn.addEventListener("click", async () => {
@@ -1217,12 +1235,13 @@ export function startPlayer({ window, storage, fetchImpl }) {
     const catalog = await loadLibrary();
     const preferDownloaded = startedOffline || !isOnline();
     if (preferDownloaded && !startedOffline) await offlineReady;
-    libraryNeedsRetry = !catalog;
-    library = catalog || normalizeLibrary(null);
+    libraryNeedsRetry = !catalog || catalog.fromDownload;
+    library = catalog?.library || normalizeLibrary(null);
     const downloadedConfig = preferDownloaded ? offline.downloadedConfig : null;
     bookConfigs = new BookConfigStore({ library, documentBaseUrl, downloadedConfig, fetchImpl });
     const downloadedId = preferDownloaded ? offline.snapshot().active?.episodeId || "" : "";
     startupBookRequest = loadStartupBook(downloadedId);
+    if (!els.optionsPanel.hidden) void loadLibraryTitles();
     if (preferDownloaded && isOnline()) void recoverLibrary();
     await startupBookRequest;
   }
@@ -1233,11 +1252,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     const initialId = downloadedId || queryId || (library.byId.has(savedId) ? savedId : "") || library.defaultId || "episode-001";
     try {
       await loadBook(initialId);
-      if (resetRemaining) return;
-      if (library.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
     } catch (error) {
-      setLoading(false);
-      setMeta(t("errorLoading"), true);
       reportError("startup", error, `${t("errorLoading")} ${error.message}`);
     }
   }
