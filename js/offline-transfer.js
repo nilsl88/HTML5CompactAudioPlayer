@@ -3,6 +3,7 @@ import { createAbortError } from "./utils.js";
 
 const { audioMimeType, downloadHeader: OFFLINE_DOWNLOAD_HEADER } = globalThis.CompactPlayerOfflineManifest;
 export const OFFLINE_CHUNK_SIZE = 8 * 1024 * 1024;
+const RANGE_IDLE_TIMEOUT_MS = 20_000;
 
 export class OfflineDownloadError extends Error {
   constructor(code, message) {
@@ -61,7 +62,7 @@ function validateAudioMime(response, sourceMime, expectedMime) {
 }
 
 // Keep at most one storage chunk plus the current network buffer in memory.
-async function* splitAudioRange(body, length, chunkSize) {
+async function* splitAudioRange(body, length, chunkSize, readNetwork) {
   const incomplete = () => new OfflineDownloadError("incomplete", "The audio range has an unexpected length.");
   if (!body) throw incomplete();
   const reader = body.getReader();
@@ -71,7 +72,11 @@ async function* splitAudioRange(body, length, chunkSize) {
   let finished = false;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readNetwork(async () => {
+        let part;
+        do { part = await reader.read(); } while (!part.done && !part.value.byteLength);
+        return part;
+      });
       if (done) break;
       if (value.byteLength > remaining) throw incomplete();
       let offset = 0;
@@ -92,8 +97,8 @@ async function* splitAudioRange(body, length, chunkSize) {
     finished = true;
     yield chunk;
   } finally {
-    try { if (!finished) await reader.cancel(); }
-    finally { reader.releaseLock(); }
+    if (!finished) void reader.cancel().catch(() => { /* The network may already have aborted. */ });
+    reader.releaseLock();
   }
 }
 
@@ -144,6 +149,34 @@ async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signa
   }
 }
 
+async function* readAudioRange(fetchImpl, manifest, start, end, validator, signal) {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(createAbortError("Download canceled"));
+  checkCanceled(signal);
+  signal?.addEventListener("abort", cancel, { once: true });
+
+  // Only network waits count. Playback and Cache Storage can suspend the consumer between chunks.
+  async function readNetwork(read) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const timer = setTimeout(() => controller.abort(new OfflineDownloadError("timeout", "No audio data received.")), RANGE_IDLE_TIMEOUT_MS);
+    let interrupt;
+    const interrupted = new Promise((_, reject) => { interrupt = () => reject(controller.signal.reason); });
+    controller.signal.addEventListener("abort", interrupt, { once: true });
+    try { return await Promise.race([interrupted, read()]); }
+    finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener("abort", interrupt);
+    }
+  }
+  try {
+    const response = await readNetwork(() => fetchAudioRange(fetchImpl, manifest, start, end, validator, controller.signal));
+    yield* splitAudioRange(response.body, end - start + 1, manifest.chunkSize, readNetwork);
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    controller.abort();
+  }
+}
+
 export async function* downloadChunks(fetchImpl, manifest, signal, waitForPriority) {
   const completed = new Set(manifest.completed);
   const validator = rangeValidator(manifest);
@@ -155,8 +188,7 @@ export async function* downloadChunks(fetchImpl, manifest, signal, waitForPriori
     const end = validator ? chunkEnd : manifest.totalSize - 1;
     await waitForPriority(signal);
     checkCanceled(signal);
-    const response = await fetchAudioRange(fetchImpl, manifest, start, end, validator, signal);
-    for await (const bytes of splitAudioRange(response.body, end - start + 1, manifest.chunkSize)) {
+    for await (const bytes of readAudioRange(fetchImpl, manifest, start, end, validator, signal)) {
       checkCanceled(signal);
       const chunkStart = index * manifest.chunkSize;
       const headers = {

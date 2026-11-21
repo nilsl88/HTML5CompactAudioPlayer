@@ -1,14 +1,15 @@
 importScripts("./js/offline-manifest.js");
-const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v15";
+const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue,
+  offlineMetaUrl, offlineChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
+const SHELL_VERSION = "v16";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=15",
-  "./player.js?v=15",
-  "./i18n.js?v=15",
+  "./player.css?v=16",
+  "./player.js?v=16",
+  "./i18n.js?v=16",
   "./js/player-app.js",
   "./js/availability-session.js",
   "./js/availability.js",
@@ -104,7 +105,7 @@ async function cachedMediaResponse(request, manifest, cache) {
       const data = new Uint8Array(await response.arrayBuffer());
       if (canceled) return;
       const chunkStart = index * manifest.chunkSize;
-      if (data.length !== Math.min(manifest.chunkSize, manifest.totalSize - chunkStart)) throw new Error("A downloaded audio chunk is incomplete.");
+      if (data.length !== chunkByteLength(manifest, index)) throw new Error("A downloaded audio chunk is incomplete.");
       const from = Math.max(0, range.start - chunkStart);
       const to = Math.min(data.length, range.end - chunkStart + 1);
       controller.enqueue(data.subarray(from, to));
@@ -114,6 +115,7 @@ async function cachedMediaResponse(request, manifest, cache) {
   }, { highWaterMark: 0 });
   const headers = {
     "accept-ranges": "bytes",
+    [versionHeader]: versionHeaderValue(manifest.cacheVersion),
     "content-length": String(range.end - range.start + 1),
     "content-type": manifest.mime,
   };
@@ -129,7 +131,12 @@ async function cachedBookResponse(request) {
       const response = await cachedMediaResponse(request, manifest, bookCache);
       if (response) return response;
     }
-    return bookCache.match(request);
+    const asset = await bookCache.match(request);
+    if (!asset?.ok || request.destination) return asset;
+    // Expose the saved edition to fetch() callers. Native image and navigation responses keep their URL.
+    const response = new Response(asset.body, asset);
+    response.headers.set(versionHeader, versionHeaderValue(manifest.cacheVersion));
+    return response;
   }
   return null;
 }

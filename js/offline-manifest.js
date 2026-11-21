@@ -1,6 +1,19 @@
 // The page imports this file and the classic service worker loads it with importScripts.
 globalThis.CompactPlayerOfflineManifest = (() => {
   const schemaVersion = 1;
+  const versionHeader = "x-compact-player-offline-version";
+
+  // Cache versions may contain characters outside the HTTP header character set.
+  function versionHeaderValue(version) {
+    return encodeURIComponent(JSON.stringify(String(version ?? 1)));
+  }
+
+  function checkResponseVersion(response, expected) {
+    const saved = response.headers?.get?.(versionHeader);
+    if (saved != null && expected != null && saved !== versionHeaderValue(expected)) {
+      throw new Error("The downloaded file belongs to a different book version.");
+    }
+  }
 
   function audioMimeType(value) {
     if (typeof value !== "string" || /[\r\n\0]/.test(value)) return "";
@@ -32,10 +45,15 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     return new URL(`__compact_player_offline__/chunks/${encodeURIComponent(downloadId)}/${index}`, baseUrl).href;
   }
 
+  function chunkByteLength(manifest, index) {
+    return Math.min(manifest.chunkSize, manifest.totalSize - index * manifest.chunkSize);
+  }
+
   return Object.freeze({
-    schemaVersion, audioMimeType, validManifest,
+    schemaVersion, audioMimeType, validManifest, chunkByteLength,
     metaCache: "compact-player-offline-meta-v1",
     downloadHeader: "x-compact-player-download",
+    versionHeader, versionHeaderValue, checkResponseVersion,
     offlineMetaUrl, offlineManifestUrl, offlineChunkUrl,
   });
 })();

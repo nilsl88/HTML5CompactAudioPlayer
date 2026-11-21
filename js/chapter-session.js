@@ -1,11 +1,10 @@
-import { loadChapters, parseChapterText } from "./chapters.js";
+import { loadChapters } from "./chapters.js";
 import { resolveLanguageAsset } from "./config.js";
 
 export class ChapterSession {
-  constructor({ fetchImpl, readCache, writeCache, onStart, onLoaded, onFailure }) {
+  constructor({ fetchImpl, openCache, onStart, onLoaded, onFailure }) {
     this.fetchImpl = fetchImpl;
-    this.readCache = readCache;
-    this.writeCache = writeCache;
+    this.openCache = openCache;
     this.onStart = onStart;
     this.onLoaded = onLoaded;
     this.onFailure = onFailure;
@@ -26,7 +25,9 @@ export class ChapterSession {
     this.mode = language?.chapterSource || "none";
     this.url = resolveLanguageAsset(language, language?.chapters);
     this.source = source;
-    this.cacheKey = [book?.id, languageCode, book?.cacheVersion, this.sourceKey(source)];
+    this.bookId = book?.id;
+    this.languageCode = languageCode;
+    this.cacheVersion = book?.cacheVersion;
   }
 
   sourceKey(source) {
@@ -61,30 +62,24 @@ export class ChapterSession {
       return Promise.resolve();
     }
     const vttUrl = this.mode === "embedded" ? "" : this.url;
-    const cached = !force && this.readCache(...this.cacheKey, vttUrl);
-    if (cached) {
-      const parsed = cached.kind === "vtt" ? parseChapterText(cached.text) : cached;
-      if (parsed) {
-        this.accept({ ...parsed, kind: cached.kind });
-        return Promise.resolve();
-      }
-    }
+    const cache = this.openCache(this.bookId, this.languageCode, this.cacheVersion, this.sourceKey(this.source), vttUrl);
     const controller = new AbortController();
     this.controller = controller;
     this.generation += 1;
     this.status = "loading";
     this.notifyFailure = notifyFailure;
     this.onStart();
-    this.pending = this.fetch(controller, force || Boolean(cached));
+    this.pending = this.fetch(controller, force, cache);
     return this.pending;
   }
 
-  async fetch(controller, revalidate) {
+  async fetch(controller, revalidate, cache) {
     try {
-      const result = await loadChapters({ mode: this.mode, vttUrl: this.url, sourceUrl: this.source?.url,
-        sourceMime: this.source?.mime, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate });
+      const result = await loadChapters({
+        mode: this.mode, vttUrl: this.url, sourceUrl: this.source?.url, sourceMime: this.source?.mime,
+        cacheVersion: this.cacheVersion, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate, cache,
+      });
       if (controller.signal.aborted) return;
-      this.writeCache(...this.cacheKey, result, this.url);
       this.accept(result);
     } catch (error) {
       if (controller.signal.aborted) return;

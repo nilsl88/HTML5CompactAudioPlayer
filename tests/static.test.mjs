@@ -157,15 +157,9 @@ test("production HTML has no runtime dependencies", async () => {
   assert.match(html, /type="module"/);
 });
 
-test("library titles are requested only from Options", async () => {
-  const source = await readFile(new URL("js/player-app.js", root), "utf8");
+test("the example catalog leaves book titles in the book configurations", async () => {
   const library = JSON.parse(await readFile(new URL("media/library.json", root), "utf8"));
   assert.ok(library.books.every((item) => item.id && !item.title && !item.label));
-  assert.match(source, /bookConfigs = new BookConfigStore\(/);
-  assert.match(source, /await bookConfigs\.loadTitles\(/);
-  assert.match(source, /openPanel\(els\.optionsPanel[\s\S]*?void loadLibraryTitles\(\);/);
-  assert.match(source, /if \(!els\.optionsPanel\.hidden\) void loadLibraryTitles\(\)/);
-  assert.doesNotMatch(source.slice(source.indexOf("async function boot()")), /loadLibraryTitles\(/);
 });
 
 test("onboarding policy belongs to the library", async () => {

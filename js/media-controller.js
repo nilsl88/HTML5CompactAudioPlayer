@@ -1,4 +1,4 @@
-import { buildFallbackQueue } from "./source-selection.js";
+import { SourceFallback } from "./source-selection.js";
 import { clamp } from "./utils.js";
 
 export class MediaController {
@@ -9,16 +9,14 @@ export class MediaController {
     this.isOnline = isOnline;
     this.generation = 0;
     this.playAttempt = 0;
-    this.queue = [];
-    this.queueIndex = -1;
-    this.attempted = new Set();
-    this.failedSources = new Set();
+    this.fallback = new SourceFallback();
     this.playbackIntent = false;
     this.desiredTime = 0;
     this.playbackRate = 1;
     this.volume = 1;
     this.loaded = false;
     this.hasStarted = false;
+    this.reloadOnReconnect = false;
     this.state = "idle";
     this.timeout = null;
     this.internalPause = false;
@@ -35,6 +33,7 @@ export class MediaController {
       this.loaded = true;
       this.applyMediaSettings();
       this.applyDesiredTime();
+      this.callbacks.onTime?.(this.position(), this.duration());
       if (!this.playbackIntent) { this.clearTimeout(); this.setState("paused"); }
       else this.armTimeout(this.generation, this.currentSource()?.url);
     });
@@ -53,19 +52,19 @@ export class MediaController {
     });
     const handleBuffering = () => {
       if (!this.playbackIntent) return;
-      const interrupted = this.hasStarted;
-      if (interrupted && this.state === "stalled" && this.timeout !== null) return;
-      this.setState(interrupted ? "stalled" : "loading");
-      this.armTimeout(this.generation, this.currentSource()?.url, interrupted);
+      const state = this.hasStarted ? "stalled" : "loading";
+      if (this.state === state && this.timeout !== null) return;
+      this.setState(state);
+      this.armTimeout(this.generation, this.currentSource()?.url);
     };
     listen("waiting", handleBuffering);
     listen("stalled", handleBuffering);
-    listen("ended", () => { this.playbackIntent = false; this.setState("ended"); this.callbacks.onEnded?.(); });
+    listen("ended", () => { this.playbackIntent = false; this.clearTimeout(); this.setState("ended"); this.callbacks.onEnded?.(); });
     listen("timeupdate", () => {
       // Reloading a source can emit timeupdate at zero before metadata arrives.
       if (!this.loaded || this.audio.seeking) return;
       if (Number.isFinite(this.audio.currentTime)) {
-        if (this.state === "stalled" && this.hasStarted && !this.audio.paused && this.audio.currentTime > this.stallPosition) {
+        if (this.awaitingPlayback && this.hasStarted && !this.audio.paused && this.audio.currentTime > this.waitPosition) {
           this.clearTimeout();
           this.setState("playing");
         }
@@ -82,14 +81,11 @@ export class MediaController {
   setSelection(sources, selectedId, position = 0, shouldPlay = false) {
     if (this.events.signal.aborted) return Promise.resolve(false);
     this.generation += 1;
-    this.queue = buildFallbackQueue(sources, selectedId);
-    this.queueIndex = this.queue.length ? 0 : -1;
-    this.attempted.clear();
-    this.failedSources.clear();
+    this.fallback = new SourceFallback(sources, selectedId);
     this.desiredTime = Math.max(0, Number(position) || 0);
-    this.playbackIntent = Boolean(shouldPlay);
+    this.playbackIntent = Boolean(shouldPlay && this.currentSource());
     this.clearTimeout();
-    if (shouldPlay) return this.activateCurrent(true);
+    if (this.playbackIntent) return this.loadSource(this.currentSource(), true);
     this.clearSource();
     if (this.currentSource()) this.callbacks.onSourceChange?.(this.currentSource());
     this.callbacks.onTime?.(this.desiredTime, 0);
@@ -102,21 +98,25 @@ export class MediaController {
   }
 
   requestPlay() {
-    if (this.events.signal.aborted) return Promise.resolve(false);
+    const source = this.currentSource();
+    if (this.events.signal.aborted || !source) return Promise.resolve(false);
     this.playbackIntent = true;
-    if (this.state === "error" && this.queue.length) {
+    if (this.fallback.exhausted) {
       this.generation += 1;
-      this.queueIndex = 0;
-      this.attempted.clear();
-      this.failedSources.clear();
-      return this.activateCurrent(true);
+      return this.loadSource(this.fallback.restart(), true);
     }
-    if (!this.audio.src && this.currentSource()) return this.activateCurrent(true);
-    if (this.audio.src && (this.state === "paused" || this.state === "ended" || !this.hasStarted)) {
+    if (this.reloadOnReconnect && this.isOnline()) {
+      this.generation += 1;
+      return this.loadSource(source, true);
+    }
+    if (!this.audio.src) return this.loadSource(source, true);
+    if (this.state === "paused" || this.state === "ended" || !this.hasStarted) {
       this.setState("loading");
-      this.armTimeout(this.generation, this.currentSource()?.url);
+      this.armTimeout(this.generation, source.url);
+    } else if (this.state === "stalled" && this.timeout === null) {
+      this.armTimeout(this.generation, source.url);
     }
-    return this.playCurrent(this.generation, this.currentSource()?.url);
+    return this.playCurrent(this.generation, source.url);
   }
 
   markPaused() {
@@ -133,10 +133,11 @@ export class MediaController {
   }
 
   handleReconnect() {
-    if (this.playbackIntent && (this.state === "loading" || this.state === "stalled")) return this.requestPlay();
+    if (this.awaitingPlayback) return this.requestPlay();
   }
 
   clearSource() {
+    this.reloadOnReconnect = false;
     this.loaded = false;
     this.hasStarted = false;
     this.internalPause = true;
@@ -148,13 +149,11 @@ export class MediaController {
     this.setState("idle");
   }
 
-  currentSource() { return this.queue[this.queueIndex] || null; }
+  currentSource() { return this.fallback.current; }
 
-  async activateCurrent(shouldPlay) {
-    const source = this.currentSource();
-    if (!source || this.attempted.has(source.url)) return false;
+  async loadSource(source, shouldPlay) {
     const generation = this.generation;
-    this.attempted.add(source.url);
+    this.reloadOnReconnect = false;
     this.loaded = false;
     this.hasStarted = false;
     this.internalPause = true;
@@ -189,42 +188,39 @@ export class MediaController {
   }
 
   handleMediaError() {
-    if (!this.audio.src || this.queueIndex < 0) return;
+    if (!this.audio.src || !this.currentSource()) return;
     const code = this.audio.error?.code || 0;
     this.failCurrent(this.audio.error || new Error("Media source failed"), code === 3 || code === 4, this.currentSource()?.url);
   }
 
   async failCurrent(error, skipCodec = false, expectedUrl = this.currentSource()?.url) {
     const failed = this.currentSource();
-    if (!failed || failed.url !== expectedUrl || this.failedSources.has(expectedUrl)) return false;
+    if (!failed || failed.url !== expectedUrl || this.fallback.exhausted) return false;
     if (!this.isOnline()) {
+      if (this.audio.error || skipCodec) this.reloadOnReconnect = true;
       if (!this.playbackIntent) return false;
       this.setState("stalled");
       this.callbacks.onOffline?.();
       return false;
     }
-    this.failedSources.add(expectedUrl);
+    const next = this.fallback.afterFailure(skipCodec);
     this.callbacks.onSourceFailure?.(failed, error);
-    let next = this.queueIndex + 1;
-    if (skipCodec && failed) while (next < this.queue.length && this.queue[next].codec === failed.codec) next += 1;
-    while (next < this.queue.length && this.attempted.has(this.queue[next].url)) next += 1;
-    if (next >= this.queue.length) {
+    if (!next) {
       this.clearTimeout();
       this.playbackIntent = false;
       this.setState("error");
       this.callbacks.onExhausted?.(error);
       return false;
     }
-    this.queueIndex = next;
-    this.callbacks.onFallback?.(failed, this.currentSource());
-    return this.activateCurrent(this.playbackIntent);
+    this.callbacks.onFallback?.(failed, next);
+    return this.loadSource(next, this.playbackIntent);
   }
 
   seek(seconds) {
     if (this.events.signal.aborted) return this.position();
     const duration = this.duration();
     this.desiredTime = duration ? clamp(Number(seconds) || 0, 0, Math.max(0, duration - .01)) : Math.max(0, Number(seconds) || 0);
-    if (this.state === "stalled") this.stallPosition = this.desiredTime;
+    if (this.awaitingPlayback) this.waitPosition = this.desiredTime;
     if (this.loaded) this.applyDesiredTime();
     this.callbacks.onProgress?.(this.desiredTime, true);
     this.callbacks.onTime?.(this.desiredTime, duration);
@@ -247,21 +243,20 @@ export class MediaController {
   }
   position() { return this.loaded && !this.audio.seeking && Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : this.desiredTime; }
   duration() { return Number.isFinite(this.audio.duration) && this.audio.duration > 0 ? this.audio.duration : 0; }
+  get awaitingPlayback() { return this.playbackIntent && (this.state === "loading" || this.state === "stalled"); }
   setState(state) {
     if (state === this.state) return;
-    if (state === "stalled") this.stallPosition = this.position();
     this.state = state;
+    if (this.awaitingPlayback) this.waitPosition = this.position();
     this.callbacks.onState?.(state);
   }
-  armTimeout(generation, url, includeStall = false) {
+  armTimeout(generation, url) {
     this.clearTimeout();
     this.timeout = setTimeout(() => {
       this.timeout = null;
-      const didNotStart = this.playbackIntent && !this.hasStarted;
-      const remainsStalled = includeStall && this.playbackIntent && this.state === "stalled";
       if (generation !== this.generation || this.currentSource()?.url !== url) return;
       if (!this.isOnline()) { this.setState("stalled"); this.callbacks.onOffline?.(); return; }
-      if (!this.loaded || didNotStart || remainsStalled) this.failCurrent(new Error("Audio source timed out"), false, url);
+      if (!this.loaded || this.awaitingPlayback) this.failCurrent(new Error("Audio source timed out"), false, url);
     }, this.sourceTimeoutMs);
   }
   clearTimeout() { if (this.timeout) clearTimeout(this.timeout); this.timeout = null; }
@@ -271,8 +266,7 @@ export class MediaController {
     this.generation += 1;
     this.clearTimeout();
     this.playbackIntent = false;
-    this.queue = [];
-    this.queueIndex = -1;
+    this.fallback = new SourceFallback();
     this.clearSource();
   }
 }

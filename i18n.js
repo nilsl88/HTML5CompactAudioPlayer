@@ -96,8 +96,9 @@ export const UI_STRINGS = {
     resetLocalFailed: "Some saved settings or listening positions may remain on this device.",
     resetOfflineFailed: "The offline download could not be cleared.",
     offlineRepair: "Restore book configuration",
+    offlineMissingAudio: "Some of the downloaded audio for {book} is missing.",
     offlineNeedsConfig: "The audio for {book} is saved. Restore its configuration to open it offline.",
-    offlineTimedOut: "The download check timed out. Try again when the connection is stable.",
+    offlineTimedOut: "The download timed out. Try again when the connection is stable.",
   
     resetCancel: "Cancel",
     errorTitle: "Player error",
@@ -239,8 +240,9 @@ export const UI_STRINGS = {
     resetLocalFailed: "Der kan stadig være gemte indstillinger eller lyttepositioner på enheden.",
     resetOfflineFailed: "Offlinebogen kunne ikke slettes.",
     offlineRepair: "Gendan bogindstillinger",
+    offlineMissingAudio: "En del af den gemte lyd til {book} mangler.",
     offlineNeedsConfig: "Lyden til {book} er gemt. Gendan bogens konfiguration for at åbne den offline.",
-    offlineTimedOut: "Kontrollen af download tog for lang tid. Prøv igen, når forbindelsen er stabil.",
+    offlineTimedOut: "Downloadet gik i stå. Prøv igen, når forbindelsen er stabil.",
   
     resetCancel: "Annuller",
     errorTitle: "Afspillerfejl",
@@ -382,8 +384,9 @@ export const UI_STRINGS = {
     resetLocalFailed: "Det kan fortsatt ligge lagrede innstillinger eller lytteposisjoner på enheten.",
     resetOfflineFailed: "Den nedlastede lydboken kunne ikke slettes.",
     offlineRepair: "Gjenopprett bokinnstillinger",
+    offlineMissingAudio: "En del av den lagrede lyden til {book} mangler.",
     offlineNeedsConfig: "Lyden til {book} er lagret. Gjenopprett bokinnstillingene for å åpne den uten nett.",
-    offlineTimedOut: "Kontrollen av nedlastingen tok for lang tid. Prøv igjen når forbindelsen er stabil.",
+    offlineTimedOut: "Tidsavbrudd under nedlastingen. Prøv igjen når forbindelsen er stabil.",
   
     resetCancel: "Avbryt",
     errorTitle: "Avspillingsfeil",
@@ -525,8 +528,9 @@ export const UI_STRINGS = {
     resetLocalFailed: "Det kan finnas kvar sparade inställningar eller lyssningspositioner på enheten.",
     resetOfflineFailed: "Den nedladdade ljudboken kunde inte tas bort.",
     offlineRepair: "Återställ bokinställningar",
+    offlineMissingAudio: "En del av det sparade ljudet för {book} saknas.",
     offlineNeedsConfig: "Ljudet till {book} är sparat. Återställ bokens inställningar för att öppna den offline.",
-    offlineTimedOut: "Kontrollen av nedladdningen tog för lång tid. Försök igen när anslutningen är stabil.",
+    offlineTimedOut: "Tidsgränsen för nedladdningen gick ut. Försök igen när anslutningen är stabil.",
   
     resetCancel: "Avbryt",
     errorTitle: "Spelarfel",

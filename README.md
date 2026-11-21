@@ -70,7 +70,9 @@ The skill requires `ffmpeg` and `ffprobe`. It keeps the input file unchanged and
 python3 tools/make-chapters.py "media/my-book/My Book.mp3"
 ```
 
-The file is written as `chapters.vtt` next to the audio. Use `-o` for another path, `--max-minutes` for a different limit, and `--title "Section {n}"` to replace the default `Part {n}` titles. An existing chapter file is kept unless you pass `--force`.
+The file is written as `chapters.vtt` next to the audio. Use `-o` for another path, `--max-minutes` for a different limit, and `--title "Section {n}"` to replace the default `Part {n}` titles. An existing chapter file is kept unless you pass `--force`. The script rejects any output path that points to the input audio, including symbolic and hard links.
+
+On mounts without hard-link support, a failed copy removes its partial output so you can retry the command.
 
 The titles are numbered parts because the script cannot tell where the book's own chapters begin. If the audio already has embedded chapters, use those.
 
@@ -214,7 +216,9 @@ Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schem
 
 If `coverSource` is omitted, a configuration with `cover` keeps the earlier `file` behavior. A configuration without `cover` defaults to `none`.
 
-Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. When chapters and artwork come from the same file, both parsers share one `moov` request and keep the result in memory for 30 seconds. This avoids downloading large MP4 metadata twice during startup.
+Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. Chapters and artwork share one `moov` request per audio URL and book `cacheVersion`. The result stays in memory for 30 seconds. When you replace an MP4 at the same URL, change `cacheVersion` so both readers request the new metadata. If the network fails, only a download of the matching version supplies metadata.
+
+If an embedded cover is still missing when the player switches to another MP4 source, it looks for artwork in the new file. A loaded file cover stays visible through quality changes.
 
 The server must support byte ranges and, for cross-origin audio, expose the required CORS headers. A downloaded M4A/M4B can supply its artwork while offline because the service worker supports byte ranges over the saved audio chunks.
 
@@ -239,7 +243,7 @@ Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder
 
 `ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Book-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
 
-The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `book.json` again. Until a title is available, the selector uses the entry ID. A failed optional title request does not prevent the current book from playing.
+The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. Configurations are kept in memory for the rest of the page session, so selecting a book does not request the same `book.json` again. Options lists the catalog IDs as soon as the catalog arrives, even while the startup book is loading or retrying. You can select another book immediately. Each title replaces its ID when its lookup finishes. A failed optional title request does not prevent the current book from playing.
 
 Library-level `title` and `label` values remain accepted for backward compatibility and as initial fallback labels. Legacy `audiofiles`, `episodes`, and `items` collections are accepted in that order when `books` is absent. If `books` is present, it takes precedence, even when empty; an invalid non-array `books` value produces an empty catalog rather than revealing a legacy list. Existing `defaultId`, `path`, `episode`, `key`, and `label` aliases remain supported.
 
@@ -259,7 +263,7 @@ The loader tries `episode.json` only after `book.json` returns HTTP 404/410 or a
 
 Existing preferences and progress are read from the original storage keys until the installation saves its own values or is reset. Offline manifests retain their existing fields, including `episodeId` and `episodeTitle`. On offline startup the player uses the configuration URL recorded with the download. This also works for a custom book folder or a legacy `episode.json` when the catalog is unavailable.
 
-If loading the catalog fails, the player retries when connectivity returns or Options opens online. If startup also failed to open a book, the player opens the selection from the recovered catalog. A book already open keeps playing. The next selection uses the folder in the recovered catalog, including when a book has moved. Updating the service-worker shell preserves downloaded media. If registration fails while this installation's worker still controls the page, the player can read its published download.
+If the catalog server is unavailable, the player can use the catalog from a downloaded book immediately. After a failed request or a response from that download, it checks the catalog again when connectivity returns or Options opens online. If startup also failed to open a book, the player opens the selection from the recovered catalog. A book already open keeps playing. If a lookup is still pending when the catalog supplies a different folder, the player requests the configuration from that folder. Title lookups and playback share the new request. Updating the service-worker shell preserves downloaded media. If registration fails while this installation's worker still controls the page, the player can read its published download.
 
 ## WebVTT chapters
 
@@ -297,7 +301,7 @@ For each source transition, the player creates a finite queue:
 2. Other bitrates from that codec, ordered by distance from the selected bitrate
 3. Remaining codec families in preference order
 
-A confirmed decode or unsupported-source failure skips the rest of that codec family. A network/source failure may try another bitrate before moving to the next codec. Each URL is attempted once per transition. A book opened offline keeps its other configured sources available for fallback when the connection returns.
+A confirmed decode or unsupported-source failure skips the rest of that codec family. A network/source failure may try another bitrate before moving to the next codec. The fallback queue tries each URL once. A book opened offline keeps its other configured sources available for fallback when the connection returns.
 
 Choosing a quality in Options saves it immediately. An automatic fallback becomes the saved quality once the browser starts playing it. If a new book fails to open, the current book keeps its playback position and sleep timer.
 
@@ -317,7 +321,7 @@ The pending position survives zero-time events during source reloads. A chapter 
 
 Browsers control actual buffering and may treat `preload` as a hint after a source is assigned.
 
-If a connection loss interrupts playback, the player retries when the connection returns. A pause from the audio element also updates the controls. After a pause, the book stays paused through reconnection until you press Play.
+After a pause, pressing Play starts a new timeout. If the source neither emits `playing` nor advances the position, the player tries the next source. If a connection loss interrupts playback, the player resumes when the connection returns. If the browser has already rejected the source, the player reloads that URL once and seeks to the saved position. If playback is still stalled after the source timeout, it tries the next source from the saved position. A pause from the audio element also updates the controls. After a pause, the book stays paused through reconnection until you press Play.
 
 ## Offline downloads
 
@@ -325,15 +329,19 @@ Options includes **Download for offline use** when Service Worker and Cache Stor
 
 The download also stores the player shell, book configuration, cover, and chapter file needed for an offline reload. A missing optional cover or chapter file does not prevent audio from being saved. The player uses the network first whenever it is online and keeps the completed copy as a fallback. Returning online does not delete the download.
 
-The player stores audio in 8 MiB chunks. With a strong version validator, the player requests sequential byte ranges using If-Range. Without one, it requests a single range covering the file and splits that response as it arrives. Each audio response must match the MIME type established by the initial probe. After an interruption, **Resume download** reuses saved chunks when the server confirms the same file version with a strong ETag or a reliable Last-Modified date. If the version has changed or cannot be confirmed, the download starts again from the first chunk. Explicit cancellation marks the partial copy for removal before deleting it. If the tab closes during cleanup, the next visit discards the canceled copy. Playback traffic has priority while the player is loading or stalled.
+The player stores audio in 8 MiB chunks. With a strong version validator, the player requests sequential byte ranges using If-Range. Without one, it requests a single range covering the file and splits that response as it arrives. Each audio response must match the MIME type established by the initial probe. After 20 seconds without response headers or new audio bytes, the download pauses and releases the write lock. Completed chunks remain available to resume from this tab or another tab. Time spent waiting for playback or writing a chunk to storage is excluded. After an interruption, **Resume download** reuses saved chunks when the server confirms the same file version with a strong ETag or a reliable Last-Modified date. If the version has changed or cannot be confirmed, the download starts again from the first chunk. Explicit cancellation marks the partial copy for removal before deleting it. If the quota prevents writing the cancellation marker, Cancel deletes the partial book cache first. The next visit clears any remaining staging record. Playback traffic has priority while the player is loading or stalled.
 
 One tab at a time can change an installation’s offline book. Other tabs can open the saved book while a replacement downloads. The player uses Web Locks for coordination, with IndexedDB as a fallback. If the browser denies the write lock, the saved book remains available for playback and the player hides the download controls.
 
-If activation fails after the replacement has finished downloading, the previous book stays available. Choose **Resume download** or reopen the player to activate the complete copy from local storage.
+If activation fails after the replacement has finished downloading, the previous book stays available. Choose **Resume download** or reopen the player to activate the complete copy, even offline. Before activating a replacement, the player reads each saved audio chunk and checks its actual byte count, including the shorter final chunk. A missing, truncated, or oversized chunk leaves the previous book available. Resume fetches the missing parts if the server can confirm the same audio version. The required book configuration must also pass validation.
 
-Before downloading audio chunks, the player opens the cached book configuration and checks the book ID, cache version, language, quality, and audio URL against the selection. A failed check keeps the previous offline book available. The player also checks the audio MIME type and the completed download manifest. If the server omits the content type or sends a generic binary type, the player uses the configured audio format.
+Before downloading audio chunks, the player checks the book ID, cache version, language, quality, and audio URL in the saved configuration. Resume reuses a matching configuration after the audio server confirms the file version. If the configuration is missing or invalid, the player validates the replacement text before writing it to storage. A failed check keeps the previous offline book available. The player also checks the audio MIME type and the completed download manifest. If the server omits the content type or sends a generic binary type, the player uses the configured audio format.
 
-At startup the player checks the required configuration before listing a download as ready. If the configuration is missing or invalid and the audio is intact, **Restore book configuration** in Options fetches just the saved configuration URL. A separate paused download keeps its own progress during a repair. After a replacement becomes active, any failed cleanup of the previous download is retried on the next visit.
+Startup and Resume both validate a replacement against its recorded configuration URL before activating it. If its local manifest has lost that URL, the player recovers it from the matching download record. The current book remains available while the replacement needs repair. If the configuration is missing or invalid and the audio is intact, **Restore book configuration** in Options fetches just the saved configuration URL. The same action can finish an interrupted replacement whose audio is complete. It checks the restored configuration against the saved audio before switching books, including on servers without a version validator. Restoring the current book keeps any separate paused download at its saved position. After a replacement becomes active, any failed cleanup of the previous download is retried on the next visit.
+
+Opening an unchanged download requires no cache writes. If its local manifest is missing, the player uses the published record to check the configuration and size of each saved audio chunk before rebuilding the manifest. For an interrupted download with a missing local manifest, the player checks the chunks listed in the staging record. Resume reuses each intact chunk when the server confirms the same audio version. A quota error during recovery keeps the offline controls available.
+
+If part of the published audiobook is missing, the player verifies the remaining audio chunks and offers **Resume download** in Options. With the same audio version it requests just the missing ranges. If another download is already paused, it keeps its place. Finishing that replacement installs the new book. Canceling it makes the damaged book available to resume.
 
 If Cache Storage reports a read error during startup, the player keeps the saved book and checks it again on the next visit. When the browser blocks access to Cache Storage, the player hides the download controls and can still play online.
 
@@ -344,7 +352,7 @@ Offline download requires:
 - valid HTTP `206 Partial Content` responses with `Content-Range` and a known total size
 - enough browser-managed storage for the selected source
 
-The player checks `navigator.storage.estimate()` before starting and requests persistent storage where supported. Quota values are estimates, persistence can be refused, and browsers may evict site data later. Keep the page open while downloading; iOS and other mobile browsers can suspend page work in the background.
+The player checks `navigator.storage.estimate()` before confirmation and again under the write lock. If a changed audio file needs a fresh download, the player counts space it can free from the confirmed partial copy. The completed book stays in storage until its replacement is ready. The player requests persistent storage where supported. Quota values are estimates, persistence can be refused, and browsers may evict site data later. Keep the page open while downloading; iOS and other mobile browsers can suspend page work in the background.
 
 Online audio requests go directly through the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt chapter seeking. When the browser reports that it is offline, the service worker serves the downloaded audio's byte ranges. Other requests, including chapter and cover metadata, remain network-first with cached fallback. If the browser still reports an online connection during an outage, native audio requests cannot use the saved copy until it detects the offline state.
 
@@ -359,19 +367,19 @@ Availability is advisory. Each source is `available`, `missing`, or `unknown`.
 
 HTTP 200/206 and authenticated 401/403 responses remain playable candidates. HTTP 404/410 from both probe paths marks a source missing. CORS, proxy, timeout, and offline failures stay unknown.
 
-Once a source plays, the player records its URL in the book's versioned availability cache. Later probe results cannot mark that URL missing while the cache entry is valid. Cached missing sources remain at the end of the runtime fallback queue.
+Once a source plays, the player records its URL in the book's versioned availability cache for seven days. A later probe from any tab can report a missing file, but the player still offers the source while its playback record is valid. After the selected source fails, the player checks the latest probe results. It tries available and unchecked files across all codecs before retrying a file marked missing. A decode failure excludes that codec for the rest of the attempt.
 
 Only the active audio language is scanned. Changing language cancels stale probe work and starts a scan for the new selection.
 
-Results are cached for seven days. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current book cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
+Each probe result expires seven days after that source was checked. Scanning another language or quality in a second tab preserves the first result and its expiry. Change `cacheVersion` or use `?clearAvailCache=1` to discard the current book cache. The old `?resetProbe=1` parameter is accepted as a harmless no-op because session-wide probe disabling no longer exists.
 
 ## Chapter loading
 
-When a book opens or the audio language changes, the selected language's WebVTT file starts loading before cover or availability checks, even if the audio is still buffering. It does not assign or preload an audio source. Normal HTTP caching applies. Successful responses are also stored in guarded localStorage by book, audio language, chapter URL, and `cacheVersion`, so repeat visits can display chapters without another request.
+When a book opens or the audio language changes, the selected language's WebVTT file starts loading before cover or availability checks, even if the audio is still buffering. It does not assign or preload an audio source. The player checks localStorage for the book, audio language, chapter URL, and `cacheVersion` first. On a miss it asks the server to revalidate the HTTP-cached file, even if the file still has time left in its cache lifetime. Repeat visits to the same edition use the saved chapters without a request.
 
-Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. A valid WebVTT file with no cues displays an empty chapter list.
+Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, an empty file leads to an embedded chapter lookup even when the WebVTT text came from the cache.
 
-Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
+If the chapter server is unavailable, a downloaded WebVTT file can supply chapters for the same book version. With a different version, the chapter panel offers Retry. Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
 
 ## Embedded M4A/M4B chapters
 
@@ -403,7 +411,7 @@ Each installation prefixes new storage keys with `compactPlayer@<encoded-folder>
 - `book:<encoded-book>:<reset-id>:selection` stores the selected language and quality
 - `book:<encoded-book>:<reset-id>:progress` is the older combined position record, still used as a fallback
 - `book:<encoded-book>:<reset-id>:progress:<encoded-language>:<revision>` stores a listening position and its activity time. Concurrent saves have separate keys. The player resumes from the latest activity and removes older revisions on the next save. It also reads earlier per-language keys without a revision.
-- `compactPlayer:ui`: theme, text size, player language, speed, volume, and skip interval
+- `ui:<field>` stores each interface preference separately, so changing speed in one tab preserves a theme or volume change in another. Older preferences are read from `compactPlayer:ui`.
 - `compactPlayer:lastEpisode`: last library selection
 - `compactPlayer:chapters:<book>:<language>:<cacheVersion>`: cached WebVTT chapter text
 - `compactPlayer:chapters:<book>:<language>:<cacheVersion>:<source>` stores embedded chapters for one audio source
@@ -412,7 +420,9 @@ Each installation prefixes new storage keys with `compactPlayer@<encoded-folder>
 
 Older `compactPlayer:<book>` records remain readable. Books named `ui` or `lastEpisode` now have separate storage from the global settings. If an older settings key contains recognizable book data, the player copies it before updating that key. The reset ID is empty until the first reset. Each reset changes the ID so queued progress from an older tab cannot restore cleared positions. Older, unprefixed values remain available to other installations.
 
-Availability writes use `compactPlayer:availability:<book>:<cacheVersion>`. Chapter entries record their source URL and timestamp. The player stores one WebVTT text per book, language, and current version. Different audio sources can retain their own embedded chapters in that version. Saving a new version clears obsolete chapter entries for the same book and language.
+Availability records use the prefix `availability:<book>:<cacheVersion>:<reset-id>:<clear-id>:`. Each `probe:<language>:<source-id>:<encoded-url>` record timestamps the result for one audio file. Each `played:<url>` record timestamps successful playback. An older probe applies to a file only if its record names the same URL. Older records without a URL leave the file eligible for playback and a fresh check. Clearing the availability cache changes its clear ID so a probe from an older tab cannot restore cleared results.
+
+After a reset, new chapter keys begin with `chapter-reset:<reset-id>:`. An outstanding chapter request in another tab cannot restore cleared entries. Older chapter keys remain readable. Chapter entries record their source URL and timestamp. The player stores one WebVTT text per book, language, and current version. Different audio sources can retain their own embedded chapters in that version. After saving a version, the player removes obsolete entries it found before starting the chapter request. A late response in another tab preserves chapters saved since that request began.
 
 Progress writes are throttled and flushed when the page is hidden or left.
 
@@ -438,13 +448,13 @@ The layout supports 320 CSS px viewports, browser zoom, long labels, safe-area i
 
 - Playback always requires a user action. The player does not attempt autoplay.
 - iOS and iPadOS expose `audio.volume` but do not apply programmatic changes. The volume control is hidden there.
-- Media Session is optional. Unsupported actions or metadata failures do not affect normal playback.
+- Media Session is optional. On a book switch, the lock screen shows the new position and duration if known. Otherwise the player clears the old position until the browser reads the new duration. Unsupported actions or metadata failures do not affect normal playback.
 - Lock-screen controls, background playback, interruptions, route changes, and app switching remain controlled by the operating system and browser.
 - Cross-origin configuration, chapter, image, and audio servers must permit the requests they receive. Authentication and CORS policies vary by deployment.
 - Cross-origin audio remains available for normal playback but cannot use the offline-download control.
 - Device codec support can differ from `canPlayType()` results. Runtime fallback is the final authority.
 - Offline downloads are best-effort browser storage. Clearing website data, private-browsing restrictions, quota pressure, or browser eviction can remove them.
-- Downloads do not continue as background jobs after the browser suspends or closes the page. An interrupted download can resume when the player is open and online again.
+- Downloads stop when the browser suspends or closes the page. Missing chunks require a connection. A fully transferred book can finish activation offline.
 
 ## Tests
 

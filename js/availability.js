@@ -1,14 +1,20 @@
-async function cancelBody(response) {
-  try { await response.body?.cancel(); } catch {}
-}
+import { createAbortError, fetchWithRetry } from "./utils.js";
 
-async function requestProbe(fetchImpl, url, options, signal, timeoutMs) {
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  signal?.addEventListener("abort", abort, { once: true });
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try { return await fetchImpl(url, { ...options, cache: "no-store", credentials: "same-origin", signal: controller.signal }); }
-  finally { clearTimeout(timeout); signal?.removeEventListener("abort", abort); }
+async function probeStatus(fetchImpl, url, options, signal, timeoutMs) {
+  try {
+    const state = await fetchWithRetry(url, {
+      ...options, fetchImpl, signal, timeoutMs, retries: 1, cache: "no-store", credentials: "same-origin",
+    }, (response) => {
+      // Only the status is needed, including when the server ignores Range.
+      void response.body?.cancel()?.catch(() => { /* A canceled fetch may have closed the stream. */ });
+      return stateFromStatus(response.status);
+    });
+    if (signal?.aborted) throw createAbortError();
+    return state;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return "unknown";
+  }
 }
 
 function stateFromStatus(status) {
@@ -24,25 +30,10 @@ function combineProbeResults(head, range) {
 
 export async function probeUrl(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 8000 } = {}) {
   if (!url || signal?.aborted) return "unknown";
-  let headState = "unknown";
-  try {
-    const head = await requestProbe(fetchImpl, url, { method: "HEAD" }, signal, timeoutMs);
-    headState = stateFromStatus(head.status);
-    await cancelBody(head);
-    if (headState === "available") return headState;
-  } catch (error) {
-    if (signal?.aborted) throw error;
-  }
-
-  try {
-    const range = await requestProbe(fetchImpl, url, { method: "GET", headers: { Range: "bytes=0-0" } }, signal, timeoutMs);
-    const rangeState = stateFromStatus(range.status);
-    await cancelBody(range);
-    return combineProbeResults(headState, rangeState);
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    return "unknown";
-  }
+  const head = await probeStatus(fetchImpl, url, { method: "HEAD" }, signal, timeoutMs);
+  if (head === "available") return head;
+  const range = await probeStatus(fetchImpl, url, { method: "GET", headers: { Range: "bytes=0-0" } }, signal, timeoutMs);
+  return combineProbeResults(head, range);
 }
 
 export async function scanSources(sources, options = {}) {

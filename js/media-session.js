@@ -2,6 +2,7 @@ import { clamp } from "./utils.js";
 
 export function createMediaSession(navigator, Metadata, reportError) {
   let session;
+  let hasPosition = false;
   try { session = navigator.mediaSession; }
   catch (error) { reportError("Media Session access", error); }
   return {
@@ -15,9 +16,16 @@ export function createMediaSession(navigator, Metadata, reportError) {
     },
 
     setPosition(position, duration, playbackRate) {
-      if (!duration) return;
-      try { session?.setPositionState?.({ duration, position: clamp(position, 0, duration), playbackRate }); }
-      catch (error) { reportError("Media Session position", error); }
+      try {
+        if (!session?.setPositionState) return;
+        if (duration > 0 && Number.isFinite(duration)) {
+          session.setPositionState({ duration, position: clamp(position, 0, duration), playbackRate });
+          hasPosition = true;
+        } else if (hasPosition) {
+          session.setPositionState();
+          hasPosition = false;
+        }
+      } catch (error) { reportError("Media Session position", error); }
     },
 
     setPlaybackState(state) {

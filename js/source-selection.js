@@ -65,19 +65,39 @@ export function buildFallbackQueue(sources, selectedId) {
   const selected = candidates.find((source) => source.id === selectedId) || chooseDefaultSource(candidates);
   if (!selected) return [];
   const codecOrder = [selected.codec, ...CODEC_PREFERENCE.filter((codec) => codec !== selected.codec)];
-  const ordered = [selected];
-  for (const codec of codecOrder) {
-    const family = candidates
-      .filter((source) => source.id !== selected.id && source.codec === codec)
-      .sort((a, b) => {
-        if ((a.availability === "missing") !== (b.availability === "missing")) return a.availability === "missing" ? 1 : -1;
-        const aDistance = Math.abs(a.bitrate - selected.bitrate);
-        const bDistance = Math.abs(b.bitrate - selected.bitrate);
-        if (aDistance !== bDistance) return aDistance - bDistance;
-        if ((a.bitrate <= selected.bitrate) !== (b.bitrate <= selected.bitrate)) return a.bitrate <= selected.bitrate ? -1 : 1;
-        return b.bitrate - a.bitrate;
-      });
-    ordered.push(...family);
-  }
+  const alternatives = candidates.filter((source) => source.id !== selected.id);
+  alternatives.sort((a, b) =>
+    Number(a.availability === "missing") - Number(b.availability === "missing")
+    || codecOrder.indexOf(a.codec) - codecOrder.indexOf(b.codec)
+    || Math.abs(a.bitrate - selected.bitrate) - Math.abs(b.bitrate - selected.bitrate)
+    || a.bitrate - b.bitrate);
+  const ordered = [selected, ...alternatives];
   return ordered.filter((source, index, list) => list.findIndex((item) => item.url === source.url) === index);
+}
+
+export class SourceFallback {
+  constructor(sources = [], selectedId) {
+    this.sources = sources;
+    this.selectedId = selectedId;
+    this.restart();
+  }
+
+  restart() {
+    this.failedUrls = new Set();
+    this.rejectedCodecs = new Set();
+    this.exhausted = false;
+    this.current = buildFallbackQueue(this.sources, this.selectedId)[0] || null;
+    return this.current;
+  }
+
+  afterFailure(rejectCodec) {
+    this.failedUrls.add(this.current.url);
+    if (rejectCodec) this.rejectedCodecs.add(this.current.codec);
+    // A probe can finish while the previous source is playing.
+    const next = buildFallbackQueue(this.sources, this.selectedId).find((source) =>
+      !this.failedUrls.has(source.url) && !this.rejectedCodecs.has(source.codec));
+    if (next) this.current = next;
+    else this.exhausted = true;
+    return next;
+  }
 }

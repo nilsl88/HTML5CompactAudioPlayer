@@ -35,6 +35,17 @@ export function createCustomSelects(document, window) {
     syncCustomSelect(select);
   }
 
+  function updateOptionLabel(select, value, label) {
+    const index = Array.from(select.children).findIndex((option) => option.value === value);
+    if (index < 0) return;
+    select.children[index].textContent = label;
+    const state = customSelectStates.get(select);
+    if (state) {
+      state.options[index].textContent = label;
+      if (select.value === value) state.button.textContent = label;
+    }
+  }
+
   function closeCustomSelect(state, restoreFocus = false) {
     if (!state) return;
     state.menu.hidden = true;
@@ -223,6 +234,6 @@ export function createCustomSelects(document, window) {
     if (!openCustomSelect?.wrapper.contains(target)) closeAllCustomSelects();
   }
 
-  return { optionsFrom, selectWithArrow, selectFocusTarget, setSelectValue, closeAllCustomSelects,
+  return { optionsFrom, selectWithArrow, selectFocusTarget, setSelectValue, updateOptionLabel, closeAllCustomSelects,
     syncCustomSelect, destroyCustomSelect, enhanceCustomSelect, syncSelectionControls, closeSelectOutside };
 }

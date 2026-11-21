@@ -12,11 +12,14 @@ class MemoryStorage {
   key(index) { return [...this.map.keys()][index] ?? null; }
 }
 
-test("migrates legacy book and UI preference names", () => {
+test("migrates legacy book and UI preference names", (t) => {
   const memory = new MemoryStorage();
   memory.setItem("compactPlayer:book", JSON.stringify({ lang: "da", quality: "aac-96", progressByLang: { da: 42 }, lastTime: 12 }));
   memory.setItem("compactPlayer:ui", JSON.stringify({ uiLang: "sv", playbackRate: 9, volume: -2, skipSeconds: 30 }));
   const storage = new PlayerStorage(memory);
+  const positions = t.mock.method(storage, "positionRecords");
+  assert.deepEqual(storage.readBookSelection("book"), { language: "da", quality: "aac-96" });
+  assert.equal(positions.mock.callCount(), 0);
   assert.deepEqual(storage.readBook("book"), { schemaVersion: 2, language: "da", quality: "aac-96", progressByLang: { da: 42 }, progressUpdatedAt: {}, lastTime: 12 });
   assert.equal(storage.readUi().uiLanguage, "sv");
   assert.equal(storage.readUi().playbackRate, 2);
@@ -83,6 +86,25 @@ test("reads legacy availability cache values", () => {
   assert.equal(new PlayerStorage(memory).readAvailability("book", 1).en["opus-96"], true);
 });
 
+test("confirmed playback expires and stale tabs cannot repopulate a cleared availability cache", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const storage = new PlayerStorage(new MemoryStorage());
+  const url = "https://example.test/book.webm";
+  const first = storage.availabilityCache("book", 1, 100);
+  first.recordPlayback(url);
+  assert.equal(storage.availabilityCache("book", 2).hasPlayed(url), false);
+  t.mock.timers.tick(101);
+  first.recordProbe("en", "opus-128", "missing", url);
+  assert.equal(storage.availabilityCache("book", 1, 100).hasPlayed(url), false);
+  for (const clear of [() => storage.clearAvailability("book", 1), () => storage.reset()]) {
+    const old = storage.availabilityCache("book", 1);
+    clear();
+    old.recordPlayback(url);
+    old.recordProbe("en", "opus-128", "missing", url);
+    assert.deepEqual(storage.readAvailabilityCache("book", 1), { playedUrls: [], byLanguage: {} });
+  }
+});
+
 test("stores chapters by book, language, version, and URL", () => {
   const memory = new MemoryStorage();
   const storage = new PlayerStorage(memory);
@@ -103,6 +125,15 @@ test("chapter cache replaces obsolete versions and rejects corrupt values", () =
   storage.writeChapters("book", "en", 2, "/chapters.vtt", "WEBVTT\n\n00:00.000 --> 00:01.000\nNew");
   assert.equal(storage.readChapters("book", "en", 1, "/chapters.vtt"), "");
   memory.setItem(storage.prefix + "compactPlayer:chapters:book:en:2", "{broken");
+  assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
+
+  // Prior releases used the same chapter keys before and after a reset.
+  memory.setItem(storage.resetKey, "previous-reset");
+  memory.setItem(storage.prefix + "compactPlayer:chapters:book:en:2", JSON.stringify({
+    kind: "vtt", url: "/chapters.vtt", text: "WEBVTT\n",
+  }));
+  assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "WEBVTT\n");
+  storage.writeChapters("book", "en", 3, "/chapters.vtt", "WEBVTT\n");
   assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
 });
 
