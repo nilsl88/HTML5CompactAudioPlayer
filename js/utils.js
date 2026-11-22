@@ -23,6 +23,9 @@ export function safeUrl(value, baseUrl, { allowImageData = false } = {}) {
   const raw = String(value || "").trim();
   if (!raw) return "";
   if (allowImageData && /^data:image\/(?:png|jpeg|gif|webp|avif);/i.test(raw)) return raw;
+  const path = raw.split(/[?#]/, 1)[0].replace(/[\t\r\n]/g, "")
+    .replace(/%2e/gi, ".").replace(/%2f|%5c/gi, "/");
+  if (/(?:^|[/\\])\.\.(?:[/\\]|$)/.test(path)) return "";
   try {
     const url = new URL(raw, baseUrl);
     if (!/^(?:https?:)$/i.test(url.protocol)) return "";

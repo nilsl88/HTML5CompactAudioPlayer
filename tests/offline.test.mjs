@@ -5,9 +5,12 @@ import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { BookConfigStore } from "../js/book-config.js";
+import { inspectAudioRange, downloadChunks } from "../js/offline-transfer.js";
 import { normalizeLibrary } from "../js/config.js";
 import { buildSources, chooseDefaultSource } from "../js/source-selection.js";
-import { deferred, openPlayerPage } from "./player-page.mjs";
+import { deferred, Element, openPlayerPage } from "./player-page.mjs";
+import { createCoverView } from "../js/cover.js";
+import { loadChapterFile } from "../js/chapters.js";
 import {
   OfflineManager,
   chunkBounds,
@@ -77,6 +80,33 @@ async function workerContext(globals = {}, decorateContract) {
   return context;
 }
 
+test("downloaded metadata carries its book identity through the worker", async () => {
+  const scope = "https://example.test/";
+  const caches = new MemoryCacheStorage();
+  const manager = new OfflineManager({ baseUrl: scope, cacheStorage: caches, navigatorObject: navigatorStub() });
+  const worker = await workerContext({ caches, fetch: async () => { throw new TypeError("Offline"); } });
+  const manifest = { ...selection(), episodeId: "catalog-a", configBookId: "book-a", schemaVersion: 1,
+    status: "ready", downloadId: "one", cacheName: "saved-book", totalSize: 3,
+    chunkSize: 3, totalChunks: 1, completed: [0] };
+  const url = scope + "shared/chapters.vtt";
+  await manager.writeRecord("active", manifest);
+  const book = await caches.open(manifest.cacheName);
+  await book.put(url, new Response("WEBVTT\n\n00:00.000 --> 00:01.000\nA"));
+  await book.put(offlineChunkUrl(scope, manifest.downloadId, 0), new Response(Uint8Array.of(3, 4, 5)));
+  const workerFetch = (target, options) => worker.networkFirst(new Request(target, options));
+  await assert.rejects(loadChapterFile(url, { cacheVersion: 1, fetchImpl: workerFetch,
+    bookIdentity: { episodeId: "catalog-b", configBookId: "book-b" } }), /different book/i);
+  assert.equal((await loadChapterFile(url, { cacheVersion: 1, fetchImpl: workerFetch,
+    bookIdentity: { episodeId: "catalog-a", configBookId: "book-a" } })).cues[0].title, "A");
+  const response = await worker.cachedBookResponse(new Request(manifest.sourceUrl, { headers: { Range: "bytes=0-1" } }));
+  assert.equal(response.headers.get("x-compact-player-offline-book"), encodeURIComponent(JSON.stringify(["catalog-a", "book-a"])));
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [3, 4]);
+
+  await manager.writeRecord("active", { ...manifest, configBookId: undefined });
+  assert.equal((await loadChapterFile(url, { cacheVersion: 1, fetchImpl: workerFetch,
+    bookIdentity: { episodeId: "catalog-a", configBookId: "legacy-book" } })).cues[0].title, "A");
+});
+
 test("offline startup opens the recorded configuration without a catalog folder mapping", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const baseUrl = "https://example.test/";
@@ -105,6 +135,21 @@ test("offline startup opens the recorded configuration without a catalog folder 
   assert.deepEqual(requests, [libraryUrl, configUrl]);
   page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
   assert.equal(page.audio.src, selected.sourceUrl);
+
+  const navigator = navigatorStub();
+  navigator.onLine = false;
+  navigator.serviceWorker.controller = { scriptURL: baseUrl + "sw.js" };
+  const controlled = await openPlayerPage(config, assert.fail, new Map([[ "compactAudioPlayer.onboardingShown.v1", "1" ]]), {
+    caches: cacheStorage, navigator,
+    fetch: async (url) => await cache.match(url) || new Response(null, { status: 404 }),
+  });
+  await controlled.ready;
+  assert.ok(!controlled.audio.src);
+  controlled.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.equal(controlled.audio.src, baseUrl + "__compact_player_offline__/audio.json?download=" + encodeURIComponent(saved.downloadId));
+  controlled.audio.dispatchEvent(new Event("loadedmetadata"));
+  controlled.document.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { code: "ArrowRight" }));
+  assert.equal(controlled.audio.currentTime, 5);
 });
 
 test("a stalled player navigation uses the installed shell and keeps waiting when the shell is absent", async (t) => {
@@ -743,6 +788,27 @@ test("an interrupted download never combines chunks from different revisions of 
   assert.deepEqual(ranges, [{ start: 0, condition: dates[1] }, { start: chunkSize, condition: dates[1] }]);
 });
 
+test("offline audio requests reject redirects to another origin before storing chunks", async () => {
+  const audioUrl = "https://example.test/audio.webm";
+  const redirect = (url = "https://other.test/audio.webm") => {
+    const response = new Response(Uint8Array.of(1), { status: 206, headers: {
+      "content-range": "bytes 0-0/1", "content-type": "audio/webm", etag: '"one"',
+    } });
+    Object.defineProperty(response, "url", { value: url });
+    return response;
+  };
+  await assert.rejects(inspectAudioRange(() => redirect(), audioUrl, "audio/webm"), { code: "cross-origin" });
+  const sameOrigin = redirect("https://example.test/media/audio.webm");
+  assert.equal((await inspectAudioRange(() => sameOrigin, audioUrl, "audio/webm")).totalSize, 1);
+  const manifest = { sourceUrl: audioUrl, mime: "audio/webm", totalSize: 1, chunkSize: 1,
+    totalChunks: 1, completed: [], etag: '"one"' };
+  await assert.rejects(async () => {
+    for await (const chunk of downloadChunks(() => redirect(), manifest, undefined, async () => {})) {
+      assert.fail("Unexpected chunk from a redirected audio request");
+    }
+  }, { code: "cross-origin" });
+});
+
 test("reports an unsupported server instead of accepting a full response", async () => {
   const manager = new OfflineManager({
     baseUrl: "https://example.test/",
@@ -890,6 +956,28 @@ test("offline If-Range serves partial audio only when the saved edition matches"
   assert.equal((await unsatisfied('"edition-one"')).status, 416);
 });
 
+test("an unreadable cached audio body reports its chunk for rechecking", async () => {
+  const worker = await workerContext();
+  const manifest = { downloadId: "one", totalSize: 4, chunkSize: 4, mime: "audio/mp4", cacheVersion: "1" };
+  const request = new Request("https://example.test/audio.m4b", { headers: { Range: "bytes=1-2" } });
+  const reads = [];
+  const reported = [];
+  const failure = new DOMException("Disk read failed", "UnknownError");
+  const response = await worker.downloadedMediaResponse(request, manifest, async (index) => {
+    reads.push(index);
+    return { arrayBuffer: async () => { throw failure; } };
+  }, async (index) => reported.push(index));
+  assert.equal(response.status, 206);
+  await assert.rejects(response.arrayBuffer(), { name: "UnknownError", message: "Disk read failed" });
+  assert.deepEqual(reads, [0]);
+  assert.deepEqual(reported, [0]);
+
+  const second = await worker.downloadedMediaResponse(request, manifest,
+    async () => new Response(Uint8Array.of(0, 1, 2, 3)), async (index) => reported.push(index));
+  assert.deepEqual([...new Uint8Array(await second.arrayBuffer())], [1, 2]);
+  assert.deepEqual(reported, [0]);
+});
+
 test("canceling an offline range stops reads at the last requested chunk", async () => {
   const scope = "https://example.test/";
   const context = await workerContext({ self: { registration: { scope }, addEventListener() {} }, URL, Request, Response, ReadableStream });
@@ -967,7 +1055,220 @@ test("online audio ranges use the native browser network path", async () => {
   assert.equal(fetched, false);
 });
 
-test("offline audio still serves downloaded ranges through the worker", async () => {
+test("the saved audio route serves only the active download even while online", async () => {
+  const events = {};
+  const scope = "https://example.test/listen/";
+  const caches = new MemoryCacheStorage();
+  const worker = await workerContext({ caches, self: { registration: { scope }, location: { origin: "https://example.test" },
+    navigator: { onLine: true }, addEventListener: (name, handler) => { events[name] = handler; } } });
+  const manifest = { ...selection(), schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved-book",
+    totalSize: 3, chunkSize: 3, totalChunks: 1, completed: [0] };
+  const manager = new OfflineManager({ baseUrl: scope, cacheStorage: caches, navigatorObject: navigatorStub() });
+  await manager.writeRecord("active", manifest);
+  const book = await caches.open(manifest.cacheName);
+  await book.put(offlineChunkUrl(scope, "one", 0), new Response(Uint8Array.of(3, 4, 5)));
+  const request = async (download) => {
+    const url = new URL("__compact_player_offline__/audio.json", scope);
+    url.searchParams.set("download", download);
+    const input = new Request(url, { headers: { Range: "bytes=1-2" } });
+    Object.defineProperty(input, "destination", { value: "audio" });
+    let result;
+    events.fetch({ request: input, respondWith: (response) => { result = response; } });
+    return result;
+  };
+  const response = await request("one");
+  assert.equal(response.status, 206);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [4, 5]);
+  assert.equal((await request("old")).status, 404);
+});
+
+test("file cover fallback during a worker upgrade checks the saved version", async (t) => {
+  const image = new Element();
+  const button = new Element();
+  image.ownerDocument = { defaultView: { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: { scriptURL: "https://example.test/listen/sw.js" } } } } };
+  let failed = 0;
+  let savedVersion = "1";
+  let sameBook = false;
+  const requestOptions = [];
+  const { versionHeader, versionHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  const fetchImpl = async (_url, options) => {
+    requestOptions.push(options);
+    return new Response("cover", { headers: { [versionHeader]: versionHeaderValue(savedVersion) } });
+  };
+  const view = createCoverView(image, button, { fetchImpl, getBookId: () => "book",
+    canUseCachedCover: () => sameBook, onShown() {}, onFailure() { failed++; } });
+  const book = { id: "book", coverSource: "file", cover: "cover.jpg", cacheVersion: "2",
+    bookBaseUrl: "https://example.test/listen/media/book/" };
+  view.applyCover(book, "en", null);
+  assert.match(image.src, /__compact_player_offline__\/cover\.json\?/);
+  image.onerror();
+  await settle();
+  assert.equal(failed, 1);
+  assert.equal(image.src, undefined);
+  savedVersion = "2";
+  view.applyCover({ ...book }, "en", null);
+  image.onerror();
+  await settle();
+  assert.equal(failed, 2);
+  assert.equal(image.src, undefined);
+  sameBook = true;
+  view.applyCover({ ...book }, "en", null);
+  image.onerror();
+  await settle();
+  assert.match(image.src, /^blob:/);
+  image.onload();
+  assert.equal(button.hidden, false);
+  assert.ok(requestOptions.every((options) => options.cache === "no-cache"));
+  view.clearCover();
+});
+
+test("worker upgrade permits an opaque redirected cover only with a compatible saved book", async () => {
+  const image = new Element();
+  const button = new Element();
+  image.ownerDocument = { defaultView: { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: { scriptURL: "https://example.test/listen/sw.js" } } } } };
+  let allowed = false;
+  let failed = 0;
+  const view = createCoverView(image, button, {
+    fetchImpl: async () => ({ type: "opaque", ok: false }),
+    getBookId: () => "book", canUseNativeCover: async () => allowed,
+    onShown() {}, onFailure() { failed++; },
+  });
+  const book = { id: "book", coverSource: "file", cover: "cover.jpg", cacheVersion: "2",
+    bookBaseUrl: "https://example.test/listen/media/book/" };
+  view.applyCover(book, "en", null);
+  image.onerror();
+  await settle();
+  assert.equal(failed, 1);
+  assert.equal(image.src, undefined);
+  allowed = true;
+  view.applyCover({ ...book }, "en", null);
+  image.onerror();
+  await settle();
+  assert.equal(image.src, "https://example.test/listen/media/book/cover.jpg");
+  image.onload();
+  assert.equal(button.hidden, false);
+  view.clearCover();
+});
+
+test("same-origin file cover without a worker revalidates the original URL", async () => {
+  const image = new Element();
+  const button = new Element();
+  image.ownerDocument = { defaultView: { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: null } } } };
+  const requests = [];
+  const view = createCoverView(image, button, {
+    fetchImpl: async (url, options) => { requests.push({ url, cache: options.cache }); return new Response("cover"); },
+    onShown() {}, onFailure: assert.fail,
+  });
+  const book = { id: "book", coverSource: "file", cacheVersion: "2", cover: "cover.jpg",
+    bookBaseUrl: "https://example.test/listen/media/book/" };
+  view.applyCover(book, "en", null);
+  await settle();
+  assert.deepEqual(requests, [{ url: "https://example.test/listen/media/book/cover.jpg", cache: "no-cache" }]);
+  assert.match(image.src, /^blob:/);
+  view.clearCover();
+});
+
+test("same-origin cover failure without a worker does not reuse an unchecked image", async () => {
+  const image = new Element();
+  const button = new Element();
+  image.ownerDocument = { defaultView: { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: null } } } };
+  let failures = 0;
+  const view = createCoverView(image, button, {
+    fetchImpl: async () => { throw new TypeError("Network unavailable"); },
+    onShown: assert.fail, onFailure() { failures++; },
+  });
+  view.applyCover({ id: "book", coverSource: "file", cacheVersion: "2", cover: "cover.jpg",
+    bookBaseUrl: "https://example.test/listen/media/book/" }, "en", null);
+  await settle();
+  assert.equal(failures, 1);
+  assert.equal(image.src, undefined);
+  assert.equal(button.hidden, true);
+});
+
+test("uncontrolled same-origin redirects retain native no-CORS image loading", async () => {
+  const image = new Element();
+  const button = new Element();
+  image.ownerDocument = { defaultView: { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: null } } } };
+  const view = createCoverView(image, button, {
+    fetchImpl: async () => ({ type: "opaque", ok: false }),
+    canUseNativeCover: async () => true, onShown() {}, onFailure: assert.fail,
+  });
+  view.applyCover({ id: "book", coverSource: "file", cacheVersion: "2", cover: "redirect.jpg?signature=original",
+    bookBaseUrl: "https://example.test/listen/media/book/" }, "en", null);
+  await settle();
+  assert.equal(image.src, "https://example.test/listen/media/book/redirect.jpg?signature=original");
+  image.onload();
+  assert.equal(button.hidden, false);
+  view.clearCover();
+});
+
+test("external and data file covers keep their native URLs", () => {
+  const image = new Element();
+  const button = new Element();
+  const browser = { location: new URL("https://example.test/listen/"),
+    navigator: { serviceWorker: { controller: { scriptURL: "https://example.test/listen/sw.js" } } } };
+  image.ownerDocument = { defaultView: browser };
+  const view = createCoverView(image, button, { onShown() {}, onFailure() {} });
+  const base = { id: "book", coverSource: "file", cacheVersion: "1", bookBaseUrl: "https://example.test/listen/media/book/" };
+  for (const cover of ["https://external.test/cover.jpg", "data:image/png;base64,AA=="]) {
+    view.applyCover({ ...base, cover }, "en", null);
+    assert.equal(image.src, cover);
+  }
+  view.clearCover();
+});
+
+test("file covers only use a saved image from the requested book version", async () => {
+  const events = {};
+  const scope = "https://example.test/listen/";
+  const caches = new MemoryCacheStorage();
+  const cover = scope + "media/book/cover.jpg?signature=original";
+  let serverStatus = 503;
+  const requests = [];
+  const optionsSeen = [];
+  const worker = await workerContext({ caches, self: { registration: { scope }, location: { origin: "https://example.test" },
+    navigator: { onLine: true }, addEventListener: (name, handler) => { events[name] = handler; } },
+    fetch: async (url, options) => {
+      requests.push(String(url));
+      optionsSeen.push(options);
+      return new Response(serverStatus === 200 ? "new cover" : "unavailable", { status: serverStatus });
+    },
+  });
+  const manifest = { ...selection(), schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved-book",
+    totalSize: 3, chunkSize: 3, totalChunks: 1, completed: [0], cacheVersion: "1" };
+  const manager = new OfflineManager({ baseUrl: scope, cacheStorage: caches, navigatorObject: navigatorStub() });
+  await manager.writeRecord("active", manifest);
+  await (await caches.open(manifest.cacheName)).put(cover, new Response("old cover"));
+  const requestCover = async (version, book = "book", config = "book") => {
+    const url = new URL("__compact_player_offline__/cover.json", scope);
+    url.searchParams.set("url", cover);
+    url.searchParams.set("version", version);
+    url.searchParams.set("book", book);
+    url.searchParams.set("config", config);
+    const request = new Request(url, { mode: "no-cors" });
+    Object.defineProperty(request, "destination", { value: "image" });
+    let result;
+    events.fetch({ request, respondWith: (response) => { result = response; } });
+    return result;
+  };
+  const mismatch = await requestCover("2");
+  assert.equal(mismatch.status, 503);
+  assert.equal((await requestCover("1", "another")).status, 503);
+  assert.equal(await (await requestCover("1")).text(), "old cover");
+  await manager.writeRecord("active", { ...manifest, configBookId: "edition" });
+  assert.equal((await requestCover("1", "book", "different-edition")).status, 503);
+  assert.equal(await (await requestCover("1", "book", "edition")).text(), "old cover");
+  serverStatus = 200;
+  assert.equal(await (await requestCover("2")).text(), "new cover");
+  assert.deepEqual(requests, [cover, cover, cover, cover, cover, cover]);
+  assert.ok(optionsSeen.every((options) => options.cache === "no-cache"));
+});
+
+test("offline native audio cannot use a saved edition based only on the source URL", async () => {
   const events = {};
   const context = await workerContext({
     self: {
@@ -979,17 +1280,10 @@ test("offline audio still serves downloaded ranges through the worker", async ()
     fetch: async () => { throw new TypeError("Offline"); },
     URL, Request, Response,
   });
-  context.cachedFallback = async () => new Response(new Uint8Array([7, 8]), {
-    status: 206, headers: { "content-range": "bytes 7-8/10" },
-  });
+  context.cachedFallback = assert.fail;
   const request = new Request("https://example.test/book.m4b", { headers: { Range: "bytes=7-8" } });
   Object.defineProperty(request, "destination", { value: "audio" });
-  let responsePromise;
-  events.fetch({ request, respondWith: (promise) => { responsePromise = promise; } });
-  const response = await responsePromise;
-  assert.equal(response.status, 206);
-  assert.equal(response.headers.get("content-range"), "bytes 7-8/10");
-  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [7, 8]);
+  events.fetch({ request, respondWith: assert.fail });
 });
 
 async function savedBookFixture(filename = "book.json") {
@@ -1277,6 +1571,173 @@ test("a published book with a missing chunk keeps its intact audio for a version
     assert.deepEqual(ranges, expectedRanges);
     assert.equal((await reopened.readRecord("active")).downloadId, repaired.downloadId);
   }
+});
+
+test("a corrupt streamed chunk is reported and the published download can be repaired", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const workerMessages = new EventTarget();
+  options.navigatorObject.serviceWorker.addEventListener = workerMessages.addEventListener.bind(workerMessages);
+  const controller = { scriptURL: new URL("sw.js", options.baseUrl).href };
+  options.navigatorObject.serviceWorker.controller = controller;
+  const reopened = new OfflineManager(options);
+  await reopened.init();
+  const cache = await options.cacheStorage.open(saved.cacheName);
+  const url = offlineChunkUrl(options.baseUrl, saved.downloadId, 0);
+  await cache.put(url, new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const worker = await workerContext({
+    caches: options.cacheStorage,
+    self: { registration: { scope: options.baseUrl }, addEventListener() {}, clients: {
+      async matchAll() { return [{ postMessage(data) {
+        workerMessages.dispatchEvent(Object.assign(new Event("message"), { data, source: controller }));
+      } }]; },
+    } },
+  });
+  const initial = await worker.activeManifest();
+  assert.ok(initial);
+  const gate = deferred();
+  const operation = reopened.runOperation(() => gate.promise);
+  const response = await worker.cachedMediaResponse(new Request(saved.sourceUrl, { headers: { Range: "bytes=0-1" } }), initial, cache);
+  await assert.rejects(response.arrayBuffer(), /incomplete/);
+  assert.equal(reopened.active.downloadId, saved.downloadId);
+  gate.resolve();
+  await operation;
+  for (let tries = 0; tries < 30 && reopened.active; tries++) await settle();
+  assert.equal(reopened.active, null);
+  assert.equal(reopened.staging?.downloadId, saved.downloadId);
+  assert.deepEqual(reopened.staging.completed, []);
+  assert.equal((await reopened.resume()).status, "ready");
+  assert.equal(new Uint8Array(await (await cache.match(url)).arrayBuffer()).length, 10);
+  assert.equal((await reopened.readRecord("active")).downloadId, saved.downloadId);
+  assert.equal(manager.active.downloadId, saved.downloadId);
+
+  // An old response can fail after the chunk has already been repaired.
+  await cache.put(url, new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const stale = await worker.cachedMediaResponse(new Request(saved.sourceUrl), initial, cache);
+  await cache.put(url, new Response(new Uint8Array(10), { headers: { "content-length": "10" } }));
+  await assert.rejects(stale.arrayBuffer(), /incomplete/);
+  await reopened.refresh();
+  assert.equal(reopened.active?.downloadId, saved.downloadId);
+  assert.equal(reopened.staging, null);
+
+  // A transient body read error is rechecked against the intact saved chunk.
+  const transientCache = {
+    match: async () => ({ arrayBuffer: async () => { throw new DOMException("Disk read failed", "UnknownError"); } }),
+    put: cache.put.bind(cache),
+  };
+  const transient = await worker.cachedMediaResponse(new Request(saved.sourceUrl), initial, transientCache);
+  await assert.rejects(transient.arrayBuffer(), { name: "UnknownError" });
+  if (reopened.damageCheck) await reopened.damageCheck;
+  await reopened.refresh();
+  assert.equal(reopened.active?.downloadId, saved.downloadId);
+  assert.equal(reopened.staging, null);
+
+  const other = await savedBookFixture();
+  const otherCache = await other.options.cacheStorage.open(other.saved.cacheName);
+  const otherUrl = offlineChunkUrl(other.options.baseUrl, other.saved.downloadId, 0);
+  await otherCache.put(otherUrl, new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const unattended = await workerContext({ caches: other.options.cacheStorage });
+  const otherResponse = await unattended.cachedMediaResponse(new Request(other.saved.sourceUrl), other.saved, otherCache);
+  await assert.rejects(otherResponse.arrayBuffer(), /incomplete/);
+  const afterReload = new OfflineManager(other.options);
+  await afterReload.init();
+  assert.equal(afterReload.staging?.downloadId, other.saved.downloadId);
+  assert.deepEqual(afterReload.staging.completed, []);
+});
+
+test("damage reports survive concurrent refresh, denied locks, and a full marker cache", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  for (const scenario of ["refreshing", "lock denied", "marker quota"]) {
+    const { options, saved } = await savedBookFixture();
+    const messages = new EventTarget();
+    const controller = { scriptURL: new URL("sw.js", options.baseUrl).href };
+    Object.assign(options.navigatorObject.serviceWorker, { controller, addEventListener: messages.addEventListener.bind(messages) });
+    let denied = false;
+    options.navigatorObject.locks = { async request(name, request, action) {
+      if (denied && !request.ifAvailable) { denied = false; throw new Error("Lock denied"); }
+      return locks.request(name, request, action);
+    } };
+    const manager = new OfflineManager(options);
+    await manager.init();
+    const cache = await options.cacheStorage.open(saved.cacheName);
+    const chunk = offlineChunkUrl(options.baseUrl, saved.downloadId, 0);
+    const marker = globalThis.CompactPlayerOfflineManifest.damagedChunkUrl(options.baseUrl, saved.downloadId, 0);
+    if (scenario === "marker quota") {
+      const originalPut = cache.put.bind(cache);
+      cache.put = async (input, response) => {
+        if (cache.key(input) === marker) throw new DOMException("Storage is full", "QuotaExceededError");
+        return originalPut(input, response);
+      };
+    }
+    const arrived = deferred();
+    const release = deferred();
+    const originalMatch = cache.match.bind(cache);
+    let wait = scenario === "refreshing";
+    cache.match = async (input) => {
+      const value = await originalMatch(input);
+      if (wait && cache.key(input) === marker) {
+        wait = false;
+        arrived.resolve();
+        await release.promise;
+      }
+      return value;
+    };
+    let refresh;
+    if (wait) {
+      refresh = manager.refresh();
+      await arrived.promise;
+    } else if (scenario === "lock denied") {
+      denied = true;
+    }
+    await cache.put(chunk, new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+    const worker = await workerContext({ caches: options.cacheStorage,
+      self: { registration: { scope: options.baseUrl }, addEventListener() {}, clients: {
+        async matchAll() { return [{ postMessage(data) {
+          messages.dispatchEvent(Object.assign(new Event("message"), { data, source: controller }));
+        } }]; },
+      } },
+    });
+    const response = await worker.cachedMediaResponse(new Request(saved.sourceUrl), saved, cache);
+    await assert.rejects(response.arrayBuffer(), /incomplete/);
+    await settle();
+    if (refresh) {
+      release.resolve();
+      await refresh;
+    } else {
+      await manager.refresh();
+    }
+    for (let tries = 0; tries < 40 && manager.active; tries++) await settle();
+    if (manager.damageCheck) await manager.damageCheck;
+    assert.equal(manager.active, null, scenario);
+    assert.equal(manager.staging?.downloadId, saved.downloadId, scenario);
+    assert.deepEqual(manager.staging.completed, [], scenario);
+    if (scenario === "marker quota") assert.equal(await cache.match(marker), undefined);
+  }
+});
+
+test("a damage report received during player startup is checked after registration", async () => {
+  const { options, saved } = await savedBookFixture();
+  const messages = new EventTarget();
+  const registration = deferred();
+  const controller = { scriptURL: new URL("sw.js", options.baseUrl).href };
+  Object.assign(options.navigatorObject.serviceWorker, {
+    controller, register: () => registration.promise, addEventListener: messages.addEventListener.bind(messages),
+  });
+  const manager = new OfflineManager(options);
+  const starting = manager.init();
+  const cache = await options.cacheStorage.open(saved.cacheName);
+  const chunk = offlineChunkUrl(options.baseUrl, saved.downloadId, 0);
+  const marker = globalThis.CompactPlayerOfflineManifest.damagedChunkUrl(options.baseUrl, saved.downloadId, 0);
+  await cache.put(chunk, new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  await cache.put(marker, new Response(""));
+  messages.dispatchEvent(Object.assign(new Event("message"), { source: controller, data: {
+    type: "compact-player-damaged-chunk", scope: options.baseUrl, downloadId: saved.downloadId, index: 0,
+  } }));
+  registration.resolve({});
+  await starting;
+  if (manager.damageCheck) await manager.damageCheck;
+  assert.equal(manager.active, null);
+  assert.equal(manager.staging?.downloadId, saved.downloadId);
+  assert.deepEqual(manager.staging.completed, []);
 });
 
 test("startup rebuilds a missing local manifest from the published book and verified chunks", async () => {

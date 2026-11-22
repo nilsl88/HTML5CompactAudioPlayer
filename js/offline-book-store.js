@@ -4,7 +4,7 @@ export { sameOfflineSelection, manifestMatchesSelection } from "./offline-select
 import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled } from "./offline-transfer.js";
 
 const { validManifest, audioMimeType, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
-  offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
+  offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
 export const OFFLINE_BOOK_CACHE_PREFIX = "compact-player-offline-book-v2-";
 const LEGACY_BOOK_CACHE_PREFIX = "compact-player-offline-book-v1-";
 
@@ -81,6 +81,12 @@ export class OfflineBookStore {
     this.baseUrl = baseUrl;
     this.cacheStorage = cacheStorage;
     this.bookCachePrefix = OFFLINE_BOOK_CACHE_PREFIX + encodeURIComponent(new URL(baseUrl).pathname) + ":";
+    this.reportedChunks = new Map();
+  }
+
+  reportDamagedChunk(downloadId, index) {
+    if (!this.reportedChunks.has(downloadId)) this.reportedChunks.set(downloadId, new Set());
+    this.reportedChunks.get(downloadId).add(index);
   }
 
   stagingManifest(selection, preflight) {
@@ -277,7 +283,16 @@ export class OfflineBookStore {
       const expected = chunkByteLength(manifest, index);
       const length = chunk.headers.get("content-length");
       if (length != null && Number(length) !== expected) continue;
-      if (!verifySize || await hasChunkLength(chunk, expected)) completed.push(index);
+      const marker = damagedChunkUrl(this.baseUrl, manifest.downloadId, index);
+      const reported = await cache.match(marker);
+      const reportedInMemory = this.reportedChunks.get(manifest.downloadId)?.has(index);
+      if (!verifySize && !reported && !reportedInMemory) {
+        completed.push(index);
+      } else if (await hasChunkLength(chunk, expected)) {
+        completed.push(index);
+        if (reported) await cache.delete(marker);
+        this.reportedChunks.get(manifest.downloadId)?.delete(index);
+      }
     }
     return completed;
   }
@@ -286,10 +301,20 @@ export class OfflineBookStore {
     let completed = await this.checkChunks(cache, manifest, verifySize);
     if (completed.length === manifest.completed.length) return manifest;
     if (manifest.status === "ready" && publishedStatus !== "downloading") {
-      if (!publishedStatus || !completed.length) return null;
+      if (!publishedStatus) return null;
       // Check the surviving bytes before using the published book as a partial download.
-      if (!verifySize) completed = await this.checkChunks(cache, { ...manifest, completed }, true);
-      if (!completed.length) return null;
+      if (completed.length && !verifySize) completed = await this.checkChunks(cache, { ...manifest, completed }, true);
+      if (!completed.length) {
+        let reportedDamage = false;
+        for (const index of manifest.completed) {
+          if (this.reportedChunks.get(manifest.downloadId)?.has(index)
+            || await cache.match(damagedChunkUrl(this.baseUrl, manifest.downloadId, index))) {
+            reportedDamage = true;
+            break;
+          }
+        }
+        if (!reportedDamage) return null;
+      }
     }
     return { ...manifest, status: "downloading", completed };
   }

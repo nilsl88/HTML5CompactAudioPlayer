@@ -86,6 +86,7 @@ export class SourceFallback {
     this.failedUrls = new Set();
     this.rejectedCodecs = new Set();
     this.exhausted = false;
+    this.savedAttempted = false;
     this.current = buildFallbackQueue(this.sources, this.selectedId)[0] || null;
     return this.current;
   }
@@ -96,7 +97,10 @@ export class SourceFallback {
     // A probe can finish while the previous source is playing.
     const next = buildFallbackQueue(this.sources, this.selectedId).find((source) =>
       !this.failedUrls.has(source.url) && !this.rejectedCodecs.has(source.codec));
-    if (next) this.current = next;
+    if (next) {
+      this.current = next;
+      this.savedAttempted = false;
+    }
     else this.exhausted = true;
     return next;
   }

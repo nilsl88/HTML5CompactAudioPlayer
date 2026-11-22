@@ -17,6 +17,7 @@ export class MediaController {
     this.loaded = false;
     this.hasStarted = false;
     this.reloadOnReconnect = false;
+    this.usingSavedSource = false;
     this.state = "idle";
     this.timeout = null;
     this.internalPause = false;
@@ -107,6 +108,7 @@ export class MediaController {
     }
     if (this.reloadOnReconnect && this.isOnline()) {
       this.generation += 1;
+      this.fallback.savedAttempted = false;
       return this.loadSource(source, true);
     }
     if (!this.audio.src) return this.loadSource(source, true);
@@ -140,6 +142,7 @@ export class MediaController {
     this.reloadOnReconnect = false;
     this.loaded = false;
     this.hasStarted = false;
+    this.usingSavedSource = false;
     this.internalPause = true;
     try { this.audio.pause(); } catch {}
     this.audio.removeAttribute("src");
@@ -151,16 +154,24 @@ export class MediaController {
 
   currentSource() { return this.fallback.current; }
 
-  async loadSource(source, shouldPlay) {
+  async loadSource(source, shouldPlay, playbackUrl = source.url) {
+    if (shouldPlay && !this.isOnline() && playbackUrl === source.url && !this.fallback.savedAttempted) {
+      const savedUrl = this.callbacks.savedSourceUrl?.(source);
+      if (savedUrl) {
+        this.fallback.savedAttempted = true;
+        playbackUrl = savedUrl;
+      }
+    }
     const generation = this.generation;
     this.reloadOnReconnect = false;
     this.loaded = false;
     this.hasStarted = false;
+    this.usingSavedSource = playbackUrl !== source.url;
     this.internalPause = true;
     try { this.audio.pause(); } catch {}
     this.internalPause = false;
     this.audio.preload = shouldPlay ? "auto" : "metadata";
-    this.audio.src = source.url;
+    this.audio.src = playbackUrl;
     this.applyMediaSettings();
     this.setState("loading");
     this.callbacks.onSourceChange?.(source);
@@ -196,8 +207,16 @@ export class MediaController {
   async failCurrent(error, skipCodec = false, expectedUrl = this.currentSource()?.url) {
     const failed = this.currentSource();
     if (!failed || failed.url !== expectedUrl || this.fallback.exhausted) return false;
+    if (this.playbackIntent && !this.fallback.savedAttempted) {
+      const savedUrl = this.callbacks.savedSourceUrl?.(failed);
+      if (savedUrl) {
+        this.fallback.savedAttempted = true;
+        this.generation += 1;
+        return this.loadSource(failed, true, savedUrl);
+      }
+    }
     if (!this.isOnline()) {
-      if (this.audio.error || skipCodec) this.reloadOnReconnect = true;
+      if (this.usingSavedSource || this.audio.error || skipCodec) this.reloadOnReconnect = true;
       if (!this.playbackIntent) return false;
       this.setState("stalled");
       this.callbacks.onOffline?.();
@@ -207,12 +226,25 @@ export class MediaController {
     this.callbacks.onSourceFailure?.(failed, error);
     if (!next) {
       this.clearTimeout();
+      if (!this.playbackIntent) {
+        this.clearSource();
+        this.setState("paused");
+        this.callbacks.onTime?.(this.desiredTime, 0);
+        return false;
+      }
       this.playbackIntent = false;
       this.setState("error");
       this.callbacks.onExhausted?.(error);
       return false;
     }
     this.callbacks.onFallback?.(failed, next);
+    if (!this.playbackIntent) {
+      this.clearSource();
+      this.setState("paused");
+      this.callbacks.onSourceChange?.(next);
+      this.callbacks.onTime?.(this.desiredTime, 0);
+      return false;
+    }
     return this.loadSource(next, this.playbackIntent);
   }
 
@@ -255,8 +287,7 @@ export class MediaController {
     this.timeout = setTimeout(() => {
       this.timeout = null;
       if (generation !== this.generation || this.currentSource()?.url !== url) return;
-      if (!this.isOnline()) { this.setState("stalled"); this.callbacks.onOffline?.(); return; }
-      if (!this.loaded || this.awaitingPlayback) this.failCurrent(new Error("Audio source timed out"), false, url);
+      if (!this.loaded || this.awaitingPlayback) this.failCurrent(new DOMException("Audio source timed out", "NetworkError"), false, url);
     }, this.sourceTimeoutMs);
   }
   clearTimeout() { if (this.timeout) clearTimeout(this.timeout); this.timeout = null; }

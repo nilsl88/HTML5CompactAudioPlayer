@@ -1,4 +1,9 @@
 const MAX_CHAPTER_CACHE_LENGTH = 512 * 1024;
+const textEncoder = new TextEncoder();
+
+function withinCacheLimit(text) {
+  return text.length <= MAX_CHAPTER_CACHE_LENGTH && textEncoder.encode(text).byteLength <= MAX_CHAPTER_CACHE_LENGTH;
+}
 
 function chapterCacheKey(bookId, language, cacheVersion) {
   return `compactPlayer:chapters:${encodeURIComponent(String(bookId))}:${encodeURIComponent(String(language))}:${encodeURIComponent(String(cacheVersion))}`;
@@ -25,7 +30,7 @@ export function openChapterCache(records, bookId, language, cacheVersion, source
     };
     if (vttUrl) {
       const raw = read(versionKey);
-      if (raw.url === vttUrl && typeof raw.text === "string" && raw.text && raw.text.length <= MAX_CHAPTER_CACHE_LENGTH) {
+      if (raw.url === vttUrl && typeof raw.text === "string" && raw.text && withinCacheLimit(raw.text)) {
         const data = { kind: "vtt", text: raw.text };
         if (!raw.kind) migrateVtt(data);
         return data;
@@ -33,12 +38,13 @@ export function openChapterCache(records, bookId, language, cacheVersion, source
     }
     const raw = read(versionKey + ":" + encodeURIComponent(String(sourceKey || "")));
     if (raw.sourceKey !== String(sourceKey || "") || !["vtt", "embedded"].includes(raw.kind)) return null;
-    if (raw.kind === "vtt" && typeof raw.text === "string" && raw.text && raw.text.length <= MAX_CHAPTER_CACHE_LENGTH) {
+    if (raw.kind === "vtt" && typeof raw.text === "string" && raw.text && withinCacheLimit(raw.text)) {
       const data = { kind: "vtt", text: raw.text };
       if (vttUrl) migrateVtt(data);
       return data;
     }
-    if (raw.kind === "embedded" && Array.isArray(raw.cues) && raw.cues.length <= 10000) {
+    if (raw.kind === "embedded" && Array.isArray(raw.cues) && raw.cues.length <= 10000
+      && withinCacheLimit(JSON.stringify(raw.cues))) {
       let previousStart = 0;
       for (const cue of raw.cues) {
         if (!cue || !Number.isFinite(cue.start) || cue.start < previousStart
@@ -59,8 +65,8 @@ export function openChapterCache(records, bookId, language, cacheVersion, source
     const value = data.kind === "vtt"
       ? { kind: data.kind, url: vttUrl, text: String(data.text || "") }
       : { kind: data.kind, sourceKey, cues: Array.isArray(data.cues) ? data.cues : [] };
-    if (data.kind === "vtt" && (!value.text || value.text.length > MAX_CHAPTER_CACHE_LENGTH)) return false;
-    if (data.kind === "embedded" && (value.cues.length > 10000 || JSON.stringify(value.cues).length > MAX_CHAPTER_CACHE_LENGTH)) return false;
+    if (data.kind === "vtt" && (!value.text || !withinCacheLimit(value.text))) return false;
+    if (data.kind === "embedded" && (value.cues.length > 10000 || !withinCacheLimit(JSON.stringify(value.cues)))) return false;
     return records.writeJson(scope + key, { schemaVersion: records.schemaVersion, timestamp: Date.now(), resetId, ...value });
   }
 

@@ -49,6 +49,12 @@ function validateAudioMime(response, sourceMime, expectedMime) {
   return mime;
 }
 
+function validateResponseOrigin(response, sourceUrl) {
+  if (response.url && new URL(response.url).origin !== new URL(sourceUrl).origin) {
+    throw new OfflineDownloadError("cross-origin", "Offline downloads require audio from this site.");
+  }
+}
+
 // Keep at most one storage chunk plus the current network buffer in memory.
 async function* splitAudioRange(body, length, chunkSize, readNetwork) {
   const incomplete = () => new OfflineDownloadError("incomplete", "The audio range has an unexpected length.");
@@ -100,6 +106,7 @@ export async function inspectAudioRange(fetchImpl, url, sourceMime, signal) {
   });
   const range = parseContentRange(response.headers.get("content-range"));
   try { await response.body?.cancel(); } catch {}
+  validateResponseOrigin(response, url);
   if (response.status !== 206 || !range || range.start !== 0 || range.end !== 0) {
     throw new OfflineDownloadError("range", "The audio server does not support offline downloads.");
   }
@@ -123,6 +130,7 @@ async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signa
     signal,
   });
   try {
+    validateResponseOrigin(response, manifest.sourceUrl);
     const range = parseContentRange(response.headers.get("content-range"));
     const responseVersion = response.headers.get(manifest.etag ? "etag" : "last-modified");
     if (response.status !== 206 || !range || range.start !== start || range.end !== end || range.total !== manifest.totalSize
