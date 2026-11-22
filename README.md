@@ -206,12 +206,14 @@ Example:
 - `chapters`: WebVTT file name or URL; used by `vtt` and tried first by `auto`
 - `sources`: map of codec, bitrate, and file path
 
-Without `basePath`, source and chapter paths are resolved from the book folder.
+Without `basePath`, source and chapter paths are resolved from the book folder. Paths with parent-directory traversal segments such as `../` are rejected, including percent-encoded forms. Relative paths within the folder and absolute HTTP(S) URLs remain supported.
+
+When replacing an audio file, give the new file a different URL and update the corresponding source path and `cacheVersion`. Browsers can reuse cached audio at the old URL even after the book configuration changes. A new versioned file name works with static hosting. For signed URLs, obtain a new signed URL for the new file and put it in the configuration unchanged. Keep the previous file available while older configurations are still in use. `Cache-Control: no-cache` can request revalidation, but browser media caches do not all behave alike, so it does not guarantee that a changed file at the same URL will be loaded.
 
 Supported codec keys are `opus`, `aac`, and `mp3`. MIME types are derived as follows:
 
 - WebM Opus: `audio/webm; codecs="opus"`
-- Ogg Opus: `audio/ogg; codecs="opus"`
+- Ogg Opus (`.ogg` and `.opus`): `audio/ogg; codecs="opus"`
 - AAC/M4A/M4B: AAC-LC (`audio/mp4; codecs="mp4a.40.2"`), HE-AAC v1 (`mp4a.40.5`), and HE-AAC v2 (`mp4a.40.29`), with a generic `audio/mp4` fallback
 - MP3: `audio/mpeg`
 
@@ -228,9 +230,11 @@ Unknown fields are ignored. Invalid languages, bitrate entries, unsafe URL schem
 
 If `coverSource` is omitted, a configuration with `cover` keeps the earlier `file` behavior. A configuration without `cover` defaults to `none`.
 
+Same-origin file covers revalidate the HTTP-cached image. The installed service worker uses a saved image only when its book and `cacheVersion` match the current selection. Without a controlling service worker, the page fetches the same-origin image itself, so its content security policy must allow that origin in `connect-src`. External and data image URLs keep their normal image-loading behavior.
+
 Embedded artwork is read from the MP4 `covr` metadata with bounded HTTP Range requests. JPEG and PNG images up to 10 MB are accepted. Reading artwork runs independently of playback and does not assign or preload the audio element. Chapters and artwork share one `moov` request per audio URL and book `cacheVersion`. The result stays in memory for 30 seconds. When you replace an MP4 at the same URL, change `cacheVersion` so both readers request the new metadata. If the network fails, only a download of the matching version supplies metadata.
 
-If an embedded cover is still missing when the player switches to another MP4 source, it looks for artwork in the new file. A loaded file cover stays visible through quality changes.
+When the player switches MP4 sources, it loads the embedded cover from the new file. A loaded file cover stays visible through quality changes.
 
 The server must support byte ranges and, for cross-origin audio, expose the required CORS headers. A downloaded M4A/M4B can supply its artwork while offline because the service worker supports byte ranges over the saved audio chunks.
 
@@ -359,6 +363,8 @@ Opening an unchanged download requires no cache writes. If its local manifest is
 
 If part of the published audiobook is missing, the player verifies the remaining audio chunks and offers **Resume download** in Options. With the same audio version it requests just the missing ranges. If another download is already paused, it keeps its place. Finishing that replacement installs the new book. Canceling it makes the damaged book available to resume.
 
+If playback detects a truncated audio chunk, the service worker records the affected chunk and tells open players to check the download. The player verifies the affected bytes and offers **Resume download**, including when the book contains only one chunk. An unprocessed report is checked on the next visit.
+
 If Cache Storage reports a read error during startup, the player keeps the saved book and checks it again on the next visit. When the browser blocks access to Cache Storage, the player hides the download controls and can still play online.
 
 Offline download requires:
@@ -368,9 +374,11 @@ Offline download requires:
 - valid HTTP `206 Partial Content` responses with `Content-Range` and a known total size
 - enough browser-managed storage for the selected source
 
+If online playback fails because the audio server cannot be reached, the player can retry the currently selected recording from the completed download. The saved book, language, source, and cache version must match the current selection. The player also rejects audio responses redirected to another origin during both the initial check and the download.
+
 The player checks `navigator.storage.estimate()` before confirmation and again under the write lock. If a changed audio file needs a fresh download, the player counts space it can free from the confirmed partial copy. The completed book stays in storage until its replacement is ready. The player requests persistent storage where supported. Quota values are estimates, persistence can be refused, and browsers may evict site data later. Keep the page open while downloading; iOS and other mobile browsers can suspend page work in the background.
 
-Online audio requests go directly through the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt chapter seeking. When the browser reports that it is offline, the service worker serves the downloaded audio's byte ranges. Other requests, including chapter and cover metadata, remain network-first with cached fallback. If the browser still reports an online connection during an outage, native audio requests cannot use the saved copy until it detects the offline state.
+Audio requests use the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt online chapter seeking. At first Play while offline, the player uses a downloaded copy only when its book, language, source, and `cacheVersion` match. If an active source fails or times out, the player tries that matching copy once. Other requests, including chapter and cover metadata, remain network-first with version-checked cached fallback.
 
 When opening the player page or loading its scripts and styles, the service worker gives the server three seconds to send response headers. It then uses the installed copy if available. If the file is missing from the cache, the original request can still finish. Only the installation root and `index.html` open the cached player page. Other URLs can serve their own cached content, and a missing page keeps the server's 404 response.
 
@@ -397,9 +405,11 @@ Each probe result expires seven days after that source was checked. Scanning ano
 
 When a book opens or the audio language changes, the selected language's WebVTT file starts loading before cover or availability checks, even if the audio is still buffering. It does not assign or preload an audio source. The player checks localStorage for the book, audio language, chapter URL, and `cacheVersion` first. On a miss it asks the server to revalidate the HTTP-cached file, even if the file still has time left in its cache lifetime. Repeat visits to the same edition reuse validated WebVTT files.
 
+The service worker identifies downloaded chapter and MP4 metadata by catalog ID, configuration ID, and `cacheVersion`. Legacy manifests without a configuration ID use the saved catalog ID. The chapter cache is also keyed by catalog ID, so separate catalog entries do not share cached chapters when their configurations have the same ID. Existing entries keyed only by a different configuration ID are not reused for an alias. During a worker upgrade, a cached response from an older worker that supplies only a version is rejected until the new worker takes control.
+
 Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, a valid empty WebVTT file leads to embedded chapters for that edition. If the WebVTT request fails, the player keeps the embedded list available offline and checks WebVTT again on reconnection or the next online visit.
 
-If the chapter server is unavailable, a downloaded WebVTT file can supply chapters for the same book version. With a different version, the chapter panel offers Retry. Each stored VTT file is limited to 512 KB. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
+If the chapter server is unavailable, a downloaded WebVTT file can supply chapters for the same book version. With a different version, the chapter panel offers Retry. Cached WebVTT text and embedded cues are each limited to 512 KiB measured as UTF-8. Older cache entries exceeding that limit are loaded again from their source. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
 
 ## Embedded M4A/M4B chapters
 
@@ -418,7 +428,9 @@ When Opus or MP3 is selected, embedded chapters are unavailable for that source.
 
 The first MP4 request reads up to 256 KiB. QuickTime chapter titles inside that range use the bytes already in memory. For titles farther into the file, the player groups nearby samples in reads of up to 256 KiB and skips gaps larger than 4 KiB. A single larger sample keeps its own range.
 
-Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. The player reads up to the first 10,000 samples of a QuickTime chapter track and skips tracks with incomplete sample-size tables. QuickTime titles use the declared text length and honor the UTF-16 byte-order mark. The player reloads cached titles that carry a reversed byte-order mark.
+When the first response has a strong ETag or a reliable Last-Modified date, later MP4 ranges must carry the same validator. Same-origin requests also send `If-Range`. Cross-origin requests compare exposed response validators without adding that header, so they do not require an extra CORS preflight. Without a strong validator, equal file sizes cannot confirm that all ranges came from the same edition. Change `cacheVersion` when replacing a file.
+
+Embedded chapters reload when the language, quality, or fallback source changes. The parser follows top-level MP4 atom sizes, skips the media-data atom without downloading it, and reads a `moov` atom located at either end of a large audiobook. MP4 metadata is limited to 16 MB. The player reads up to the first 10,000 samples of a QuickTime chapter track. Incomplete or invalid sample, timing, or chunk tables produce a retryable chapter error rather than saving a partial list. QuickTime titles use the declared text length and honor the UTF-16 byte-order mark. The player reloads cached titles that carry a reversed byte-order mark.
 
 The parser runs independently of playback and requires a server that supports byte ranges and the necessary same-origin or CORS response headers. If loading fails, the Chapters panel offers Retry and the player tries again when the connection returns. This also works for books whose only chapter source is the audio file. Embedded cues are cached per book, language, cache version, and source URL.
 

@@ -28,6 +28,204 @@ const sources = [
   { id: "mp3-128", codec: "mp3", bitrate: 128, url: "audio.mp3", availability: "unknown" },
 ];
 
+test("a last-source failure after Pause waits for Play before reporting exhaustion", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const start of ["only", "last"]) {
+    const audio = new FakeAudio();
+    const notices = [];
+    const candidates = start === "only" ? [sources[0]] : sources.slice(0, 2);
+    const media = new MediaController(audio, { onExhausted: () => notices.push("exhausted") }, { sourceTimeoutMs: 100 });
+    await media.setSelection(candidates, candidates[0].id, 23, true);
+    if (start === "last") {
+      audio.error = { code: 2 };
+      audio.emit("error");
+    }
+    const lastSource = media.currentSource().id;
+    media.requestPause();
+    audio.error = { code: 2 };
+    audio.emit("error");
+    assert.equal(media.state, "paused", start);
+    assert.equal(media.playbackIntent, false);
+    assert.deepEqual(notices, []);
+    t.mock.timers.tick(1000);
+    assert.deepEqual(notices, []);
+    await media.requestPlay();
+    assert.equal(media.currentSource().id, candidates[0].id);
+    assert.notEqual(audio.src, "");
+    assert.ok(lastSource);
+    media.destroy();
+  }
+  const audio = new FakeAudio();
+  const notices = [];
+  const media = new MediaController(audio, { onExhausted: () => notices.push("exhausted") });
+  await media.setSelection([sources[0]], sources[0].id, 0, true);
+  audio.error = { code: 2 };
+  audio.emit("error");
+  assert.equal(media.state, "error");
+  assert.deepEqual(notices, ["exhausted"]);
+  media.destroy();
+});
+
+test("offline first Play loads only the validated saved source and preserves lazy loading and seeking", async (t) => {
+  const audio = new FakeAudio();
+  const attempts = [];
+  audio.playImpl = async (url) => { attempts.push(url); };
+  const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" }, { isOnline: () => false });
+  t.after(() => media.destroy());
+  await media.setSelection([sources[0]], "opus-128", 23, false);
+  assert.equal(audio.src, "");
+  assert.deepEqual(attempts, []);
+  await media.requestPlay();
+  assert.deepEqual(attempts, ["saved-audio"]);
+  audio.emit("loadedmetadata");
+  media.seek(30);
+  assert.equal(media.position(), 30);
+  assert.equal(media.currentSource().url, "opus.webm");
+});
+
+test("reconnection starts a fresh saved-source attempt after an offline failure", async (t) => {
+  let online = false;
+  let savedReady = false;
+  const audio = new FakeAudio();
+  const attempts = [];
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "opus.webm" || !savedReady) throw new DOMException("Unavailable", "NetworkError");
+  };
+  const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" }, { isOnline: () => online });
+  t.after(() => media.destroy());
+  await media.setSelection([sources[0]], "opus-128", 15, true);
+  assert.equal(media.state, "stalled");
+  assert.deepEqual(attempts, ["saved-audio"]);
+  online = true;
+  savedReady = true;
+  await media.handleReconnect();
+  assert.deepEqual(attempts, ["saved-audio", "opus.webm", "saved-audio"]);
+  assert.equal(media.usingSavedSource, true);
+  assert.equal(media.position(), 15);
+});
+
+test("losing the network uses a matching saved source on media error and timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const reason of ["error", "timeout"]) {
+    const audio = new FakeAudio();
+    let online = true;
+    const saved = "https://example.test/saved";
+    const media = new MediaController(audio, { savedSourceUrl: () => saved },
+      { isOnline: () => online, sourceTimeoutMs: 100 });
+    await media.setSelection(sources, "opus-128", 12, true);
+    audio.emit("loadedmetadata");
+    audio.emit("playing");
+    audio.currentTime = 22;
+    audio.emit("timeupdate");
+    online = false;
+    if (reason === "error") {
+      audio.error = { code: 2 };
+      audio.emit("error");
+    } else {
+      audio.emit("waiting");
+      t.mock.timers.tick(100);
+    }
+    assert.equal(audio.src, saved, reason);
+    assert.equal(media.currentSource().id, "opus-128");
+    assert.equal(media.position(), 22);
+    assert.equal(media.playbackIntent, true);
+    media.destroy();
+  }
+  const audio = new FakeAudio();
+  const media = new MediaController(audio, {}, { isOnline: () => false });
+  await media.setSelection(sources, "opus-128", 12, true);
+  audio.error = { code: 2 };
+  audio.emit("error");
+  assert.equal(media.state, "stalled");
+  assert.equal(audio.src, "opus.webm");
+  media.destroy();
+
+  const retryAudio = new FakeAudio();
+  let online = false;
+  const attempts = [];
+  retryAudio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "saved-audio") throw new DOMException("Unavailable", "NetworkError");
+  };
+  const retry = new MediaController(retryAudio, { savedSourceUrl: () => "saved-audio" }, { isOnline: () => online });
+  await retry.setSelection(sources, "opus-128", 12, true);
+  await retry.failCurrent(new DOMException("Offline", "NetworkError"));
+  assert.equal(retry.state, "stalled");
+  assert.deepEqual(attempts, ["saved-audio"]);
+  online = true;
+  await retry.handleReconnect();
+  assert.deepEqual(attempts, ["saved-audio", "opus.webm"]);
+  retry.destroy();
+});
+
+test("a new Play retries the saved copy after the fallback queue is exhausted", async (t) => {
+  const audio = new FakeAudio();
+  const attempts = [];
+  let savedAvailable = false;
+  const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" });
+  t.after(() => media.destroy());
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url !== "saved-audio" || !savedAvailable) throw new DOMException("unavailable", "NetworkError");
+  };
+  await media.setSelection([sources[0]], "opus-128", 23, true);
+  assert.deepEqual(attempts, ["opus.webm", "saved-audio"]);
+  assert.equal(media.state, "error");
+  savedAvailable = true;
+  await media.requestPlay();
+  assert.deepEqual(attempts, ["opus.webm", "saved-audio", "opus.webm", "saved-audio"]);
+  assert.equal(media.usingSavedSource, true);
+  assert.equal(media.position(), 23);
+});
+
+test("a failed online source tries the matching saved copy once before codec fallback", async (t) => {
+  const audio = new FakeAudio();
+  const savedUrl = "https://example.test/__compact_player_offline__/audio.json?download=one";
+  const media = new MediaController(audio, { savedSourceUrl: () => savedUrl });
+  t.after(() => media.destroy());
+  const attempts = [];
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "opus.webm" || url === savedUrl) throw new DOMException("unavailable", "NetworkError");
+  };
+  await media.setSelection(sources, "opus-128", 12, true);
+  assert.deepEqual(attempts.slice(0, 3), ["opus.webm", savedUrl, "opus-low.webm"]);
+  assert.equal(media.currentSource().id, "opus-96");
+  assert.equal(media.desiredTime, 12);
+});
+
+test("a decode error retries the saved edition once before skipping the codec", async (t) => {
+  const audio = new FakeAudio();
+  const attempts = [];
+  const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" });
+  t.after(() => media.destroy());
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "opus.webm" || url === "saved-audio") throw new DOMException("Unsupported", "NotSupportedError");
+  };
+  await media.setSelection(sources, "opus-128", 0, true);
+  assert.deepEqual(attempts.slice(0, 3), ["opus.webm", "saved-audio", "audio.m4a"]);
+  assert.equal(media.currentSource().id, "aac-128");
+});
+
+test("a late network failure cannot load a saved copy for a newer selection", async (t) => {
+  const audio = new FakeAudio();
+  let rejectPrevious;
+  const previous = new Promise((_, reject) => { rejectPrevious = reject; });
+  let savedChecks = 0;
+  const media = new MediaController(audio, { savedSourceUrl: () => { savedChecks++; return "saved-audio"; } });
+  t.after(() => media.destroy());
+  audio.playImpl = (url) => url === "opus.webm" ? previous : Promise.resolve();
+  const pending = media.setSelection(sources, "opus-128", 3, true);
+  await media.setSelection(sources, "aac-128", 7, true);
+  rejectPrevious(new DOMException("Offline", "NetworkError"));
+  await pending;
+  assert.equal(audio.src, "audio.m4a");
+  assert.equal(media.desiredTime, 7);
+  assert.equal(savedChecks, 0);
+});
+
 test("does not report playing until the media element emits playing", async () => {
   const audio = new FakeAudio();
   const states = [];
@@ -184,6 +382,28 @@ test("fallback defers missing URLs across codecs and skips every variant of a re
       media.destroy();
     }
   }
+});
+
+test("a source error after Pause defers loading and timeout until the next Play", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const audio = new FakeAudio();
+  const failures = [];
+  const media = new MediaController(audio, { onSourceFailure: (source) => failures.push(source.id) }, { sourceTimeoutMs: 100 });
+  await media.setSelection(sources, "opus-128", 33, true);
+  media.requestPause();
+  audio.error = { code: 2 };
+  audio.emit("error");
+  assert.equal(media.currentSource().id, "opus-96");
+  assert.equal(audio.src, "");
+  t.mock.timers.tick(1000);
+  assert.equal(media.state, "paused");
+  assert.deepEqual(failures, ["opus-128"]);
+  assert.equal(media.position(), 33);
+  await media.requestPlay();
+  assert.equal(audio.src, "opus-low.webm");
+  t.mock.timers.tick(100);
+  assert.deepEqual(failures, ["opus-128", "opus-96"]);
+  media.destroy();
 });
 
 test("decode rejection skips the failed codec family", async () => {

@@ -1,16 +1,16 @@
 importScripts("./js/offline-manifest.js", "./js/offline-media-response.js");
-const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue,
-  offlineMetaUrl, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v17";
+const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue, bookHeader, bookHeaderValue,
+  offlineMetaUrl, offlineChunkUrl, damagedChunkUrl } = globalThis.CompactPlayerOfflineManifest;
+const SHELL_VERSION = "v18";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_NETWORK_WAIT_MS = 3000;
 const SHELL_URLS = [
   "./",
   "./index.html",
-  "./player.css?v=17",
-  "./player.js?v=17",
-  "./i18n.js?v=17",
+  "./player.css?v=18",
+  "./player.js?v=18",
+  "./i18n.js?v=18",
   "./js/player-app.js",
   "./js/availability-cache.js",
   "./js/chapter-cache.js",
@@ -70,7 +70,20 @@ async function activeManifest() {
 }
 
 function cachedMediaResponse(request, manifest, cache) {
-  return downloadedMediaResponse(request, manifest, (index) => cache.match(chunkUrl(manifest.downloadId, index)));
+  return downloadedMediaResponse(request, manifest, (index) => cache.match(chunkUrl(manifest.downloadId, index)), async (index) => {
+    try {
+      await cache.put(damagedChunkUrl(self.registration.scope, manifest.downloadId, index), new Response(""));
+    } catch (error) {
+      console.warn("[CompactAudioPlayer] Could not record a damaged audio chunk.", error);
+    }
+    try {
+      const clients = await self.clients?.matchAll({ type: "window" }) || [];
+      for (const client of clients) client.postMessage({ type: "compact-player-damaged-chunk",
+        scope: self.registration.scope, downloadId: manifest.downloadId, index });
+    } catch (error) {
+      console.warn("[CompactAudioPlayer] Could not report a damaged audio chunk.", error);
+    }
+  });
 }
 
 async function cachedBookResponse(request) {
@@ -86,9 +99,36 @@ async function cachedBookResponse(request) {
     // Expose the saved edition to fetch() callers. Native image and navigation responses keep their URL.
     const response = new Response(asset.body, asset);
     response.headers.set(versionHeader, versionHeaderValue(manifest.cacheVersion));
+    response.headers.set(bookHeader, bookHeaderValue(manifest.episodeId, manifest.configBookId));
     return response;
   }
   return null;
+}
+
+async function networkFirstCover(request, url) {
+  const source = url.searchParams.get("url");
+  const version = url.searchParams.get("version");
+  const bookId = url.searchParams.get("book");
+  const configId = url.searchParams.get("config");
+  let target;
+  try { target = new URL(source); }
+  catch { return new Response(null, { status: 400 }); }
+  if (target.origin !== self.location.origin || version === null || !bookId || !configId) return new Response(null, { status: 400 });
+  let response;
+  try {
+    response = await fetch(target.href, { mode: "no-cors", cache: "no-cache", credentials: "same-origin", signal: request.signal });
+    if (response.ok || response.type === "opaque") return response;
+  } catch (error) {
+    if (request.signal.aborted) throw error;
+  }
+  const manifest = await activeManifest();
+  if (manifest && manifest.episodeId === bookId && (!manifest.configBookId || manifest.configBookId === configId)
+    && String(manifest.cacheVersion) === version) {
+    const cache = await caches.open(manifest.cacheName);
+    const saved = await cache.match(target.href);
+    if (saved?.ok) return saved;
+  }
+  return response || Response.error();
 }
 
 function cachedFallback(request) {
@@ -162,8 +202,22 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (!["GET", "HEAD"].includes(request.method) || request.headers.get(DOWNLOAD_HEADER) === "1") return;
   if (new URL(request.url).origin !== self.location.origin) return;
-  // Firefox can fail media seeks when a worker forwards the streaming response.
-  // Let the browser own online audio; offline requests still use saved chunks.
-  if (request.destination === "audio" && self.navigator?.onLine !== false) return;
+  const savedUrl = new URL(request.url);
+  if (request.destination === "image"
+    && savedUrl.pathname === new URL(offlineMetaUrl(self.registration.scope, "cover")).pathname) {
+    event.respondWith(networkFirstCover(request, savedUrl));
+    return;
+  }
+  if (savedUrl.pathname === new URL(offlineMetaUrl(self.registration.scope, "audio")).pathname) {
+    event.respondWith((async () => {
+      const manifest = await activeManifest();
+      if (!manifest || savedUrl.searchParams.get("download") !== manifest.downloadId) return new Response(null, { status: 404 });
+      const cache = await caches.open(manifest.cacheName);
+      return await cachedMediaResponse(request, manifest, cache) || new Response(null, { status: 404 });
+    })());
+    return;
+  }
+  // Native audio has no book version. Saved audio uses the validated internal URL above.
+  if (request.destination === "audio") return;
   event.respondWith(networkFirst(request));
 });

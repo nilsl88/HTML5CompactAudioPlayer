@@ -2,7 +2,7 @@ import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { createCustomSelects } from "../js/custom-select.js";
-import { openPanel } from "../js/dialogs.js";
+import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
 import { OfflineManager } from "../js/offline.js";
 import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js";
@@ -14,6 +14,51 @@ const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
   languages: { en: { sources: { aac: { 96: "sample.m4b" } } } },
 };
+
+test("versioned audio paths and signed URLs reach the media element unchanged", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const signed = "https://cdn.example.test/audio-v2.m4b?signature=a%2Fb%2Bc&expires=123";
+  const saved = new Map();
+  for (const [version, path, expected] of [
+    [1, "audio-v1.m4b", "https://example.test/media/sample/audio-v1.m4b"],
+    [2, signed, signed],
+  ]) {
+    const edition = { ...book, cacheVersion: version,
+      languages: { en: { sources: { aac: { 96: path } } } } };
+    const page = await openPlayerPage(edition, assert.fail, saved);
+    await page.ready;
+    assert.ok(!page.audio.src);
+    page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+    assert.equal(page.audio.src, expected);
+  }
+});
+
+test("network errors use a saved source only for the selected book version", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const manifest = { schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved",
+    episodeId: "sample", languageCode: "en", sourceId: "aac-96",
+    sourceUrl: "https://example.test/media/sample/sample.m4b", cacheVersion: "1", mime: "audio/mp4",
+    totalSize: 1, chunkSize: 1, totalChunks: 1, completed: [0] };
+  t.mock.method(OfflineManager.prototype, "init", async function () { this.active = manifest; });
+  for (const onlineAtPlay of [true, false]) {
+    for (const [version, expectedSaved] of [[1, true], [2, false]]) {
+      const page = await openPlayerPage({ ...book, cacheVersion: version }, assert.fail, new Map(),
+        { navigator: { onLine: true, language: "en", serviceWorker: { controller: { scriptURL: "https://example.test/sw.js" } } } });
+      await page.ready;
+      page.navigator.onLine = onlineAtPlay;
+      const attempts = [];
+      page.audio.play = async () => {
+        attempts.push(page.audio.src);
+        if (page.audio.src === manifest.sourceUrl) throw new DOMException("Network unavailable", "NetworkError");
+      };
+      page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+      await settle();
+      assert.equal(attempts.some((url) => url.includes("__compact_player_offline__/audio.json")), expectedSaved,
+        `version ${version}, online ${onlineAtPlay}`);
+      if (!onlineAtPlay && expectedSaved) assert.ok(attempts[0].includes("__compact_player_offline__/audio.json"));
+    }
+  }
+});
 
 test("regional recordings keep separate identities and reopen saved and downloaded language choices", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -56,6 +101,30 @@ test("regional recordings keep separate identities and reopen saved and download
   assert.equal(sameOfflineSelection({ ...legacy, languageTag: "en" }, selected), false);
 });
 
+test("dialog focus callbacks respect a closed dialog and subsequent user focus", () => {
+  const frames = [];
+  const original = { isConnected: true, focus() { document.activeElement = this; } };
+  const first = { focus() { document.activeElement = this; } };
+  const other = { isConnected: true, focus() { document.activeElement = this; } };
+  const document = { activeElement: original, defaultView: { requestAnimationFrame: (fn) => frames.push(fn) } };
+  const dialog = { ownerDocument: document, open: false, showModal() { this.open = true; },
+    close() { this.open = false; }, hasAttribute() { return false; } };
+  openDialog(dialog, first);
+  closeDialog(dialog);
+  frames.shift()();
+  assert.equal(document.activeElement, original);
+  frames.shift()();
+  openDialog(dialog, first);
+  document.activeElement = other;
+  frames.shift()();
+  assert.equal(document.activeElement, other);
+  document.activeElement = first;
+  closeDialog(dialog);
+  document.activeElement = other;
+  frames.shift()();
+  assert.equal(document.activeElement, other);
+});
+
 test("opening a panel sets initial focus unless the user has already moved it or closed it", () => {
   const trigger = new Element();
   const panel = new Element();
@@ -74,6 +143,35 @@ test("opening a panel sets initial focus unless the user has already moved it or
     const expected = { open: first, "choose chapter": chapter, close: trigger };
     assert.equal(document.activeElement, expected[action]);
   }
+});
+
+test("closing a panel restores focus only while its closure remains current", () => {
+  const frames = [];
+  const trigger = new Element();
+  const panel = new Element();
+  const inside = new Element();
+  const elsewhere = new Element();
+  const document = { activeElement: inside, defaultView: { requestAnimationFrame: (fn) => frames.push(fn) } };
+  trigger.focus = () => { document.activeElement = trigger; };
+  panel.ownerDocument = document;
+  panel.hidden = false;
+  closePanel(panel, trigger, true);
+  frames.shift()();
+  assert.equal(document.activeElement, trigger);
+
+  document.activeElement = inside;
+  panel.hidden = false;
+  closePanel(panel, trigger, true);
+  document.activeElement = elsewhere;
+  frames.shift()();
+  assert.equal(document.activeElement, elsewhere);
+
+  document.activeElement = inside;
+  panel.hidden = false;
+  closePanel(panel, trigger, true);
+  panel.hidden = false;
+  frames.shift()();
+  assert.equal(document.activeElement, inside);
 });
 
 test("holding Space toggles playback once per press while repeated arrow keys continue seeking", async (t) => {
@@ -216,6 +314,52 @@ test("custom selects commit a keyboard choice and restore focus on Escape", () =
   assert.ok(menu.hidden && focused);
   assert.equal(select.value, "en");
   assert.equal(changes, 1);
+});
+
+test("an open book selector keeps the active choice when the catalog changes", () => {
+  const document = { createElement() {
+    const element = new Element();
+    const active = new Set();
+    element.classList = {
+      add: (name) => active.add(name), remove: (name) => active.delete(name),
+      toggle: (name, enabled) => enabled ? active.add(name) : active.delete(name),
+      contains: (name) => active.has(name),
+    };
+    element.getBoundingClientRect = () => ({ top: 0, bottom: 10, height: 10 });
+    return element;
+  }, querySelector: () => null };
+  const controls = createCustomSelects(document, { innerHeight: 600 });
+  const select = Object.assign(new Element(), { id: "book" });
+  Object.defineProperties(select, {
+    options: { get: () => select.children },
+    selectedIndex: { get: () => select.children.findIndex((option) => option.selected) },
+    value: {
+      get: () => select.children.find((option) => option.selected)?.value || "",
+      set: (value) => select.children.forEach((option) => { option.selected = option.value === value; }),
+    },
+  });
+  const wrapper = controls.selectWithArrow(select);
+  wrapper.insertBefore = (button) => wrapper.children.unshift(button);
+  select.closest = () => wrapper;
+  const records = (values) => values.map((value) => ({ value }));
+  controls.optionsFrom(select, records(["alpha", "beta"]), "alpha", (item) => item.value);
+  const { button, menu } = controls.enhanceCustomSelect(select);
+  const key = (key) => button.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { key }));
+  key("ArrowDown");
+  assert.equal(button.getAttribute("aria-activedescendant"), "book-option-1");
+
+  controls.optionsFrom(select, records(["gamma", "alpha", "beta"]), "alpha", (item) => item.value);
+  assert.equal(button.getAttribute("aria-activedescendant"), "book-option-2");
+  assert.equal(menu.children[2].classList.contains("is-active"), true);
+  key("Enter");
+  assert.equal(select.value, "beta");
+
+  key("ArrowUp");
+  controls.optionsFrom(select, records(["beta", "gamma"]), "beta", (item) => item.value);
+  assert.equal(menu.hidden, true);
+  assert.equal(button.getAttribute("aria-activedescendant"), null);
+  key("Enter");
+  assert.equal(select.value, "beta");
 });
 
 test("reset clears only this installation's progress, even for a shared book ID", async (t) => {

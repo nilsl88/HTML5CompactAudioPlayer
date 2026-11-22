@@ -26,6 +26,7 @@ export async function loadChapterFile(url, {
   timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS,
   revalidate = false,
   cacheVersion,
+  bookIdentity,
 } = {}) {
   const text = await fetchWithRetry(url, {
     fetchImpl,
@@ -35,7 +36,7 @@ export async function loadChapterFile(url, {
     timeoutMs,
   }, (response) => {
     if (!response.ok) throw new Error(`Chapter request failed with HTTP ${response.status}.`);
-    checkResponseVersion(response, cacheVersion);
+    checkResponseVersion(response, cacheVersion, bookIdentity);
     return response.text();
   });
   const chapters = parseChapterText(text);
@@ -44,7 +45,7 @@ export async function loadChapterFile(url, {
 }
 
 export async function loadChapters({
-  mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", cacheVersion,
+  mode = "none", vttUrl = "", sourceUrl = "", sourceMime = "", cacheVersion, bookIdentity,
   signal, fetchImpl = globalThis.fetch, timeoutMs = CHAPTER_REQUEST_TIMEOUT_MS, revalidate = false, cache,
   online = true, fallbackCues, onFallback,
 } = {}) {
@@ -62,7 +63,7 @@ export async function loadChapters({
     const parsed = cached?.kind === "vtt" && parseChapterText(cached.text);
     if (parsed) return { kind: "vtt", ...parsed };
     cache?.beginWrite();
-    const result = await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs, cacheVersion, revalidate: revalidate || Boolean(cached) });
+    const result = await loadChapterFile(vttUrl, { signal, fetchImpl, timeoutMs, cacheVersion, bookIdentity, revalidate: revalidate || Boolean(cached) });
     return save({ kind: "vtt", ...result });
   };
   const canReadEmbedded = isMp4Audio({ mime: sourceMime, url: sourceUrl });
@@ -72,7 +73,7 @@ export async function loadChapters({
     const stored = cached?.kind === "vtt" ? cache.readSource() : cached;
     if (stored?.kind === "embedded") return embeddedChapters(stored.cues);
     cache?.beginWrite();
-    const cues = await loadEmbeddedMp4Chapters(sourceUrl, { signal, fetchImpl, timeoutMs, cacheVersion });
+    const cues = await loadEmbeddedMp4Chapters(sourceUrl, { signal, fetchImpl, timeoutMs, cacheVersion, bookIdentity });
     return save(embeddedChapters(cues));
   };
   if (mode === "embedded") return loadEmbedded();

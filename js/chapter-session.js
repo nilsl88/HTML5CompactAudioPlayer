@@ -13,7 +13,7 @@ export class ChapterSession {
     this.reset();
   }
 
-  reset(book = null, languageCode = "", source = null) {
+  reset(book = null, languageCode = "", source = null, episodeId = book?.id) {
     this.generation += 1;
     this.controller?.abort();
     this.controller = null;
@@ -27,7 +27,8 @@ export class ChapterSession {
     this.mode = language?.chapterSource || "none";
     this.url = resolveLanguageAsset(language, language?.chapters);
     this.source = source;
-    this.bookId = book?.id;
+    this.bookId = episodeId || book?.id;
+    this.bookIdentity = book ? { episodeId, configBookId: book.id } : null;
     this.languageCode = languageCode;
     this.cacheVersion = book?.cacheVersion;
   }
@@ -89,7 +90,7 @@ export class ChapterSession {
     try {
       const result = await loadChapters({
         mode: this.mode, vttUrl: this.url, sourceUrl: this.source?.url, sourceMime: this.source?.mime,
-        cacheVersion: this.cacheVersion, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate, cache,
+        cacheVersion: this.cacheVersion, bookIdentity: this.bookIdentity, signal: controller.signal, fetchImpl: this.fetchImpl, revalidate, cache,
         online: this.isOnline(), fallbackCues: this.retryVtt ? this.cues : null,
         onFallback: (result) => { if (!controller.signal.aborted) this.accept(result, true); },
       });

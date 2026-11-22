@@ -85,6 +85,9 @@ export class OfflineManager {
     this.phase = "idle";
     this.abortController = null;
     this.currentPromise = null;
+    this.pendingDamage = false;
+    this.damageCheck = null;
+    this.listensForDamage = false;
   }
 
   get cacheStorage() { return this.store.cacheStorage; }
@@ -126,6 +129,18 @@ export class OfflineManager {
   async init() {
     if (!this.supported) { this.emit(); return this.snapshot(); }
     const script = new URL("sw.js", this.baseUrl);
+    if (!this.listensForDamage && this.navigator.serviceWorker.addEventListener) {
+      this.navigator.serviceWorker.addEventListener("message", (event) => {
+        if (event.source?.scriptURL !== script.href || event.data?.type !== "compact-player-damaged-chunk"
+          || event.data.scope !== this.baseUrl || !event.data.downloadId) return;
+        const saved = [this.active, this.repairable, this.staging].find((item) => item?.downloadId === event.data.downloadId);
+        if (!Number.isSafeInteger(event.data.index) || event.data.index < 0 || (saved && event.data.index >= saved.totalChunks)) return;
+        this.store.reportDamagedChunk(event.data.downloadId, event.data.index);
+        this.pendingDamage = true;
+        this.reconcileReportedDamage();
+      });
+      this.listensForDamage = true;
+    }
     let controlsPage = false;
     try {
       const workers = this.navigator.serviceWorker;
@@ -213,7 +228,25 @@ export class OfflineManager {
       await this.readPublishedBook();
       this.emit();
       return this.snapshot();
+    } finally {
+      if (this.pendingDamage) this.reconcileReportedDamage();
     }
+  }
+
+  reconcileReportedDamage() {
+    if (!this.supported || !this.pendingDamage || this.damageCheck) return;
+    let checked = false;
+    this.damageCheck = Promise.resolve().then(() => this.withLock(async () => {
+      this.pendingDamage = false;
+      await this.refreshLocked();
+      checked = true;
+    })).catch((error) => {
+      this.pendingDamage = true;
+      console.warn("[CompactAudioPlayer] Could not check the damaged audio chunk.", error);
+    }).finally(() => {
+      this.damageCheck = null;
+      if (checked && this.pendingDamage) this.reconcileReportedDamage();
+    });
   }
 
   async refreshLocked() {
@@ -343,6 +376,7 @@ export class OfflineManager {
       this.abortController = null;
       this.currentPromise = null;
       if (["preparing", "finalizing", "publishing-repair"].includes(this.phase)) this.setPhase(this.staging ? "paused" : "idle");
+      if (this.pendingDamage) this.reconcileReportedDamage();
     });
     this.setPhase("preparing");
     return this.currentPromise;

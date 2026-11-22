@@ -1,4 +1,4 @@
-import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=17";
+import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=18";
 import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js";
 import { BookSelection } from "./book-selection.js";
 import { AvailabilitySession } from "./availability-session.js";
@@ -102,6 +102,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     baseUrl: documentBaseUrl,
     onChange: renderOfflineUi,
   });
+  let offlineInitialization = Promise.resolve();
   const renderDownloads = createOfflinePanel(window, {
     offline, t, getLocale: () => locale, getSelection: currentOfflineSelection, isOnline,
     waitForPriority: waitForPlaybackPriority, reportError, showToast,
@@ -285,6 +286,22 @@ export function startPlayer({ window, storage, fetchImpl }) {
 
   const { applyCover, clearCover } = createCoverView(els.coverImg, els.coverButton, {
     fetchImpl,
+    getBookId: () => bookSelection?.bookId,
+    async canUseCachedCover(coverBook) {
+      await offlineInitialization;
+      const saved = offline.snapshot().active;
+      return Boolean(saved && saved.episodeId === bookSelection?.bookId
+        && (!saved.configBookId || saved.configBookId === coverBook.id)
+        && String(saved.cacheVersion) === String(coverBook.cacheVersion));
+    },
+    async canUseNativeCover(coverBook) {
+      if (!navigator.serviceWorker?.controller) return true;
+      await offlineInitialization;
+      const { supported, active } = offline.snapshot();
+      return supported && (!active || (active.episodeId === bookSelection?.bookId
+        && (!active.configBookId || active.configBookId === coverBook.id)
+        && String(active.cacheVersion) === String(coverBook.cacheVersion)));
+    },
     onShown() {
       els.coverImg.alt = displayTitle();
       els.coverButton.setAttribute("aria-label", t("openCover"));
@@ -414,7 +431,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
 
   function resetChapters(book, code, source) {
     availability.selectLanguage(code || "");
-    chapters.reset(book, code, source);
+    chapters.reset(book, code, source, bookSelection?.bookId || book?.id);
     chapterPanel.reset();
     updateMediaSessionMetadata();
     updateChapterButtons();
@@ -525,10 +542,20 @@ export function startPlayer({ window, storage, fetchImpl }) {
     },
     onSourceSuccess: (source) => {
       if (resetRemaining || !source) return;
-      availability.markPlayed(source);
+      if (!media.usingSavedSource) availability.markPlayed(source);
       bookSelection.confirmPlayed(source);
     },
     onSourceFailure: (source, error) => reportError(`source failure (${source?.id || "unknown"})`, error),
+    savedSourceUrl: (source) => {
+      const selection = currentOfflineSelection();
+      const saved = offline.snapshot().active;
+      if (navigator.serviceWorker?.controller?.scriptURL !== new URL("sw.js", documentBaseUrl).href
+        || !selection || source !== bookSelection.source
+        || !manifestMatchesSelection(saved, selection)) return "";
+      const url = new URL("__compact_player_offline__/audio.json", documentBaseUrl);
+      url.searchParams.set("download", saved.downloadId);
+      return url.href;
+    },
     onFallback: (_failed, next) => {
       if (resetRemaining) return;
       showToast(t("audioFallbackCompatible"), "warning", 5000, `fallback:${next.id}`);
@@ -1007,7 +1034,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     setLoading(true);
     applyUiPreferences();
     applyStrings();
-    const offlineReady = offline.init();
+    const offlineReady = offlineInitialization = offline.init();
     const startedOffline = !isOnline();
     if (startedOffline) await offlineReady;
     const catalog = await loadLibrary();

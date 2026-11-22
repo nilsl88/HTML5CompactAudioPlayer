@@ -10,8 +10,9 @@ export const AAC_MIME_TYPES = [
 
 const qualityLabels = [[256, "qPremium"], [128, "qHigh"], [96, "qLow"], [0, "qUltraLow"]];
 const legacyLabels = [[128, "qLegacyFair"], [96, "qLegacyLow"], [0, "qLegacyUltraLow"]];
+const oggOpus = ['audio/ogg; codecs="opus"'];
 const formats = {
-  opus: { mime: ['audio/webm; codecs="opus"'], extensions: { ogg: ['audio/ogg; codecs="opus"'] }, labels: qualityLabels },
+  opus: { mime: ['audio/webm; codecs="opus"'], extensions: { ogg: oggOpus, opus: oggOpus }, labels: qualityLabels },
   aac: { mime: AAC_MIME_TYPES, container: "mp4", labels: qualityLabels },
   mp3: { mime: ["audio/mpeg"], labels: legacyLabels },
 };

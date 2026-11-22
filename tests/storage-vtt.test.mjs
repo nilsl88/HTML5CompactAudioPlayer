@@ -155,6 +155,33 @@ test("chapter cache replaces obsolete versions and rejects corrupt values", () =
   assert.equal(storage.readChapters("book", "en", 2, "/chapters.vtt"), "");
 });
 
+test("chapter cache applies the byte limit to Unicode text and legacy entries", () => {
+  const memory = new MemoryStorage();
+  const storage = new PlayerStorage(memory);
+  const url = "/chapters.vtt";
+  const key = storage.prefix + "compactPlayer:chapters:book:en:1";
+  const tooLarge = "漢".repeat(180_000);
+  const withinLimit = "漢".repeat(1000);
+  const atLimit = "é".repeat(256 * 1024);
+  assert.equal(storage.writeChapters("book", "en", 1, url, atLimit), true);
+  assert.equal(storage.readChapters("book", "en", 1, url), atLimit);
+  assert.equal(storage.writeChapters("book", "en", 1, url, atLimit + "a"), false);
+  assert.equal(storage.writeChapters("book", "en", 1, url, tooLarge), false);
+  memory.setItem(key, JSON.stringify({ url, text: tooLarge }));
+  assert.equal(storage.readChapters("book", "en", 1, url), "");
+  memory.setItem(key, JSON.stringify({ url, text: withinLimit }));
+  assert.equal(storage.readChapters("book", "en", 1, url), withinLimit);
+  const source = "embedded:audio.m4b";
+  const chapterKey = key + ":" + encodeURIComponent(source);
+  const cues = [{ start: 0, end: 10, title: tooLarge }];
+  assert.equal(storage.writeChapterData("book", "en", 1, source, { kind: "embedded", cues }), false);
+  memory.setItem(chapterKey, JSON.stringify({ kind: "embedded", sourceKey: source, cues }));
+  assert.equal(storage.readChapterData("book", "en", 1, source), null);
+  cues[0].title = withinLimit;
+  memory.setItem(chapterKey, JSON.stringify({ kind: "embedded", sourceKey: source, cues }));
+  assert.deepEqual(storage.readChapterData("book", "en", 1, source), { kind: "embedded", cues });
+});
+
 test("caches embedded chapter cues by active source", () => {
   const storage = new PlayerStorage(new MemoryStorage());
   const cues = [{ start: 0, end: 12, title: "Opening" }];

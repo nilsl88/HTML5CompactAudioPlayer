@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
-import { deferred, openPlayerPage } from "./player-page.mjs";
+import { deferred, Element, openPlayerPage } from "./player-page.mjs";
 import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
 import { PlayerStorage } from "../js/storage.js";
 import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
+import { RangeReader } from "../js/mp4-metadata.js";
+import { createCoverView } from "../js/cover.js";
+import { ChapterSession } from "../js/chapter-session.js";
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));
@@ -62,6 +65,126 @@ function rangedFetch(file, total = 262144) {
     };
   };
 }
+
+test("chapter cache keeps catalog aliases separate even when configuration IDs and URLs match", async () => {
+  const values = new Map();
+  const records = {
+    get length() { return values.size; },
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+    key: (index) => [...values.keys()][index] ?? null,
+  };
+  const storage = new PlayerStorage(records, "https://example.test/");
+  let title = "A";
+  let requests = 0;
+  const session = new ChapterSession({
+    fetchImpl: async () => { requests++; return new Response(`WEBVTT\n\n00:00.000 --> 00:01.000\n${title}`); },
+    openCache: storage.chapterCache.bind(storage), onStart() {}, onLoaded() {}, onFailure: assert.fail,
+  });
+  const book = { id: "same-config", cacheVersion: 1, languages: { en: {
+    chapterSource: "vtt", chapters: "chapters.vtt", baseUrl: "https://example.test/shared/",
+  } } };
+  session.reset(book, "en", null, "catalog-a");
+  await session.load();
+  assert.equal(session.cues[0].title, "A");
+  title = "B";
+  session.reset(book, "en", null, "catalog-b");
+  await session.load();
+  assert.equal(session.cues[0].title, "B");
+  assert.equal(requests, 2);
+  session.reset(book, "en", null, "catalog-a");
+  await session.load();
+  assert.equal(session.cues[0].title, "A");
+  assert.equal(requests, 2);
+});
+
+test("chapter session rejects another downloaded book and retries without caching its cues", async () => {
+  const { versionHeader, versionHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  const identityHeader = "x-compact-player-offline-book";
+  let savedBook = ["catalog-a", "book-a"];
+  const writes = [];
+  const failures = [];
+  const session = new ChapterSession({
+    fetchImpl: async () => new Response("WEBVTT\n\n00:00.000 --> 00:01.000\nChapter", {
+      headers: { [versionHeader]: versionHeaderValue(1), [identityHeader]: encodeURIComponent(JSON.stringify(savedBook)) },
+    }),
+    openCache: () => ({ read: () => null, beginWrite() {}, write: (entry) => writes.push(entry) }),
+    onStart() {}, onLoaded() {}, onFailure: (error) => failures.push(error),
+  });
+  const book = { id: "book-b", cacheVersion: 1, languages: { en: {
+    chapterSource: "vtt", chapters: "chapters.vtt", baseUrl: "https://example.test/shared/",
+  } } };
+  session.reset(book, "en", null, "catalog-b");
+  await session.load();
+  assert.equal(session.status, "failed");
+  assert.match(failures[0].message, /different book/i);
+  assert.equal(writes.length, 0);
+  savedBook = ["catalog-b", "book-b"];
+  await session.load({ force: true });
+  assert.equal(session.status, "loaded");
+  assert.equal(session.cues[0].title, "Chapter");
+  assert.equal(writes.length, 1);
+});
+
+test("downloaded chapters and MP4 metadata must match the selected book identity", async () => {
+  const { versionHeader, versionHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  const bookHeader = "x-compact-player-offline-book";
+  const identity = { episodeId: "catalog-b", configBookId: "book-b" };
+  const cachedHeaders = (episodeId, configBookId) => ({
+    [versionHeader]: versionHeaderValue(1),
+    [bookHeader]: encodeURIComponent(JSON.stringify([episodeId, configBookId])),
+  });
+  const text = "WEBVTT\n\n00:00.000 --> 00:01.000\nBook A";
+  const url = "https://example.test/shared.vtt";
+  const chapterFetch = (episodeId, configBookId) => async () => new Response(text, {
+    headers: cachedHeaders(episodeId, configBookId),
+  });
+  await assert.rejects(loadChapterFile(url, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: chapterFetch("catalog-a", "book-a"),
+  }), /different book/i);
+  assert.equal((await loadChapterFile(url, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: chapterFetch("catalog-b", "book-b"),
+  })).cues[0].title, "Book A");
+  assert.equal((await loadChapterFile(url, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: chapterFetch("catalog-b", null),
+  })).cues[0].title, "Book A");
+  await assert.rejects(loadChapterFile(url, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: async () => new Response(text, { headers: { [versionHeader]: versionHeaderValue(1) } }),
+  }), /different book/i);
+  assert.equal((await loadChapterFile(url, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: async () => new Response(text),
+  })).cues[0].title, "Book A");
+
+  const file = neroMetadata();
+  const source = "https://example.test/shared.m4b";
+  const range = rangedFetch(file, file.length);
+  const mp4Fetch = (episodeId, configBookId) => async (...args) => {
+    const response = await range(...args);
+    const original = response.headers.get("Content-Range");
+    response.headers = new Headers({ "Content-Range": original, ...cachedHeaders(episodeId, configBookId) });
+    return response;
+  };
+  await assert.rejects(loadEmbeddedMp4Chapters(source, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: mp4Fetch("catalog-a", "book-a"),
+  }), /different book/i);
+  assert.equal((await loadEmbeddedMp4Chapters(source, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: mp4Fetch("catalog-b", "book-b"),
+  })).length, 2);
+  await assert.rejects(loadEmbeddedMp4Cover(source, {
+    cacheVersion: 1, bookIdentity: identity, fetchImpl: mp4Fetch("catalog-a", "book-a"),
+  }), /different book/i);
+  let requests = 0;
+  const savedBookA = mp4Fetch("catalog-a", "book-a");
+  const sharedFetch = async (...args) => { requests++; return savedBookA(...args); };
+  await Promise.all([
+    loadEmbeddedMp4Cover(source, { cacheVersion: 1, bookIdentity: { episodeId: "catalog-a", configBookId: "book-a" }, fetchImpl: sharedFetch }),
+    loadEmbeddedMp4Chapters(source, { cacheVersion: 1, bookIdentity: { episodeId: "catalog-a", configBookId: "book-a" }, fetchImpl: sharedFetch }),
+  ]);
+  assert.equal(requests, 1);
+  await assert.rejects(loadEmbeddedMp4Chapters(source, { cacheVersion: 1, bookIdentity: identity, fetchImpl: sharedFetch }), /different book/i);
+  assert.equal(requests, 2);
+});
 
 test("embedded chapters have the same result from the network and both offline cache paths", async () => {
   const values = new Map();
@@ -320,23 +443,184 @@ function uint32Fields(...fields) {
   return new Uint8Array(view.buffer);
 }
 
-function quickTimeChapterFile(count, sizeTable, sample = Uint8Array.of(0, 1, 65), padding = 0, gap = 0) {
+function quickTimeChapterFile(count, sizeTable, sample = Uint8Array.of(0, 1, 65), padding = 0, gap = 0, mapping = null,
+  { referenceIds = [2], referencePayload = null, trackId = 2, otherTrackIds = [] } = {}) {
   const stride = sample.length + gap;
   const data = new Uint8Array(padding + (count - 1) * stride + sample.length);
   for (let i = padding; i < data.length; i += stride) data.set(sample, i);
   const media = atom("mdat", data);
   const offsets = gap ? Array.from({ length: count }, (_, i) => 8 + padding + i * stride) : [8 + padding];
-  const references = atom("trak", atom("tref", atom("chap", uint32Fields(2))));
+  const references = atom("trak", atom("tref", atom("chap", referencePayload || uint32Fields(...referenceIds))));
   const samples = atom("stbl", concatBytes(
     atom("stts", uint32Fields(0, 1, count, 1000)),
-    atom("stsc", uint32Fields(0, 1, 1, gap ? 1 : count, 1)),
+    atom("stsc", uint32Fields(0, 1, ...(mapping || [1, gap ? 1 : count, 1]))),
     atom("stco", uint32Fields(0, offsets.length, ...offsets)),
     atom("stsz", sizeTable),
   ));
-  const track = atom("trak", concatBytes(atom("tkhd", uint32Fields(0, 0, 0, 2)),
+  const track = atom("trak", concatBytes(atom("tkhd", uint32Fields(0, 0, 0, trackId)),
     atom("mdia", concatBytes(atom("mdhd", uint32Fields(0, 0, 0, 1000)), atom("minf", samples)))));
-  return concatBytes(media, atom("moov", concatBytes(references, track)));
+  const others = otherTrackIds.map((id) => atom("trak", atom("tkhd", uint32Fields(0, 0, 0, id))));
+  return concatBytes(media, atom("moov", concatBytes(references, track, ...others)));
 }
+
+test("missing referenced QuickTime tracks fail without caching and succeed on retry", async () => {
+  const url = "https://example.test/referenced.m4b";
+  const cacheWrites = [];
+  const cache = { read: () => null, beginWrite() {}, write: (result) => cacheWrites.push(result) };
+  let file = quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, 0, 0, null,
+    { referenceIds: [2], trackId: 3 });
+  let requests = 0;
+  const fetchImpl = (url, options) => {
+    requests++;
+    return rangedFetch(file, file.length)(url, options);
+  };
+  const load = () => loadChapters({ mode: "embedded", sourceUrl: url, sourceMime: "audio/mp4", cache, fetchImpl });
+  await assert.rejects(load(), /QuickTime.*track/i);
+  assert.equal(cacheWrites.length, 0);
+  file = quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, 0, 0, null,
+    { referenceIds: [9, 2], otherTrackIds: [3] });
+  const result = await load();
+  assert.deepEqual(result.cues, [
+    { start: 0, end: 1, title: "A" }, { start: 1, end: null, title: "A" },
+  ]);
+  assert.equal(requests, 2);
+  assert.deepEqual(cacheWrites, [result]);
+
+  const noReferences = quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, 0, 0, null, { referenceIds: [] });
+  assert.deepEqual(await loadEmbeddedMp4Chapters("https://example.test/no-references.m4b",
+    { fetchImpl: rangedFetch(noReferences, noReferences.length) }), []);
+
+  let partial = quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, 0, 0, null,
+    { referencePayload: Uint8Array.of(0, 2) });
+  const partialWrites = [];
+  const partialCache = { read: () => null, beginWrite() {}, write: (value) => partialWrites.push(value) };
+  let partialRequests = 0;
+  const fetchPartial = (url, options) => {
+    partialRequests++;
+    return rangedFetch(partial, partial.length)(url, options);
+  };
+  const loadPartial = () => loadChapters({ mode: "embedded", sourceUrl: "https://example.test/partial.m4b",
+    sourceMime: "audio/mp4", cache: partialCache, fetchImpl: fetchPartial });
+  await assert.rejects(loadPartial(), /QuickTime.*reference/i);
+  assert.equal(partialWrites.length, 0);
+  partial = quickTimeChapterFile(2, uint32Fields(0, 3, 2));
+  assert.equal((await loadPartial()).cues.length, 2);
+  assert.equal(partialRequests, 2);
+  assert.equal(partialWrites.length, 1);
+});
+
+test("incomplete QuickTime chapter tables fail without caching and succeed on retry", async () => {
+  const good = quickTimeChapterFile(2, uint32Fields(0, 3, 2));
+  const badFiles = [
+    ...[[1, 1, 1], [1, 0, 1], [2, 1, 1]].map((mapping) =>
+      quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, 0, 0, mapping)),
+    quickTimeChapterFile(2, uint32Fields(0, 0, 2, 3)),
+    ...["mdhd", "stbl", "stts", "stsc", "stsz", "stco"].map((name) => {
+      const bytes = good.slice();
+      const offset = bytes.findIndex((_, index) =>
+        name === String.fromCharCode(...bytes.subarray(index, index + 4)));
+      assert.notEqual(offset, -1);
+      bytes[offset] = 120;
+      return bytes;
+    }),
+  ];
+  const shortTiming = good.slice();
+  const timingOffset = shortTiming.findIndex((_, index) =>
+    "stts" === String.fromCharCode(...shortTiming.subarray(index, index + 4)));
+  new DataView(shortTiming.buffer).setUint32(timingOffset + 12, 1);
+  badFiles.push(shortTiming);
+  for (let file of badFiles) {
+    let written;
+    let requests = 0;
+    const cache = { read: () => null, beginWrite() {}, write: (result) => { written = result; } };
+    const fetchImpl = (url, options) => {
+      requests++;
+      return rangedFetch(file, file.length)(url, options);
+    };
+    const options = { mode: "embedded", sourceUrl: "https://example.test/broken.m4b",
+      sourceMime: "audio/mp4", fetchImpl, cache };
+    await assert.rejects(loadChapters(options), /QuickTime.*mapping/i);
+    assert.equal(written, undefined);
+    file = good;
+    const result = await loadChapters(options);
+    assert.equal(requests, 2);
+    assert.deepEqual(result.cues, [
+      { start: 0, end: 1, title: "A" }, { start: 1, end: null, title: "A" },
+    ]);
+    assert.equal(written, result);
+  }
+});
+
+test("MP4 metadata and QuickTime samples reject a changed strong HTTP validator", async () => {
+  const sample = Uint8Array.of(0, 1, 65);
+  const firstSample = 300_000;
+  const file = quickTimeChapterFile(2, uint32Fields(0, sample.length, 2), sample, firstSample - 8);
+  const moovStart = firstSample + sample.length * 2;
+  const modified = "Wed, 04 Mar 2026 11:00:00 GMT";
+  const date = "Wed, 04 Mar 2026 12:00:00 GMT";
+  for (const scenario of ["changed-moov", "changed-sample", "changed-date", "missing-etag", "range-ignored", "stable", "no-validator", "weak-etag"]) {
+    const requests = [];
+    let revisionSwitched = false;
+    const fetchImpl = async (_url, options) => {
+      const range = options.headers.Range;
+      const [, first, last] = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(first);
+      const end = Math.min(Number(last), file.length - 1);
+      const isSample = start === firstSample;
+      const isMoov = start >= moovStart;
+      const changed = revisionSwitched || (scenario === "changed-sample" && isSample) || (scenario === "changed-moov" && isMoov);
+      const changedDate = scenario === "changed-date" && isSample;
+      const headers = new Headers({ "Content-Range": `bytes ${start}-${end}/${file.length}`, Date: date });
+      if (scenario !== "no-validator" && scenario !== "changed-date" && !(scenario === "missing-etag" && isSample)) {
+        headers.set("ETag", scenario === "weak-etag" ? 'W/"old"' : changed ? '"new"' : '"old"');
+      }
+      if (scenario === "changed-date") headers.set("Last-Modified", changedDate ? date : modified);
+      requests.push({ range, condition: options.headers["If-Range"] });
+      if (scenario === "range-ignored" && isSample) return new Response(file, { status: 200, headers });
+      return new Response(file.slice(start, end + 1), { status: 206, headers });
+    };
+    const result = loadEmbeddedMp4Chapters("https://example.test/versioned.m4b", { fetchImpl });
+    if (scenario.startsWith("changed") || scenario === "missing-etag" || scenario === "range-ignored") {
+      await assert.rejects(result, /metadata|range|version/i, scenario);
+    } else {
+      assert.equal((await result).length, 2, scenario);
+    }
+    const expected = scenario === "no-validator" || scenario === "weak-etag" ? undefined
+      : scenario === "changed-date" ? modified : '"old"';
+    assert.equal(requests[0].condition, undefined);
+    assert.ok(requests.length > 1);
+    assert.ok(requests.slice(1).every((request) => request.condition === expected), scenario);
+    if (scenario === "changed-sample") {
+      revisionSwitched = true;
+      const previousRequests = requests.length;
+      assert.equal((await loadEmbeddedMp4Chapters("https://example.test/versioned.m4b", { fetchImpl })).length, 2);
+      assert.equal(requests[previousRequests].range, "bytes=0-262143");
+      assert.equal(requests[previousRequests].condition, undefined);
+    }
+  }
+});
+
+test("cross-origin MP4 ranges compare exposed ETags without requiring an If-Range preflight", async () => {
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", { configurable: true, value: new URL("https://player.test/") });
+  try {
+    const requests = [];
+    const fetchImpl = async (_url, options) => {
+      requests.push(options.headers);
+      const start = requests.length - 1;
+      return new Response(Uint8Array.of(start), { status: 206, headers: {
+        "Content-Range": `bytes ${start}-${start}/2`, ETag: start ? '"new"' : '"old"',
+      } });
+    };
+    const reader = new RangeReader("https://cdn.test/book.m4b", { fetchImpl });
+    await reader.read(0, 1);
+    await assert.rejects(reader.read(1, 2), /version changed/);
+    assert.equal(requests[1]["If-Range"], undefined);
+  } finally {
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else delete globalThis.location;
+  }
+});
 
 test("QuickTime chapters reuse the initial range and fetch neighboring titles together", async () => {
   const count = 100;
@@ -400,9 +684,14 @@ test("QuickTime chapter sizes respect the sample limit and require a complete si
     [2, uint32Fields(0, 3), 0],
   ]) {
     const file = quickTimeChapterFile(count, table);
-    const cues = await loadEmbeddedMp4Chapters("https://example.test/sample-sizes.m4b", { fetchImpl: rangedFetch(file, file.length) });
+    const result = loadEmbeddedMp4Chapters("https://example.test/sample-sizes.m4b", { fetchImpl: rangedFetch(file, file.length) });
+    if (!expected) {
+      await assert.rejects(result, /QuickTime.*mapping/i);
+      continue;
+    }
+    const cues = await result;
     assert.equal(cues.length, expected);
-    if (expected) assert.deepEqual(cues.at(-1), { start: expected - 1, end: null, title: "A" });
+    assert.deepEqual(cues.at(-1), { start: expected - 1, end: null, title: "A" });
   }
 });
 
@@ -424,12 +713,15 @@ test("an embedded cover follows a new quality or fallback after the first file f
       languages: { en: { sources: { aac: { 96: "new.m4b", 128: "old.m4b" } } } } };
     const { audio, elements } = await openPlayerPage(book, (url, opts) => {
       requests.push(new URL(url).pathname.split("/").at(-1));
+      if (url.endsWith("cover.jpg")) {
+        return new Response(change === "external cover" ? Uint8Array.of(0xff, 0xd8, 0xff, 0xe0) : null,
+          { status: change === "external cover" ? 200 : 404, headers: { "content-type": "image/jpeg" } });
+      }
       return url.endsWith("old.m4b") ? new Response(null, { status: 404 }) : range(url, opts);
     });
     const image = elements.get("coverImg");
-    if (change === "external cover") image.onload();
-    else image.onerror();
     await settle();
+    if (change === "external cover") image.onload();
     if (change === "fallback") {
       elements.get("playPauseBtn").dispatchEvent(new Event("click"));
       audio.error = { code: 2 };
@@ -442,15 +734,116 @@ test("an embedded cover follows a new quality or fallback after the first file f
     }
     await settle();
     if (change === "external cover") {
-      assert.deepEqual(requests, []);
-      assert.match(image.src, /cover\.jpg$/);
+      assert.deepEqual(requests, ["cover.jpg"]);
+      assert.match(image.src, /^blob:/);
     } else {
-      assert.deepEqual(requests, ["old.m4b", "new.m4b"], change);
+      assert.deepEqual(requests, ["cover.jpg", "old.m4b", "new.m4b"], change);
       assert.match(image.src, /^blob:/);
       image.onload();
     }
     assert.equal(elements.get("coverButton").hidden, false);
   }
+});
+
+test("an already displayed embedded cover follows quality changes and fallback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const revoked = t.mock.method(URL, "revokeObjectURL");
+  const oldImage = Uint8Array.of(0xff, 0xd8, 0xff, 0xe0);
+  const newImage = Uint8Array.of(0xff, 0xd8, 0xff, 0xe1);
+  const oldRange = rangedFetch(coverMetadata(oldImage, 13).file);
+  const newRange = rangedFetch(coverMetadata(newImage, 13).file);
+  for (const change of ["quality", "fallback"]) {
+    const requests = [];
+    const book = { id: "sample", defaultLanguage: "en", coverSource: "embedded",
+      languages: { en: { sources: { aac: { 96: "new.m4b", 128: "old.m4b" } } } } };
+    const { audio, elements } = await openPlayerPage(book, (url, opts) => {
+      requests.push(new URL(url).pathname.split("/").at(-1));
+      return (url.endsWith("old.m4b") ? oldRange : newRange)(url, opts);
+    });
+    const image = elements.get("coverImg");
+    const firstUrl = image.src;
+    assert.match(firstUrl, /^blob:/);
+    const oldLoad = image.onload;
+    image.onload();
+    assert.deepEqual([...new Uint8Array(await (await fetch(firstUrl)).arrayBuffer())], [...oldImage]);
+    if (change === "fallback") {
+      elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+      audio.error = { code: 2 };
+      audio.dispatchEvent(new Event("error"));
+    } else {
+      const quality = elements.get("qualitySelect");
+      quality.value = "aac-96";
+      quality.dispatchEvent(new Event("change"));
+    }
+    await settle();
+    assert.deepEqual(requests, ["old.m4b", "new.m4b"], change);
+    assert.notEqual(image.src, firstUrl);
+    assert.ok(revoked.mock.calls.some((call) => call.arguments[0] === firstUrl));
+    assert.deepEqual([...new Uint8Array(await (await fetch(image.src)).arrayBuffer())], [...newImage]);
+    oldLoad();
+    assert.equal(elements.get("coverButton").hidden, true);
+    image.onload();
+    assert.equal(elements.get("coverButton").hidden, false);
+  }
+});
+
+test("a pending embedded cover cannot replace the cover of a newer source", async () => {
+  const oldResponse = deferred();
+  const newerImage = Uint8Array.of(0xff, 0xd8, 0xff, 0xe2);
+  const newRange = rangedFetch(coverMetadata(newerImage, 13).file);
+  const image = new Element();
+  const button = new Element();
+  let shown = 0;
+  const view = createCoverView(image, button, {
+    fetchImpl: (url, options) => url.endsWith("/old.m4b") ? oldResponse.promise : newRange(url, options),
+    onShown: () => { shown++; }, onFailure: assert.fail,
+  });
+  const book = { cacheVersion: 1, coverSource: "embedded" };
+  view.applyCover(book, "en", { url: "https://example.test/old.m4b" });
+  view.applyCover(book, "en", { url: "https://example.test/new.m4b" });
+  await settle();
+  const latestUrl = image.src;
+  assert.match(latestUrl, /^blob:/);
+  const oldRange = rangedFetch(coverMetadata(Uint8Array.of(0xff, 0xd8, 0xff, 0xe0), 13).file);
+  oldResponse.resolve(await oldRange("https://example.test/old.m4b", { headers: { Range: "bytes=0-262143" } }));
+  await settle();
+  assert.equal(image.src, latestUrl);
+  assert.deepEqual([...new Uint8Array(await (await fetch(latestUrl)).arrayBuffer())], [...newerImage]);
+  image.onload();
+  assert.equal(shown, 1);
+  view.clearCover();
+});
+
+test("auto cover follows the active source after falling back to embedded artwork", async () => {
+  const image = new Element();
+  const button = new Element();
+  const requests = [];
+  const oldImage = Uint8Array.of(0xff, 0xd8, 0xff, 0xe0);
+  const newImage = Uint8Array.of(0xff, 0xd8, 0xff, 0xe1);
+  const view = createCoverView(image, button, {
+    fetchImpl: (url, options) => {
+      requests.push(url);
+      const contents = url.endsWith("/old.m4b") ? oldImage : newImage;
+      return rangedFetch(coverMetadata(contents, 13).file)(url, options);
+    },
+    onShown: () => {}, onFailure: assert.fail,
+  });
+  const book = { cacheVersion: 1, coverSource: "auto", cover: "missing.jpg",
+    bookBaseUrl: "https://example.test/media/book/" };
+  view.applyCover(book, "en", { url: "https://example.test/old.m4b" });
+  image.onerror();
+  await settle();
+  const firstUrl = image.src;
+  image.onload();
+  view.applyCover(book, "en", { url: "https://example.test/new.m4b" });
+  await settle();
+  assert.deepEqual(requests, ["https://example.test/old.m4b", "https://example.test/new.m4b"]);
+  assert.notEqual(image.src, firstUrl);
+  assert.deepEqual([...new Uint8Array(await (await fetch(image.src)).arrayBuffer())], [...newImage]);
+  image.onload();
+  assert.equal(button.hidden, false);
+  view.clearCover();
 });
 
 test("a late cover image load after a language change cannot replace the current cover", async (t) => {

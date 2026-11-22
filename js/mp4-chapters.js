@@ -57,6 +57,7 @@ function chapterReferences(trak) {
   const atom = findAtoms(payload(trak), "chap", { absoluteStart: trak.start + trak.headerSize })[0];
   if (!atom) return [];
   const bytes = new Uint8Array(payload(atom));
+  if (atom.truncated || bytes.length % 4 !== 0) throw new Error("The QuickTime chapter track reference is incomplete.");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const values = [];
   for (let offset = 0; offset + 4 <= bytes.length; offset += 4) values.push(view.getUint32(offset, false));
@@ -75,34 +76,38 @@ function tableEntries(atom, entryWidth, limit, mapper) {
 }
 
 function parseChapterTrack(trak) {
+  const invalidMapping = () => new Error("The QuickTime chapter tables or chunk mapping are incomplete or invalid.");
   const mdhd = findAtoms(payload(trak), "mdhd", { absoluteStart: trak.start + trak.headerSize })[0];
   const stbl = findAtoms(payload(trak), "stbl", { absoluteStart: trak.start + trak.headerSize })[0];
-  if (!mdhd || !stbl) return null;
+  if (!mdhd || !stbl) throw invalidMapping();
   const mdhdBytes = new Uint8Array(payload(mdhd));
   const mdhdView = new DataView(mdhdBytes.buffer, mdhdBytes.byteOffset, mdhdBytes.byteLength);
   const mdhdVersion = mdhdBytes[0];
   const timescaleOffset = mdhdVersion === 1 ? 20 : 12;
   const timescale = mdhdBytes.length >= timescaleOffset + 4 ? mdhdView.getUint32(timescaleOffset, false) : 0;
-  if (!timescale) return null;
+  if (!timescale) throw invalidMapping();
   const stts = findAtoms(payload(stbl), "stts", { absoluteStart: stbl.start + stbl.headerSize })[0];
   const stsc = findAtoms(payload(stbl), "stsc", { absoluteStart: stbl.start + stbl.headerSize })[0];
   const stsz = findAtoms(payload(stbl), "stsz", { absoluteStart: stbl.start + stbl.headerSize })[0];
   const stco = findAtoms(payload(stbl), "stco", { absoluteStart: stbl.start + stbl.headerSize })[0];
   const co64 = findAtoms(payload(stbl), "co64", { absoluteStart: stbl.start + stbl.headerSize })[0];
-  if (!stts || !stsc || !stsz || (!stco && !co64)) return null;
+  if (!stts || !stsc || !stsz || (!stco && !co64)) throw invalidMapping();
   const sizeView = new DataView(stsz.buffer, stsz.payloadStart, stsz.payloadEnd - stsz.payloadStart);
-  if (sizeView.byteLength < 12) return null;
+  if (sizeView.byteLength < 12) throw invalidMapping();
   const fixedSize = sizeView.getUint32(4, false);
   const declaredCount = sizeView.getUint32(8, false);
-  if (!fixedSize && 12 + declaredCount * 4 > sizeView.byteLength) return null;
+  if (!fixedSize && 12 + declaredCount * 4 > sizeView.byteLength) throw invalidMapping();
   const sampleCount = Math.min(declaredCount, MAX_QUICKTIME_SAMPLES);
   const durations = [];
   for (const entry of tableEntries(stts, 8, sampleCount, (view, offset) => ({ count: view.getUint32(offset, false), delta: view.getUint32(offset + 4, false) }))) {
     for (let index = 0; index < entry.count && durations.length < sampleCount; index += 1) durations.push(entry.delta);
   }
-  if (durations.length !== sampleCount) return null;
+  if (durations.length !== sampleCount) throw invalidMapping();
   const offsets = tableEntries(co64 || stco, co64 ? 8 : 4, sampleCount, (view, offset) => co64 ? uint64(view, offset) : view.getUint32(offset, false));
   const chunks = tableEntries(stsc, 12, sampleCount, (view, offset) => ({ firstChunk: view.getUint32(offset, false), samplesPerChunk: view.getUint32(offset + 4, false) }));
+  if (sampleCount && (!chunks.length || chunks[0].firstChunk !== 1
+    || chunks.some((entry, index) => !entry.samplesPerChunk
+      || (index > 0 && entry.firstChunk <= chunks[index - 1].firstChunk)))) throw invalidMapping();
   const samples = [];
   let timestamp = 0;
   let sampleIndex = 0;
@@ -111,18 +116,19 @@ function parseChapterTrack(trak) {
     const chunkNumber = chunkIndex + 1;
     while (mapping + 1 < chunks.length && chunks[mapping + 1].firstChunk <= chunkNumber) mapping += 1;
     const entry = chunks[mapping];
-    if (!entry || entry.firstChunk > chunkNumber) return null;
+    if (!entry || entry.firstChunk > chunkNumber) throw invalidMapping();
     let offset = offsets[chunkIndex];
     for (let count = 0; count < entry.samplesPerChunk && sampleIndex < sampleCount; count += 1) {
       const size = fixedSize || sizeView.getUint32(12 + sampleIndex * 4, false);
-      if (Number.isSafeInteger(offset) && size > 0 && size <= MP4_METADATA_LIMIT_BYTES) {
-        samples.push({ offset, size, start: timestamp / timescale });
-      }
+      if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(offset + size)
+        || size <= 0 || size > MP4_METADATA_LIMIT_BYTES) throw invalidMapping();
+      samples.push({ offset, size, start: timestamp / timescale });
       timestamp += durations[sampleIndex];
       offset += size;
       sampleIndex += 1;
     }
   }
+  if (sampleIndex !== sampleCount) throw invalidMapping();
   return samples;
 }
 
@@ -162,10 +168,24 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
   if (neroChapters.length) return normalizeChapters(neroChapters);
 
   const tracks = findAtoms(moovBuffer, "trak");
-  const references = new Set(tracks.flatMap(chapterReferences));
+  let references;
+  try { references = new Set(tracks.flatMap(chapterReferences)); }
+  catch (error) {
+    metadata.discard();
+    throw error;
+  }
+  if (!references.size) return [];
   const chapterTrack = tracks.find((track) => references.has(parseTrackId(track)));
-  if (!chapterTrack) return [];
-  const samples = parseChapterTrack(chapterTrack);
+  if (!chapterTrack) {
+    metadata.discard();
+    throw new Error("The referenced QuickTime chapter track was not found.");
+  }
+  let samples;
+  try { samples = parseChapterTrack(chapterTrack); }
+  catch (error) {
+    metadata.discard();
+    throw error;
+  }
   if (!samples?.length) return [];
   const reader = new RangeReader(url, options, metadata);
   const chapters = [];
@@ -179,7 +199,12 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
       end = offset + size;
       next++;
     }
-    const bytes = await reader.read(start, end);
+    let bytes;
+    try { bytes = await reader.read(start, end); }
+    catch (error) {
+      metadata.discard();
+      throw error;
+    }
     for (; i < next; i++) {
       const sample = samples[i];
       const offset = sample.offset - start;

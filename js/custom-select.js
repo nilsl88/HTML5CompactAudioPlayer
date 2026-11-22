@@ -49,6 +49,8 @@ export function createCustomSelects(document, window) {
   function closeCustomSelect(state, restoreFocus = false) {
     if (!state) return;
     state.menu.hidden = true;
+    state.activeIndex = -1;
+    state.activeValue = undefined;
     state.button.setAttribute("aria-expanded", "false");
     state.button.removeAttribute("aria-activedescendant");
     state.wrapper.classList.remove("opens-up");
@@ -64,6 +66,7 @@ export function createCustomSelects(document, window) {
   function setCustomSelectActive(state, index) {
     if (!state.options.length) return;
     state.activeIndex = index;
+    state.activeValue = state.select.options[index]?.value;
     for (const [optionIndex, option] of state.options.entries()) option.classList.toggle("is-active", optionIndex === index);
     const active = state.options[index];
     if (!active) state.button.removeAttribute("aria-activedescendant");
@@ -170,8 +173,14 @@ export function createCustomSelects(document, window) {
     const selected = options[select.selectedIndex];
     state.button.textContent = selected?.textContent || "";
     state.button.disabled = select.disabled;
-    if (state.menu.hidden) state.button.setAttribute("aria-expanded", "false");
-    if (state.menu.hidden) state.button.removeAttribute("aria-activedescendant");
+    if (state.menu.hidden) {
+      state.button.setAttribute("aria-expanded", "false");
+      state.button.removeAttribute("aria-activedescendant");
+    } else {
+      const active = options.findIndex((option) => option.value === state.activeValue && !option.disabled);
+      if (select.disabled || active < 0) closeCustomSelect(state);
+      else setCustomSelectActive(state, active);
+    }
   }
 
   function destroyCustomSelect(select) {
