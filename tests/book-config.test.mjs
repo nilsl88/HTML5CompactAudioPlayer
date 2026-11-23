@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { BookConfigStore, queryBookId } from "../js/book-config.js";
-import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js";
+import { BookConfigStore, queryBookId } from "../js/book-config.js?v=19";
+import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=19";
 
 const baseUrl = "https://example.test/";
 const configuration = (id = "one") => ({

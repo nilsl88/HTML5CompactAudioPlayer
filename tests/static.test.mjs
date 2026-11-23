@@ -165,9 +165,11 @@ test("offline controls are semantic and media opts into service-worker handling"
 test("service-worker shell and versioned entry points stay in sync", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("js/player-app.js", root), "utf8");
+  const offline = await readFile(new URL("js/offline.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
   const version = worker.match(/const SHELL_VERSION = "v(\d+)"/)?.[1];
   assert.ok(version);
+  assert.ok(offline.includes('new URL("sw.js?v=' + version + '", this.baseUrl)'));
   const script = "./player.js?v=" + version;
   const style = "./player.css?v=" + version;
   const strings = "./i18n.js?v=" + version;
@@ -177,7 +179,28 @@ test("service-worker shell and versioned entry points stay in sync", async () =>
   const urls = worker.match(/const SHELL_URLS = \[([\s\S]*?)\];/)[1];
   const paths = new Set([...urls.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
   const modules = (await readdir(new URL("js/", root))).filter((name) => name.endsWith(".js"));
-  for (const path of [script, style, strings, ...modules.map((name) => "./js/" + name)]) {
+  for (const path of [script, style, strings, "./?v=" + version, "./index.html?v=" + version, ...modules.map((name) => "./js/" + name + "?v=" + version)]) {
     assert.ok(paths.has(path), "Missing offline shell asset " + path);
+  }
+});
+
+test("all local module imports and worker scripts use the shell version", async () => {
+  const worker = await readFile(new URL("sw.js", root), "utf8");
+  const version = worker.match(/const SHELL_VERSION = "v(\d+)"/)?.[1];
+  const shellUrls = worker.match(/const SHELL_URLS = \[([\s\S]*?)\];/)[1];
+  const paths = new Set([...shellUrls.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+  const modules = (await readdir(new URL("js/", root))).filter((name) => name.endsWith(".js"));
+  for (const filename of ["player.js", "i18n.js", ...modules.map((name) => "js/" + name)]) {
+    const file = new URL(filename, root);
+    const source = await readFile(file, "utf8");
+    for (const match of source.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'](\.{1,2}\/[^"']+\.js(?:\?[^"']*)?)["']/g)) {
+      const imported = new URL(match[1], file);
+      assert.equal(imported.search, "?v=" + version, `${filename}: ${match[1]}`);
+      const path = "./" + imported.pathname.slice(root.pathname.length) + imported.search;
+      assert.ok(paths.has(path), `${filename}: shell is missing ${path}`);
+    }
+  }
+  for (const match of worker.matchAll(/"(\.\/js\/[^"']+\.js(?:\?[^"']*)?)"/g)) {
+    assert.match(match[1], new RegExp("\\?v=" + version + "$"));
   }
 });

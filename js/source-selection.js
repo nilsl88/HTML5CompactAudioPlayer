@@ -1,6 +1,6 @@
-import { CODECS, extensionFromPath, mimeCandidatesFor } from "./codecs.js";
-import { resolveLanguageAsset } from "./config.js";
-export { AAC_MIME_TYPES, extensionFromPath, mimeFor, mimeCandidatesFor } from "./codecs.js";
+import { CODECS, extensionFromPath, mimeCandidatesFor } from "./codecs.js?v=19";
+import { resolveLanguageAsset } from "./config.js?v=19";
+export { AAC_MIME_TYPES, extensionFromPath, mimeFor, mimeCandidatesFor } from "./codecs.js?v=19";
 
 export const CODEC_PREFERENCE = [...CODECS];
 

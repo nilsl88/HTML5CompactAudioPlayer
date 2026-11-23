@@ -1,6 +1,6 @@
 import { setImmediate as settle } from "node:timers/promises";
-import { startPlayer } from "../js/player-app.js";
-import { PlayerStorage } from "../js/storage.js";
+import { startPlayer } from "../js/player-app.js?v=19";
+import { PlayerStorage } from "../js/storage.js?v=19";
 
 export function deferred() {
   let resolve;

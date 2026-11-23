@@ -1,6 +1,6 @@
-import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js";
-import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js";
-export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js";
+import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js?v=19";
+import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=19";
+export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=19";
 export const MP4_COVER_LIMIT_BYTES = 10 * 1024 * 1024;
 const MAX_QUICKTIME_SAMPLES = 10_000;
 const MAX_SAMPLE_GAP_BYTES = 4096;

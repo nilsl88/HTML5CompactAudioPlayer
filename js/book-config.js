@@ -1,7 +1,7 @@
-import { normalizeLibrary, parseBookConfig, parseJson } from "./config.js";
-export { validateOfflineBookConfig } from "./offline-selection.js";
-import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js";
-import "./offline-manifest.js";
+import { normalizeLibrary, parseBookConfig, parseJson } from "./config.js?v=19";
+export { validateOfflineBookConfig } from "./offline-selection.js?v=19";
+import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=19";
+import "./offline-manifest.js?v=19";
 
 function isDownloadedResponse(response) {
   return response.headers?.get?.(globalThis.CompactPlayerOfflineManifest.versionHeader) != null;

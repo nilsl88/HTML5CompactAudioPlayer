@@ -1,5 +1,5 @@
-import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js";
-import { setText } from "./utils.js";
+import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js?v=19";
+import { setText } from "./utils.js?v=19";
 
 export function createOfflinePanel(window, { offline, t, getLocale, getSelection, isOnline,
   waitForPriority, onRepair, reportError, showToast }) {

@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js";
-import { PlayerStorage } from "../js/storage.js";
-import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js";
-import { RangeReader } from "../js/mp4-metadata.js";
-import { createCoverView } from "../js/cover.js";
-import { ChapterSession } from "../js/chapter-session.js";
+import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=19";
+import { PlayerStorage } from "../js/storage.js?v=19";
+import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=19";
+import { RangeReader } from "../js/mp4-metadata.js?v=19";
+import { createCoverView } from "../js/cover.js?v=19";
+import { ChapterSession } from "../js/chapter-session.js?v=19";
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));

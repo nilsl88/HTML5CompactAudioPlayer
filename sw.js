@@ -1,52 +1,52 @@
-importScripts("./js/offline-manifest.js", "./js/offline-media-response.js");
+importScripts("./js/offline-manifest.js?v=19", "./js/offline-media-response.js?v=19");
 const { validManifest, metaCache: META_CACHE, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue, bookHeader, bookHeaderValue,
   offlineMetaUrl, offlineChunkUrl, damagedChunkUrl } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v18";
+const SHELL_VERSION = "v19";
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const SHELL_CACHE = SHELL_CACHE_PREFIX + SHELL_VERSION;
 const SHELL_NETWORK_WAIT_MS = 3000;
 const SHELL_URLS = [
-  "./",
-  "./index.html",
-  "./player.css?v=18",
-  "./player.js?v=18",
-  "./i18n.js?v=18",
-  "./js/player-app.js",
-  "./js/availability-cache.js",
-  "./js/chapter-cache.js",
-  "./js/chapter-panel.js",
-  "./js/http-range.js",
-  "./js/mp4-atoms.js",
-  "./js/mp4-metadata.js",
-  "./js/offline-media-response.js",
-  "./js/offline-panel.js",
-  "./js/offline-selection.js",
-  "./js/availability-session.js",
-  "./js/availability.js",
-  "./js/chapters.js",
-  "./js/chapter-session.js",
-  "./js/config.js",
-  "./js/codecs.js",
-  "./js/preferences.js",
-  "./js/cover.js",
-  "./js/book-config.js",
-  "./js/book-selection.js",
-  "./js/dialogs.js",
-  "./js/custom-select.js",
-  "./js/media-controller.js",
-  "./js/media-session.js",
-  "./js/mp4-chapters.js",
-  "./js/offline.js",
-  "./js/offline-book-store.js",
-  "./js/progress-writer.js",
-  "./js/offline-transfer.js",
-  "./js/offline-lock.js",
-  "./js/offline-manifest.js",
-  "./js/source-selection.js",
-  "./js/storage.js",
-  "./js/sleep-timer.js",
-  "./js/utils.js",
-  "./js/vtt.js",
+  "./?v=19",
+  "./index.html?v=19",
+  "./player.css?v=19",
+  "./player.js?v=19",
+  "./i18n.js?v=19",
+  "./js/player-app.js?v=19",
+  "./js/availability-cache.js?v=19",
+  "./js/chapter-cache.js?v=19",
+  "./js/chapter-panel.js?v=19",
+  "./js/http-range.js?v=19",
+  "./js/mp4-atoms.js?v=19",
+  "./js/mp4-metadata.js?v=19",
+  "./js/offline-media-response.js?v=19",
+  "./js/offline-panel.js?v=19",
+  "./js/offline-selection.js?v=19",
+  "./js/availability-session.js?v=19",
+  "./js/availability.js?v=19",
+  "./js/chapters.js?v=19",
+  "./js/chapter-session.js?v=19",
+  "./js/config.js?v=19",
+  "./js/codecs.js?v=19",
+  "./js/preferences.js?v=19",
+  "./js/cover.js?v=19",
+  "./js/book-config.js?v=19",
+  "./js/book-selection.js?v=19",
+  "./js/dialogs.js?v=19",
+  "./js/custom-select.js?v=19",
+  "./js/media-controller.js?v=19",
+  "./js/media-session.js?v=19",
+  "./js/mp4-chapters.js?v=19",
+  "./js/offline.js?v=19",
+  "./js/offline-book-store.js?v=19",
+  "./js/progress-writer.js?v=19",
+  "./js/offline-transfer.js?v=19",
+  "./js/offline-lock.js?v=19",
+  "./js/offline-manifest.js?v=19",
+  "./js/source-selection.js?v=19",
+  "./js/storage.js?v=19",
+  "./js/sleep-timer.js?v=19",
+  "./js/utils.js?v=19",
+  "./js/vtt.js?v=19",
 ];
 const SHELL_PATHS = new Set(SHELL_URLS.map((path) => new URL(path, self.registration.scope).pathname));
 const PLAYER_PAGES = new Set(["./", "index.html"].map((path) => new URL(path, self.registration.scope).pathname));
@@ -138,16 +138,38 @@ function cachedFallback(request) {
 async function cachedShell(request) {
   const shell = await caches.open(SHELL_CACHE);
   if (request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname)) {
-    return await shell.match(scopeUrl("index.html")) || shell.match(scopeUrl("./"));
+    return await shell.match(scopeUrl(`index.html?v=${SHELL_VERSION.slice(1)}`)) || shell.match(scopeUrl(`./?v=${SHELL_VERSION.slice(1)}`));
   }
-  return shell.match(request, { ignoreSearch: true });
+  return shell.match(request);
+}
+
+async function validShellPage(response, allowNewer = false) {
+  if (!response?.ok) return false;
+  const html = (await response.clone().text()).replace(/<!--[\s\S]*?-->/g, "");
+  const attributeValue = (tag, attribute) => {
+    const match = tag.match(new RegExp(`\\b${attribute}\\s*=\\s*(["'])(.*?)\\1`, "i"));
+    return match?.[2];
+  };
+  const scripts = html.match(/<script\b[^>]*>/gi) || [];
+  const links = html.match(/<link\b[^>]*>/gi) || [];
+  const scriptVersions = scripts.filter((tag) => attributeValue(tag, "type") === "module")
+    .map((tag) => attributeValue(tag, "src")?.match(/^\.\/player\.js\?v=(\d+)$/)?.[1]);
+  const styleVersions = links.filter((tag) => attributeValue(tag, "rel") === "stylesheet")
+    .map((tag) => attributeValue(tag, "href")?.match(/^\.\/player\.css\?v=(\d+)$/)?.[1]);
+  const current = Number(SHELL_VERSION.slice(1));
+  return scriptVersions.some((version) => version && styleVersions.includes(version)
+    && (allowNewer ? Number(version) >= current : Number(version) === current));
 }
 
 async function fetchShell(request) {
   const controller = typeof AbortSignal.any === "function" ? new AbortController() : null;
-  const network = controller
-    ? fetch(request, { signal: AbortSignal.any([request.signal, controller.signal]) })
-    : fetch(request);
+  const isPage = request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname);
+  const signal = controller ? AbortSignal.any([request.signal, controller.signal]) : request.signal;
+  const network = fetch(request, { signal })
+    .then(async (response) => {
+      if (isPage && response.ok && !await validShellPage(response, true)) throw new Error("Player shell version does not match the worker");
+      return response;
+    });
   let timer;
   try {
     const deadline = new Promise((resolve) => { timer = setTimeout(resolve, SHELL_NETWORK_WAIT_MS); });
@@ -184,9 +206,19 @@ async function networkFirst(request) {
 
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
-    const cache = await caches.open(SHELL_CACHE);
-    await cache.addAll(SHELL_URLS.map((path) => new Request(scopeUrl(path), { cache: "reload" })));
-    await self.skipWaiting();
+    const stagingName = `${SHELL_CACHE}:install:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const staging = await caches.open(stagingName);
+    try {
+      await staging.addAll(SHELL_URLS.map((path) => new Request(scopeUrl(path), { cache: "reload" })));
+      for (const page of [`./?v=${SHELL_VERSION.slice(1)}`, `./index.html?v=${SHELL_VERSION.slice(1)}`]) {
+        if (!await validShellPage(await staging.match(scopeUrl(page)))) throw new Error("Player shell version does not match the worker");
+      }
+      const cache = await caches.open(SHELL_CACHE);
+      for (const request of await staging.keys()) await cache.put(request, await staging.match(request));
+      await self.skipWaiting();
+    } finally {
+      await caches.delete(stagingName);
+    }
   })());
 });
 

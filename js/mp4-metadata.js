@@ -1,7 +1,7 @@
-import { parseContentRange } from "./http-range.js";
-import { findTopLevelAtom } from "./mp4-atoms.js";
-import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js";
-import "./offline-manifest.js";
+import { parseContentRange } from "./http-range.js?v=19";
+import { findTopLevelAtom } from "./mp4-atoms.js?v=19";
+import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js?v=19";
+import "./offline-manifest.js?v=19";
 
 const { checkResponseVersion, strongETag, strongLastModified } = globalThis.CompactPlayerOfflineManifest;
 

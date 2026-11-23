@@ -1,9 +1,9 @@
-import "./offline-manifest.js";
-import { createAbortError, fetchWithRetry } from "./utils.js";
-import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js";
-import { withOfflineLock } from "./offline-lock.js";
-import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange } from "./offline-transfer.js";
-export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js";
+import "./offline-manifest.js?v=19";
+import { createAbortError, fetchWithRetry, isPlayerServiceWorker } from "./utils.js?v=19";
+import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js?v=19";
+import { withOfflineLock } from "./offline-lock.js?v=19";
+import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange } from "./offline-transfer.js?v=19";
+export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js?v=19";
 
 const PREPARATION_TIMEOUT_MS = 20_000;
 const MEBIBYTE = 1024 * 1024;
@@ -13,7 +13,7 @@ const {
   validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength,
 } = globalThis.CompactPlayerOfflineManifest;
 export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
-export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js";
+export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js?v=19";
 
 export function completedBytes(manifest) {
   if (!validManifest(manifest)) return 0;
@@ -128,10 +128,10 @@ export class OfflineManager {
 
   async init() {
     if (!this.supported) { this.emit(); return this.snapshot(); }
-    const script = new URL("sw.js", this.baseUrl);
+    const script = new URL("sw.js?v=19", this.baseUrl);
     if (!this.listensForDamage && this.navigator.serviceWorker.addEventListener) {
       this.navigator.serviceWorker.addEventListener("message", (event) => {
-        if (event.source?.scriptURL !== script.href || event.data?.type !== "compact-player-damaged-chunk"
+        if (!isPlayerServiceWorker(event.source, this.baseUrl) || event.data?.type !== "compact-player-damaged-chunk"
           || event.data.scope !== this.baseUrl || !event.data.downloadId) return;
         const saved = [this.active, this.repairable, this.staging].find((item) => item?.downloadId === event.data.downloadId);
         if (!Number.isSafeInteger(event.data.index) || event.data.index < 0 || (saved && event.data.index >= saved.totalChunks)) return;
@@ -144,8 +144,8 @@ export class OfflineManager {
     let controlsPage = false;
     try {
       const workers = this.navigator.serviceWorker;
-      controlsPage = workers.controller?.scriptURL === script.href;
-      await withTimeout(workers.register(script, { scope: new URL(this.baseUrl).pathname }), 8000);
+      controlsPage = isPlayerServiceWorker(workers.controller, this.baseUrl);
+      await withTimeout(workers.register(script, { scope: new URL(this.baseUrl).pathname, updateViaCache: "none" }), 8000);
       await withTimeout(workers.ready, 8000);
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not register the offline player.", error);
