@@ -1,7 +1,54 @@
-import { normalizeLanguageTag, safeUrl } from "./utils.js?v=19";
-import { CODECS } from "./codecs.js?v=19";
+import { createAbortError, normalizeLanguageTag, safeUrl } from "./utils.js?v=20";
+import { CODECS } from "./codecs.js?v=20";
 
 export { CODECS };
+
+const BOOK_CONFIG_MAX_BYTES = 1024 ** 2;
+
+class BookConfigTooLargeError extends Error {
+  constructor() {
+    super("Book configuration exceeds 1 MiB.");
+    this.name = "BookConfigTooLargeError";
+    this.code = "config";
+  }
+}
+
+export async function readBookConfigText(response, signal) {
+  const body = response.body;
+  if (signal?.aborted) {
+    void body?.cancel().catch(() => { /* The fetch may already have canceled the stream. */ });
+    throw createAbortError();
+  }
+  if (!body) return "";
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  let ended = false;
+  const cancel = () => {
+    if (ended) return;
+    ended = true;
+    void reader.cancel().catch(() => { /* A failed stream can reject cancellation. */ });
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (signal?.aborted) throw createAbortError();
+      if (done) {
+        ended = true;
+        return text + decoder.decode();
+      }
+      bytes += value.byteLength;
+      if (bytes > BOOK_CONFIG_MAX_BYTES) throw new BookConfigTooLargeError();
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    cancel();
+    reader.releaseLock();
+  }
+}
 
 function audioLanguageTag(value) {
   const tag = String(value || "").trim().replace(/_/g, "-");

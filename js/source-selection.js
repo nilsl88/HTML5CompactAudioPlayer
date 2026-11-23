@@ -1,6 +1,6 @@
-import { CODECS, extensionFromPath, mimeCandidatesFor } from "./codecs.js?v=19";
-import { resolveLanguageAsset } from "./config.js?v=19";
-export { AAC_MIME_TYPES, extensionFromPath, mimeFor, mimeCandidatesFor } from "./codecs.js?v=19";
+import { CODECS, extensionFromPath, mimeCandidatesFor } from "./codecs.js?v=20";
+import { resolveLanguageAsset } from "./config.js?v=20";
+export { AAC_MIME_TYPES, extensionFromPath, mimeFor, mimeCandidatesFor } from "./codecs.js?v=20";
 
 export const CODEC_PREFERENCE = [...CODECS];
 
@@ -49,10 +49,12 @@ export function chooseDefaultSource(sources) {
     || sources.find((source) => source.url) || null;
 }
 
-export function visibleSources(sources, showAllCodecs = false) {
+export function visibleSources(sources, showAllCodecs = false, selected = null) {
   const knownOrUnknown = eligibleSources(sources);
   const eligible = knownOrUnknown.length ? knownOrUnknown : sources.filter((source) => source.url);
+  if (selected?.url && !eligible.some((source) => source.id === selected.id)) eligible.unshift(selected);
   if (showAllCodecs) return eligible;
+  if (selected) return eligible.filter((source) => source.codec === selected.codec);
   for (const codec of CODEC_PREFERENCE) {
     const family = eligible.filter((source) => source.codec === codec && source.support > 0);
     if (family.length) return family;
@@ -86,7 +88,6 @@ export class SourceFallback {
     this.failedUrls = new Set();
     this.rejectedCodecs = new Set();
     this.exhausted = false;
-    this.savedAttempted = false;
     this.current = buildFallbackQueue(this.sources, this.selectedId)[0] || null;
     return this.current;
   }
@@ -97,10 +98,7 @@ export class SourceFallback {
     // A probe can finish while the previous source is playing.
     const next = buildFallbackQueue(this.sources, this.selectedId).find((source) =>
       !this.failedUrls.has(source.url) && !this.rejectedCodecs.has(source.codec));
-    if (next) {
-      this.current = next;
-      this.savedAttempted = false;
-    }
+    if (next) this.current = next;
     else this.exhausted = true;
     return next;
   }

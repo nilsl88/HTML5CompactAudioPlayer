@@ -3,6 +3,13 @@ globalThis.CompactPlayerOfflineManifest = (() => {
   const schemaVersion = 1;
   const versionHeader = "x-compact-player-offline-version";
   const bookHeader = "x-compact-player-offline-book";
+  const damageVersionHeader = "x-compact-player-damage-id";
+  const networkStatusHeader = "x-compact-player-offline-network-status";
+  const metaCache = "compact-player-offline-meta-v1";
+  const maxChunkBytes = 8 * 1024 * 1024;
+  const controlDbName = "compact-player-offline-control-v1";
+  const controlStore = "records";
+  const controlTimeoutMs = 3000;
 
   // Cache versions may contain characters outside the HTTP header character set.
   function versionHeaderValue(version) {
@@ -49,6 +56,7 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     if (!value || value.schemaVersion !== schemaVersion) return false;
     if (!value.downloadId || !value.cacheName || !value.episodeId || !value.languageCode || !value.sourceId || !value.sourceUrl || !audioMimeType(value.mime)) return false;
     if (!Number.isSafeInteger(value.totalSize) || value.totalSize <= 0 || !Number.isSafeInteger(value.chunkSize) || value.chunkSize <= 0) return false;
+    if (value.chunkSize > maxChunkBytes) return false;
     if (!Number.isSafeInteger(value.totalChunks) || value.totalChunks !== Math.ceil(value.totalSize / value.chunkSize)) return false;
     if (!Array.isArray(value.completed) || new Set(value.completed).size !== value.completed.length
       || value.completed.some((index) => !Number.isInteger(index) || index < 0 || index >= value.totalChunks)) return false;
@@ -59,6 +67,121 @@ globalThis.CompactPlayerOfflineManifest = (() => {
 
   function offlineMetaUrl(baseUrl, type) {
     return new URL(`__compact_player_offline__/${type}.json`, baseUrl).href;
+  }
+
+  function activeCacheName(baseUrl, slot) {
+    return `compact-player-offline-active-v1:${encodeURIComponent(new URL(baseUrl).pathname)}:${slot}`;
+  }
+
+  function activeCandidatePrefix(baseUrl) {
+    return `compact-player-offline-active-v2:${encodeURIComponent(new URL(baseUrl).pathname)}:`;
+  }
+
+  function openOfflineControl(signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (!globalThis.indexedDB) return Promise.reject(new DOMException("Offline control storage is unavailable.", "NotSupportedError"));
+    return new Promise((resolve, reject) => {
+      const request = globalThis.indexedDB.open(controlDbName, 1);
+      let finished = false;
+      const finish = (settle, value) => {
+        finished = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        settle(value);
+      };
+      const abort = () => finish(reject, signal.reason);
+      const timer = setTimeout(() => finish(reject,
+        new DOMException("Opening offline control storage timed out.", "TimeoutError")), controlTimeoutMs);
+      signal?.addEventListener("abort", abort, { once: true });
+      request.onupgradeneeded = () => {
+        if (finished) request.transaction.abort();
+        else request.result.createObjectStore(controlStore);
+      };
+      request.onerror = () => { if (!finished) finish(reject, request.error); };
+      request.onsuccess = () => {
+        if (finished) request.result.close();
+        else finish(resolve, request.result);
+      };
+    });
+  }
+
+  async function transactOfflineControl(mode, action, signal) {
+    const database = await openOfflineControl(signal);
+    try {
+      if (signal?.aborted) throw signal.reason;
+      return await new Promise((resolve, reject) => {
+        const transaction = database.transaction(controlStore, mode);
+        let request, interrupted, timer;
+        const finish = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+        };
+        const interrupt = (error) => {
+          interrupted ??= error;
+          try { transaction.abort(); }
+          catch (cause) {
+            // A completed transaction still reports its actual outcome.
+            if (cause.name !== "InvalidStateError") { finish(); reject(cause); }
+          }
+        };
+        const abort = () => interrupt(signal.reason);
+        transaction.oncomplete = () => { finish(); resolve(request?.result); };
+        transaction.onabort = () => { finish(); reject(interrupted ?? transaction.error); };
+        signal?.addEventListener("abort", abort, { once: true });
+        timer = setTimeout(() => interrupt(new DOMException("Offline control storage timed out.", "TimeoutError")), controlTimeoutMs);
+        try { request = action(transaction.objectStore(controlStore)); }
+        catch (error) { interrupt(error); }
+      });
+    } finally { database.close(); }
+  }
+
+  function offlineControl(baseUrl, cacheStorage) {
+    const injected = cacheStorage?.offlineControl?.(baseUrl);
+    if (injected) return injected;
+    const scope = new URL(baseUrl).pathname;
+    return {
+      read(key, signal) { return transactOfflineControl("readonly", (store) => store.get([scope, key]), signal); },
+      write(entries, signal) {
+        return transactOfflineControl("readwrite", (store) => {
+          for (const [key, value] of Object.entries(entries)) store.put(value, [scope, key]);
+        }, signal);
+      },
+    };
+  }
+
+  async function readActiveState(baseUrl, read, signal, cacheStorage, requireControl = false) {
+    const url = offlineMetaUrl(baseUrl, "active");
+    let pointer;
+    try { pointer = await offlineControl(baseUrl, cacheStorage).read("active", signal); }
+    catch (error) {
+      if (requireControl || signal?.aborted
+        || !["NotSupportedError", "SecurityError", "NotAllowedError"].includes(error?.name)) throw error;
+      const prefix = activeCandidatePrefix(baseUrl);
+      if ((await cacheStorage?.keys?.())?.some((name) => name.startsWith(prefix))) throw error;
+    }
+    if (signal?.aborted) throw signal.reason;
+    if (pointer !== undefined) {
+      const { cacheName, previousCacheName, revision, resetId, committedRecord } = pointer ?? {};
+      const matchesPointer = (record) => record && record.revision === revision && record.resetId === resetId;
+      let current = matchesPointer(committedRecord) ? committedRecord : null;
+      if (!current && typeof cacheName === "string" && cacheName.startsWith(activeCandidatePrefix(baseUrl))) {
+        const cached = await read(url, cacheName);
+        if (signal?.aborted) throw signal.reason;
+        if (matchesPointer(cached)) current = cached;
+      }
+      return { ...current, revision: revision ?? 0, resetId: resetId ?? "", slot: null,
+        journalCacheName: cacheName, previousJournalCacheName: previousCacheName };
+    }
+    const records = await Promise.all([0, 1].map((slot) => read(url, activeCacheName(baseUrl, slot))));
+    if (signal?.aborted) throw signal.reason;
+    let current = null;
+    for (const [slot, record] of records.entries()) {
+      if (Number.isSafeInteger(record?.revision) && record.revision > (current?.revision ?? 0)) {
+        current = { ...record, slot };
+      }
+    }
+    if (current) return current;
+    return { ...await read(url, metaCache), revision: 0, slot: null, resetId: "" };
   }
 
   function offlineManifestUrl(baseUrl) {
@@ -73,15 +196,58 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     return new URL(`__compact_player_offline__/damaged/${encodeURIComponent(downloadId)}/${index}`, baseUrl).href;
   }
 
+  function confirmedChunkUrl(baseUrl, downloadId, index) {
+    return damagedChunkUrl(baseUrl, downloadId, index) + "/verified";
+  }
+
   function chunkByteLength(manifest, index) {
     return Math.min(manifest.chunkSize, manifest.totalSize - index * manifest.chunkSize);
   }
 
+  function cancelChunkRead(reader) {
+    void reader.cancel().catch(() => { /* A failed stream can reject cancellation. */ });
+  }
+
+  async function readExactChunk(body, expected, signal, bytes) {
+    if (!body) return false;
+    if (signal?.aborted) {
+      cancelChunkRead(body);
+      throw signal.reason;
+    }
+    const reader = body.getReader();
+    let received = 0;
+    let ended = false;
+    const cancel = () => {
+      if (ended) return;
+      ended = true;
+      cancelChunkRead(reader);
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (signal?.aborted) throw signal.reason;
+        if (done) {
+          ended = true;
+          return received === expected;
+        }
+        if (value.byteLength > expected - received) return false;
+        bytes?.set(value, received);
+        received += value.byteLength;
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+      cancel();
+      reader.releaseLock();
+    }
+  }
+
   return Object.freeze({
     schemaVersion, audioMimeType, strongETag, strongLastModified, validManifest, chunkByteLength,
-    metaCache: "compact-player-offline-meta-v1",
+    maxChunkBytes, chunkReadTimeoutMs: 3000, readExactChunk,
+    metaCache, activeCacheName, activeCandidatePrefix, offlineControl, readActiveState,
     downloadHeader: "x-compact-player-download",
-    versionHeader, versionHeaderValue, bookHeader, bookHeaderValue, checkResponseVersion,
-    offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl,
+    versionHeader, versionHeaderValue, bookHeader, bookHeaderValue, networkStatusHeader, checkResponseVersion,
+    offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl, confirmedChunkUrl, damageVersionHeader,
   });
 })();

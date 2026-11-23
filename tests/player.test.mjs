@@ -1,14 +1,14 @@
 import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
-import { createCustomSelects } from "../js/custom-select.js?v=19";
-import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=19";
+import { createCustomSelects } from "../js/custom-select.js?v=20";
+import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=20";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { OfflineManager } from "../js/offline.js?v=19";
-import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=19";
-import { BookSelection } from "../js/book-selection.js?v=19";
-import { normalizeBook } from "../js/config.js?v=19";
-import { buildSources } from "../js/source-selection.js?v=19";
+import { OfflineManager } from "../js/offline.js?v=20";
+import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=20";
+import { BookSelection } from "../js/book-selection.js?v=20";
+import { normalizeBook } from "../js/config.js?v=20";
+import { buildSources } from "../js/source-selection.js?v=20";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
@@ -39,10 +39,19 @@ test("network errors use a saved source only for the selected book version", asy
     episodeId: "sample", languageCode: "en", sourceId: "aac-96",
     sourceUrl: "https://example.test/media/sample/sample.m4b", cacheVersion: "1", mime: "audio/mp4",
     totalSize: 1, chunkSize: 1, totalChunks: 1, completed: [0] };
-  t.mock.method(OfflineManager.prototype, "init", async function () { this.active = manifest; });
+  t.mock.method(OfflineManager.prototype, "init", async function () {
+    this.active = manifest;
+    await this.worker.prepare(manifest);
+  });
   for (const onlineAtPlay of [true, false]) {
     for (const [version, expectedSaved] of [[1, true], [2, false]]) {
-      const page = await openPlayerPage({ ...book, cacheVersion: version }, assert.fail, new Map(),
+      const page = await openPlayerPage({ ...book, cacheVersion: version }, (url, options) => {
+        assert.equal(url, "https://example.test/__compact_player_offline__/audio.json?download=one");
+        assert.equal(options.method, "HEAD");
+        return new Response(null, { headers: {
+          "content-length": "1", "content-type": "audio/mp4", "x-compact-player-offline-version": "%221%22",
+        } });
+      }, new Map(),
         { navigator: { onLine: true, language: "en", serviceWorker: { controller: { scriptURL: "https://example.test/sw.js" } } } });
       await page.ready;
       page.navigator.onLine = onlineAtPlay;
@@ -650,6 +659,29 @@ test("only a playing fallback changes the quality restored on the next visit", a
   assert.match(afterFallback.audio.src, /high\.m4b$/);
 });
 
+test("the quality menu follows the codec that plays after fallback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const config = { ...book, languages: { en: { sources: {
+    opus: { 128: "high.webm", 64: "low.webm" }, aac: { 96: "high.m4b", 64: "low.m4b" },
+  } } } };
+  const { elements, audio, ready } = await openPlayerPage(config, assert.fail);
+  await ready;
+  const qualities = elements.get("qualitySelect");
+  const menu = () => qualities.children.map((option) => option.value);
+  assert.deepEqual(menu(), ["opus-128", "opus-64"]);
+
+  audio.play = async () => {
+    if (audio.src.endsWith(".webm")) throw new DOMException("Cannot decode Opus", "NotSupportedError");
+    audio.dispatchEvent(new Event("playing"));
+  };
+  elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  await settle();
+  assert.match(audio.src, /high\.m4b$/);
+  assert.deepEqual(menu(), ["aac-96", "aac-64"]);
+  assert.equal(qualities.children.find((option) => option.selected)?.value, "aac-96");
+});
+
 test("a new chapter edition revalidates a still-fresh HTTP response before saving WebVTT", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const saved = new Map();
@@ -1036,6 +1068,69 @@ test("reconnection restores a missing catalog without interrupting the active bo
   selector.dispatchEvent(new Event("change"));
   await settle();
   assert.equal(elements.get("bookTitle").textContent, "Another book");
+});
+
+test("the next explicit Play applies a revalidated single book and preserves its source choice and position", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const edition = (version) => ({
+    ...book, title: { en: `Edition ${version}` }, cacheVersion: version,
+    languages: { en: { sources: { aac: { 64: `edition-${version}-64.m4b`, 128: `edition-${version}-128.m4b` } } } },
+  });
+  const savedHeaders = { "x-compact-player-offline-version": "%221%22" };
+  const catalog = { books: [{ id: book.id }], ui: { onboardingEnabled: false } };
+  for (const control of ["button", "keyboard", "media session"]) {
+    const handlers = new Map();
+    const navigator = { onLine: false, language: "en",
+      mediaSession: { setActionHandler: (action, handle) => handlers.set(action, handle) } };
+    const saved = new Map([["compactPlayer:sample", JSON.stringify({
+      language: "en", quality: "aac-64", lastTime: 27,
+    })]]);
+    const requests = [];
+    const { audio, document, elements, window, ready } = await openPlayerPage(book, assert.fail, saved, {
+      navigator,
+      fetch: async (url, options) => {
+        if (url.endsWith("/library.json")) return Response.json(catalog, { headers: navigator.onLine ? {} : savedHeaders });
+        assert.ok(url.endsWith("/sample/book.json"), url);
+        requests.push(options.cache);
+        return navigator.onLine ? Response.json(edition(2)) : Response.json(edition(1), { headers: savedHeaders });
+      },
+    });
+    await ready;
+    const button = elements.get("playPauseBtn");
+    const title = elements.get("bookTitle");
+    const pause = t.mock.method(audio, "pause");
+    if (control === "button") {
+      button.dispatchEvent(new Event("click"));
+      audio.dispatchEvent(new Event("loadedmetadata"));
+      audio.dispatchEvent(new Event("playing"));
+      audio.currentTime = 38;
+      audio.dispatchEvent(new Event("timeupdate"));
+    }
+    const source = audio.src;
+    const pausesBeforeReconnect = pause.mock.callCount();
+    navigator.onLine = true;
+    window.dispatchEvent(new Event("online"));
+    await settle();
+    assert.equal(title.textContent, "Edition 1", control);
+    assert.equal(audio.src, source, control);
+    assert.equal(pause.mock.callCount(), pausesBeforeReconnect, control);
+    assert.deepEqual(requests, ["default", "no-cache"], control);
+    assert.equal(elements.get("bookRow").hidden, true, control);
+    if (control === "button") {
+      button.dispatchEvent(new Event("click"));
+      button.dispatchEvent(new Event("click"));
+    } else if (control === "keyboard") {
+      document.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { code: "Space" }));
+    } else {
+      handlers.get("play")();
+    }
+    assert.equal(title.textContent, "Edition 2", control);
+    assert.ok(audio.src.endsWith("/edition-2-64.m4b"), control);
+    audio.currentTime = 0;
+    audio.dispatchEvent(new Event("loadedmetadata"));
+    assert.equal(audio.currentTime, control === "button" ? 38 : 27, control);
+    assert.deepEqual(requests, ["default", "no-cache"], control);
+  }
 });
 
 test("Previous follows the displayed chapter after an overlapping cue ends", async (t) => {

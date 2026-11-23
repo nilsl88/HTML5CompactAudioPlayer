@@ -1,7 +1,7 @@
-import { parseContentRange } from "./http-range.js?v=19";
-import { findTopLevelAtom } from "./mp4-atoms.js?v=19";
-import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js?v=19";
-import "./offline-manifest.js?v=19";
+import { parseContentRange } from "./http-range.js?v=20";
+import { findTopLevelAtom } from "./mp4-atoms.js?v=20";
+import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js?v=20";
+import "./offline-manifest.js?v=20";
 
 const { checkResponseVersion, strongETag, strongLastModified } = globalThis.CompactPlayerOfflineManifest;
 
@@ -10,8 +10,36 @@ export const MP4_METADATA_LIMIT_BYTES = 16 * 1024 * 1024;
 const MP4_METADATA_CACHE_MS = 30000;
 const metadataRequestsByFetch = new WeakMap();
 
+async function readMetadataBytes(body, length) {
+  if (!body) throw new Error("The audio metadata range was truncated.");
+  const bytes = new Uint8Array(length);
+  const reader = body.getReader();
+  let offset = 0;
+  let finished = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        finished = true;
+        break;
+      }
+      if (value.byteLength > bytes.length - offset) throw new Error("The audio metadata range exceeded its declared length.");
+      bytes.set(value, offset);
+      offset += value.byteLength;
+    }
+    if (offset !== bytes.length) throw new Error("The audio metadata range was truncated.");
+    return bytes;
+  } finally {
+    // The transport handles fetch aborts and may still be finishing when cancellation is requested.
+    if (!finished) void reader.cancel().catch(() => { /* The transport may already have aborted. */ });
+    reader.releaseLock();
+  }
+}
+
 export class RangeReader {
-  constructor(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 20000, cacheVersion, bookIdentity } = {}, { first, total = 0, validator = null } = {}) {
+  constructor(url, { fetchImpl = globalThis.fetch, signal, timeoutMs = 20000, cacheVersion, bookIdentity } = {}, {
+    first, total = 0, validator = null, responseUrl = null,
+  } = {}) {
     this.url = url;
     this.fetchImpl = fetchImpl;
     this.signal = signal;
@@ -21,6 +49,7 @@ export class RangeReader {
     this.first = first;
     this.total = total;
     this.validator = validator;
+    this.responseUrl = responseUrl;
   }
 
   async read(start, end) {
@@ -33,7 +62,8 @@ export class RangeReader {
     if (missingStart === end) return cached;
     const headers = { Range: `bytes=${missingStart}-${end - 1}` };
     const location = globalThis.location;
-    if (this.validator && (!location?.origin || new URL(this.url, location.href).origin === location.origin)) {
+    const urls = [this.url, this.responseUrl ?? this.url];
+    if (this.validator && (!location?.origin || urls.every((url) => new URL(url, location.href).origin === location.origin))) {
       headers["If-Range"] = this.validator.value;
     }
     const bytes = await fetchWithRetry(this.url, {
@@ -59,9 +89,14 @@ export class RangeReader {
     if (!range || (this.total && this.total !== range.total)) throw new Error("The audio server returned an invalid metadata range.");
     const expectedEnd = Math.min(end, range.total) - 1;
     if (range.start !== start || range.end !== expectedEnd) throw new Error("The audio server returned an invalid metadata range.");
+    const responseUrl = String(response.url || this.url).split("#", 1)[0];
+    if (this.responseUrl != null && this.responseUrl !== responseUrl) {
+      throw new Error("The MP4 metadata URL changed during loading.");
+    }
     if (this.validator && response.headers.get(this.validator.header) !== this.validator.value) {
       throw new Error("The MP4 metadata version changed during loading.");
     }
+    const bytes = await readMetadataBytes(response.body, range.end - start + 1);
     if (!this.total) {
       const etag = strongETag(response.headers.get("ETag"));
       const lastModified = strongLastModified({
@@ -71,8 +106,7 @@ export class RangeReader {
         : lastModified ? { header: "Last-Modified", value: lastModified } : null;
     }
     this.total = range.total;
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength !== range.end - start + 1) throw new Error("The audio metadata range was truncated.");
+    this.responseUrl = responseUrl;
     return bytes;
   }
 }
@@ -84,7 +118,7 @@ async function readMp4Metadata(url, options = {}) {
   if (!moov) throw new Error("The MP4 metadata box was not found.");
   const moovBytes = await reader.read(moov.start, moov.start + moov.size);
   const moovBuffer = moovBytes.buffer.slice(moovBytes.byteOffset, moovBytes.byteOffset + moovBytes.byteLength);
-  return { moovBuffer, first: reader.first, total: reader.total, validator: reader.validator };
+  return { moovBuffer, first: reader.first, total: reader.total, validator: reader.validator, responseUrl: reader.responseUrl };
 }
 
 function metadataRequestMap(fetchImpl) {

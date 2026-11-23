@@ -165,11 +165,11 @@ test("offline controls are semantic and media opts into service-worker handling"
 test("service-worker shell and versioned entry points stay in sync", async () => {
   const html = await readFile(new URL("index.html", root), "utf8");
   const source = await readFile(new URL("js/player-app.js", root), "utf8");
-  const offline = await readFile(new URL("js/offline.js", root), "utf8");
+  const connection = await readFile(new URL("js/player-worker.js", root), "utf8");
   const worker = await readFile(new URL("sw.js", root), "utf8");
   const version = worker.match(/const SHELL_VERSION = "v(\d+)"/)?.[1];
   assert.ok(version);
-  assert.ok(offline.includes('new URL("sw.js?v=' + version + '", this.baseUrl)'));
+  assert.ok(connection.includes('new URL("sw.js?v=' + version + '", this.baseUrl)'));
   const script = "./player.js?v=" + version;
   const style = "./player.css?v=" + version;
   const strings = "./i18n.js?v=" + version;

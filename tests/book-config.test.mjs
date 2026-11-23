@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { BookConfigStore, queryBookId } from "../js/book-config.js?v=19";
-import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=19";
+import { BookConfigStore, queryBookId } from "../js/book-config.js?v=20";
+import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=20";
 
 const baseUrl = "https://example.test/";
 const configuration = (id = "one") => ({
@@ -138,7 +138,7 @@ for (const name of ["TypeError", "NetworkError", "TimeoutError", "AbortError"]) 
 
 test("a network failure reading the response body can use the legacy config", async () => {
   const configs = store(async (url) => url.endsWith("/book.json")
-    ? { ok: true, text: async () => { throw new TypeError("Connection lost"); } }
+    ? new Response(new ReadableStream({ start(controller) { controller.error(new TypeError("Connection lost")); } }))
     : json(configuration()));
   assert.ok((await configs.load("one")).configUrl.endsWith("/episode.json"));
 });
@@ -154,7 +154,9 @@ test("a stalled book.json body times out and loads episode.json", async (t) => {
       if (url.endsWith("/episode.json")) return json(configuration());
       transport = signal;
       signal.addEventListener("abort", () => body.reject(signal.reason), { once: true });
-      return { ok: true, text: () => { reading.resolve(); return body.promise; } };
+      return new Response(new ReadableStream({
+        pull() { reading.resolve(); return body.promise; },
+      }, { highWaterMark: 0 }));
     },
   });
   const result = configs.load("one");
@@ -170,6 +172,18 @@ for (const status of [401, 403, 429, 500, 503]) test(`HTTP ${status} does not hi
   const configs = store(async (url) => { calls.push(url); return new Response(null, { status }); });
   await assert.rejects(configs.load("one"), new RegExp(`HTTP ${status}`));
   assert.equal(calls.length, 1);
+  assert.equal(configs.cache.size, 0);
+});
+
+test("oversized book configurations are rejected without trying episode.json", async () => {
+  const calls = [];
+  const book = JSON.stringify(configuration());
+  const configs = store(async (url) => {
+    calls.push(url);
+    return new Response(book.padEnd(1024 ** 2 + 1, " "));
+  });
+  await assert.rejects(configs.load("one"), { name: "BookConfigTooLargeError" });
+  assert.deepEqual(calls, [baseUrl + "media/one/book.json"]);
   assert.equal(configs.cache.size, 0);
 });
 

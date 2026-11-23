@@ -1,10 +1,12 @@
-import { normalizeLibrary, parseBookConfig, parseJson } from "./config.js?v=19";
-export { validateOfflineBookConfig } from "./offline-selection.js?v=19";
-import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=19";
-import "./offline-manifest.js?v=19";
+import { normalizeLibrary, parseBookConfig, parseJson, readBookConfigText } from "./config.js?v=20";
+export { validateOfflineBookConfig } from "./offline-selection.js?v=20";
+import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=20";
+import "./offline-manifest.js?v=20";
+
+const { versionHeader, networkStatusHeader } = globalThis.CompactPlayerOfflineManifest;
 
 function isDownloadedResponse(response) {
-  return response.headers?.get?.(globalThis.CompactPlayerOfflineManifest.versionHeader) != null;
+  return response.headers?.get?.(versionHeader) != null;
 }
 
 export function fetchLibraryCatalog(url, fetchImpl) {
@@ -136,21 +138,33 @@ export class BookConfigStore {
 
   async fetchConfig(id, recordedUrl, signal, cache) {
     const urls = this.configUrls(id, recordedUrl);
-    for (const [index, configUrl] of urls.entries()) {
-      const hasFallback = index + 1 < urls.length;
-      let response;
-      try {
-        response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal, cache });
-        if (signal?.aborted) throw createAbortError();
-      } catch (error) {
-        // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
-        if (!signal?.aborted && hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
-        throw error;
+    let downloaded;
+    try {
+      for (const [index, configUrl] of urls.entries()) {
+        const hasFallback = index + 1 < urls.length;
+        let response;
+        try {
+          response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal, cache }, readBookConfigText);
+          if (signal?.aborted) throw createAbortError();
+        } catch (error) {
+          // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
+          if (!signal?.aborted && hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
+          throw error;
+        }
+        if (hasFallback && [404, 410].includes(response.status)) continue;
+        if (!response.ok) throw new Error(`Could not load book configuration ${configUrl} (HTTP ${response.status}).`);
+        const book = parseBookConfig(response.text, configUrl, this.documentBaseUrl);
+        const result = { book, configUrl, fromDownload: isDownloadedResponse(response) };
+        const networkStatus = response.headers?.get?.(networkStatusHeader);
+        if (hasFallback && result.fromDownload && ["404", "410", "network-error"].includes(networkStatus)) {
+          downloaded = result;
+          continue;
+        }
+        return result;
       }
-      if (hasFallback && [404, 410].includes(response.status)) continue;
-      if (!response.ok) throw new Error(`Could not load book configuration ${configUrl} (HTTP ${response.status}).`);
-      const book = parseBookConfig(response.text, configUrl, this.documentBaseUrl);
-      return { book, configUrl, fromDownload: isDownloadedResponse(response) };
+    } catch (error) {
+      if (downloaded && !signal?.aborted) return downloaded;
+      throw error;
     }
   }
 

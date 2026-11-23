@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeBook, normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=19";
-import { buildFallbackQueue, buildSources, chooseDefaultSource, mimeFor, visibleSources } from "../js/source-selection.js?v=19";
+import { normalizeBook, normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=20";
+import { buildFallbackQueue, buildSources, chooseDefaultSource, mimeFor, visibleSources } from "../js/source-selection.js?v=20";
 
 test("normalizes the documented book schema without changing paths", () => {
   const book = normalizeBook({

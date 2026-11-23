@@ -1,5 +1,5 @@
-import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js?v=19";
-import { setText } from "./utils.js?v=19";
+import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js?v=20";
+import { setText } from "./utils.js?v=20";
 
 export function createOfflinePanel(window, { offline, t, getLocale, getSelection, isOnline,
   waitForPriority, onRepair, reportError, showToast }) {
@@ -40,7 +40,7 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     let status = "";
     let action = t("offlineDownload");
     let showDownload = true;
-    const showRemove = Boolean(state.active || state.repairable) && !busy;
+    const showRemove = state.canWrite && Boolean(state.active || state.repairable) && !busy;
 
     els.offlineProgress.hidden = true;
     if (state.phase === "preparing" || state.phase === "publishing-repair") {
@@ -80,11 +80,11 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     setText(els.offlineCancelBtn, t("offlineCancel"));
     setText(els.offlineRemoveBtn, t("offlineRemove"));
     setText(els.offlineRepairBtn, t("offlineRepair"));
-    els.offlineRepairBtn.hidden = state.repairable?.status !== "needs-config" || busy;
+    els.offlineRepairBtn.hidden = !state.canWrite || state.repairable?.status !== "needs-config" || busy;
     els.offlineRepairBtn.disabled = !isOnline();
-    els.offlineDownloadBtn.hidden = !showDownload;
+    els.offlineDownloadBtn.hidden = !state.canWrite || !showDownload;
     els.offlineDownloadBtn.disabled = busy || (!selection && !state.staging) || (!isOnline() && !state.canFinishOffline);
-    els.offlineCancelBtn.hidden = !state.canCancel;
+    els.offlineCancelBtn.hidden = !state.canWrite || !state.canCancel;
     els.offlineRemoveBtn.hidden = !showRemove;
     if (focusCancel && busy && state.canCancel) {
       focusCancel = false;
@@ -96,6 +96,8 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     if (error?.code === "offline") return t("offlineConnect");
     if (["unsupported", "cross-origin"].includes(error?.code)) return t("offlineUnsupported");
     if (error?.code === "timeout") return t("offlineTimedOut");
+    if (error?.code === "storage-timeout") return t("offlineStorageTimedOut");
+    if (error?.code === "storage-read-timeout") return t("offlineStorageReadTimedOut");
     if (error?.code === "range") return t("offlineRangeUnsupported");
     if (error?.code === "mime") return t("offlineMimeUnsupported");
     if (error?.code === "conflict") return t("offlineTabConflict");
@@ -110,10 +112,17 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     if (!selection && !staging) return;
     focusCancel = true;
     let persisted;
+    let completed = false;
+    const warnIfStorageIsTemporary = () => {
+      if (persisted === false) showToast(t("offlinePersistenceWarning"), "warning", 7000, "offline-persistence");
+    };
     try {
       const options = {
         waitForPriority,
-        onPersistence: (granted) => { persisted = granted; },
+        onPersistence(granted) {
+          persisted = granted;
+          if (completed) warnIfStorageIsTemporary();
+        },
         confirmDownload(check, candidate) {
           if (check.canResume) return true;
           const { active, repairable } = offline.snapshot();
@@ -126,8 +135,9 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
       };
       const ready = staging ? await offline.resume(options) : await offline.start(selection, undefined, options);
       if (!ready) return;
+      completed = true;
       showToast(t("offlineComplete"), "success", 6000, "offline-complete");
-      if (persisted === false) showToast(t("offlinePersistenceWarning"), "warning", 7000, "offline-persistence");
+      warnIfStorageIsTemporary();
     } catch (error) {
       if (error?.name === "AbortError") return;
       reportError("offline download", error, offlineErrorMessage(error));

@@ -1,4 +1,4 @@
-import { normalizeLanguageTag } from "./js/utils.js?v=19";
+import { normalizeLanguageTag } from "./js/utils.js?v=20";
 
 export const UI_STRINGS = {
   en: {
@@ -102,6 +102,8 @@ export const UI_STRINGS = {
     offlineMissingAudio: "Some of the downloaded audio for {book} is missing.",
     offlineNeedsConfig: "The audio for {book} is saved. Restore its configuration to open it offline.",
     offlineTimedOut: "The download timed out. Try again when the connection is stable.",
+    offlineStorageTimedOut: "Your browser took too long to save the download. Try again.",
+    offlineStorageReadTimedOut: "Checking the saved files took too long. Try resuming the download.",
   
     resetCancel: "Cancel",
     errorTitle: "Player error",
@@ -247,6 +249,8 @@ export const UI_STRINGS = {
     offlineMissingAudio: "En del af den gemte lyd til {book} mangler.",
     offlineNeedsConfig: "Lyden til {book} er gemt. Gendan bogens konfiguration for at åbne den offline.",
     offlineTimedOut: "Downloadet gik i stå. Prøv igen, når forbindelsen er stabil.",
+    offlineStorageTimedOut: "Browseren brugte for lang tid på at gemme downloadet. Prøv igen.",
+    offlineStorageReadTimedOut: "Kontrollen af de gemte filer tog for lang tid. Prøv at fortsætte downloadet.",
   
     resetCancel: "Annuller",
     errorTitle: "Afspillerfejl",
@@ -392,6 +396,8 @@ export const UI_STRINGS = {
     offlineMissingAudio: "En del av den lagrede lyden til {book} mangler.",
     offlineNeedsConfig: "Lyden til {book} er lagret. Gjenopprett bokinnstillingene for å åpne den uten nett.",
     offlineTimedOut: "Tidsavbrudd under nedlastingen. Prøv igjen når forbindelsen er stabil.",
+    offlineStorageTimedOut: "Nettleseren brukte for lang tid på å lagre nedlastingen. Prøv igjen.",
+    offlineStorageReadTimedOut: "Kontrollen av de lagrede filene tok for lang tid. Prøv å fortsette nedlastingen.",
   
     resetCancel: "Avbryt",
     errorTitle: "Avspillingsfeil",
@@ -537,6 +543,8 @@ export const UI_STRINGS = {
     offlineMissingAudio: "En del av det sparade ljudet för {book} saknas.",
     offlineNeedsConfig: "Ljudet till {book} är sparat. Återställ bokens inställningar för att öppna den offline.",
     offlineTimedOut: "Tidsgränsen för nedladdningen gick ut. Försök igen när anslutningen är stabil.",
+    offlineStorageTimedOut: "Webbläsaren tog för lång tid på sig att spara nedladdningen. Försök igen.",
+    offlineStorageReadTimedOut: "Kontrollen av de sparade filerna tog för lång tid. Försök återuppta nedladdningen.",
   
     resetCancel: "Avbryt",
     errorTitle: "Spelarfel",
