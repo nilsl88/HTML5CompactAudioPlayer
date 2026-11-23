@@ -1,4 +1,4 @@
-import { clamp } from "./utils.js?v=19";
+import { clamp } from "./utils.js?v=20";
 
 export function createMediaSession(navigator, Metadata, reportError) {
   let session;

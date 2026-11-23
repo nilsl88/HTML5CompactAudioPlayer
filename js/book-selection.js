@@ -1,6 +1,6 @@
-import { chooseDefaultSource } from "./source-selection.js?v=19";
-import { matchAudioLanguage } from "./config.js?v=19";
-import { matchesDownloadedSource } from "./offline-selection.js?v=19";
+import { chooseDefaultSource } from "./source-selection.js?v=20";
+import { matchAudioLanguage } from "./config.js?v=20";
+import { matchesDownloadedSource } from "./offline-selection.js?v=20";
 
 function preferredSource(sources, id) {
   return sources.find((source) => source.url && source.id === id && source.availability !== "missing") || chooseDefaultSource(sources);

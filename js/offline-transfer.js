@@ -1,9 +1,10 @@
-import { parseContentRange } from "./http-range.js?v=19";
-import "./offline-manifest.js?v=19";
-import { createAbortError } from "./utils.js?v=19";
+import { parseContentRange } from "./http-range.js?v=20";
+import "./offline-manifest.js?v=20";
+import { createAbortError } from "./utils.js?v=20";
 
-const { audioMimeType, strongETag, strongLastModified, downloadHeader: OFFLINE_DOWNLOAD_HEADER } = globalThis.CompactPlayerOfflineManifest;
-export const OFFLINE_CHUNK_SIZE = 8 * 1024 * 1024;
+const { audioMimeType, strongETag, strongLastModified, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
+  maxChunkBytes } = globalThis.CompactPlayerOfflineManifest;
+export const OFFLINE_CHUNK_SIZE = maxChunkBytes;
 const RANGE_IDLE_TIMEOUT_MS = 20_000;
 
 export class OfflineDownloadError extends Error {
@@ -18,6 +19,24 @@ export function checkCanceled(signal) {
   if (signal?.aborted) throw createAbortError("Download canceled");
 }
 
+export async function withOfflineDeadline(action, signal, timeoutMs = 20_000,
+  timeoutError = new OfflineDownloadError("timeout", "Download preparation timed out.")) {
+  checkCanceled(signal);
+  const controller = new AbortController();
+  let stop;
+  const interrupted = new Promise((_, reject) => {
+    stop = (error) => { reject(error); controller.abort(error); };
+  });
+  const cancel = () => stop(createAbortError("Download canceled"));
+  const timer = setTimeout(() => stop(timeoutError), timeoutMs);
+  signal?.addEventListener("abort", cancel, { once: true });
+  try { return await Promise.race([interrupted, action(controller.signal)]); }
+  finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
 export { parseContentRange };
 
 export function chunkBounds(index, totalSize, chunkSize = OFFLINE_CHUNK_SIZE) {
@@ -26,12 +45,16 @@ export function chunkBounds(index, totalSize, chunkSize = OFFLINE_CHUNK_SIZE) {
 }
 
 function rangeValidator(manifest) {
-  return manifest.etag ? strongETag(manifest.etag) : strongLastModified(manifest);
+  const header = manifest.etag ? "etag" : "last-modified";
+  const value = manifest.etag ? strongETag(manifest.etag) : strongLastModified(manifest);
+  return value ? { header, value } : null;
 }
 
 export function sameAudioRevision(previous, next) {
-  const validator = rangeValidator(next);
-  return previous.totalSize === next.totalSize && Boolean(validator && validator === rangeValidator(previous));
+  if (!previous.responseUrl || previous.responseUrl !== next.responseUrl || previous.totalSize !== next.totalSize) return false;
+  const previousValidator = rangeValidator(previous);
+  const nextValidator = rangeValidator(next);
+  return Boolean(nextValidator && previousValidator?.header === nextValidator.header && previousValidator.value === nextValidator.value);
 }
 
 function downloadMimeType(contentType, sourceMime) {
@@ -49,10 +72,13 @@ function validateAudioMime(response, sourceMime, expectedMime) {
   return mime;
 }
 
-function validateResponseOrigin(response, sourceUrl) {
-  if (response.url && new URL(response.url).origin !== new URL(sourceUrl).origin) {
+function audioResponseUrl(response, sourceUrl) {
+  const url = new URL(response.url || sourceUrl);
+  if (url.origin !== new URL(sourceUrl).origin) {
     throw new OfflineDownloadError("cross-origin", "Offline downloads require audio from this site.");
   }
+  url.hash = "";
+  return url.href;
 }
 
 // Keep at most one storage chunk plus the current network buffer in memory.
@@ -106,13 +132,14 @@ export async function inspectAudioRange(fetchImpl, url, sourceMime, signal) {
   });
   const range = parseContentRange(response.headers.get("content-range"));
   try { await response.body?.cancel(); } catch {}
-  validateResponseOrigin(response, url);
+  const responseUrl = audioResponseUrl(response, url);
   if (response.status !== 206 || !range || range.start !== 0 || range.end !== 0) {
     throw new OfflineDownloadError("range", "The audio server does not support offline downloads.");
   }
   const mime = validateAudioMime(response, sourceMime);
   return {
     mime,
+    responseUrl,
     totalSize: range.total,
     etag: response.headers.get("etag") || "",
     lastModified: response.headers.get("last-modified") || "",
@@ -122,7 +149,7 @@ export async function inspectAudioRange(fetchImpl, url, sourceMime, signal) {
 
 async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signal) {
   const headers = { Range: `bytes=${start}-${end}`, [OFFLINE_DOWNLOAD_HEADER]: "1" };
-  if (validator) headers["If-Range"] = validator;
+  if (validator) headers["If-Range"] = validator.value;
   const response = await fetchImpl(manifest.sourceUrl, {
     headers,
     cache: "no-store",
@@ -130,11 +157,12 @@ async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signa
     signal,
   });
   try {
-    validateResponseOrigin(response, manifest.sourceUrl);
+    const responseUrl = audioResponseUrl(response, manifest.sourceUrl);
     const range = parseContentRange(response.headers.get("content-range"));
-    const responseVersion = response.headers.get(manifest.etag ? "etag" : "last-modified");
-    if (response.status !== 206 || !range || range.start !== start || range.end !== end || range.total !== manifest.totalSize
-      || (validator && responseVersion !== null && responseVersion !== validator)) {
+    const responseVersion = validator ? response.headers.get(validator.header) : null;
+    if (responseUrl !== manifest.responseUrl || response.status !== 206 || !range
+      || range.start !== start || range.end !== end || range.total !== manifest.totalSize
+      || (responseVersion !== null && responseVersion !== validator.value)) {
       throw new OfflineDownloadError("changed", "The audio file changed during the download.");
     }
     validateAudioMime(response, manifest.mime, manifest.mime);

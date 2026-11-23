@@ -19,7 +19,15 @@ function parseRange(value, totalSize) {
   return { start, end, partial: true };
 }
 
-async function downloadedMediaResponse(request, manifest, readChunk, reportInvalidChunk = async () => {}) {
+async function readStoredAudioChunk(response, expected, signal) {
+  const bytes = new Uint8Array(expected);
+  const { readExactChunk } = globalThis.CompactPlayerOfflineManifest;
+  return await readExactChunk(response.body, expected, signal, bytes) ? bytes : null;
+}
+
+async function downloadedMediaResponse(request, manifest, readChunk, {
+  readBody = readStoredAudioChunk, reportInvalidChunk = () => {}, finish = () => {},
+} = {}) {
   const { chunkByteLength, strongETag, strongLastModified, versionHeader, versionHeaderValue,
     bookHeader, bookHeaderValue } = globalThis.CompactPlayerOfflineManifest;
   const headers = {
@@ -44,49 +52,53 @@ async function downloadedMediaResponse(request, manifest, readChunk, reportInval
   const firstChunk = Math.floor(range.start / manifest.chunkSize);
   const lastChunk = Math.floor(range.end / manifest.chunkSize);
   let index = firstChunk;
-  let firstResponse;
-  try { firstResponse = await readChunk(index); }
-  catch (error) {
-    await reportInvalidChunk(index);
-    throw error;
-  }
+  let firstResponse = await readChunk(index, request.signal);
   if (!firstResponse) {
-    await reportInvalidChunk(index);
+    reportInvalidChunk(index);
     return null;
   }
-  let canceled = false;
+  const streamAbort = new AbortController();
+  const { signal } = streamAbort;
   const stream = new ReadableStream({
     async pull(controller) {
-      let response;
-      try { response = firstResponse || await readChunk(index); }
-      catch (error) {
-        if (!canceled) await reportInvalidChunk(index);
+      try {
+        const response = firstResponse || await readChunk(index, signal);
+        firstResponse = null;
+        if (signal.aborted) return;
+        if (!response) {
+          reportInvalidChunk(index);
+          throw new Error("A downloaded audio chunk is missing.");
+        }
+        let data;
+        try { data = await readBody(response, chunkByteLength(manifest, index), signal); }
+        catch (error) {
+          if (!signal.aborted && error?.name !== "TimeoutError" && error?.name !== "AbortError") reportInvalidChunk(index);
+          throw error;
+        }
+        if (signal.aborted) return;
+        if (!data) {
+          reportInvalidChunk(index);
+          throw new Error("A downloaded audio chunk is incomplete.");
+        }
+        const chunkStart = index * manifest.chunkSize;
+        const from = Math.max(0, range.start - chunkStart);
+        const to = Math.min(data.length, range.end - chunkStart + 1);
+        controller.enqueue(data.subarray(from, to));
+        if (++index > lastChunk) {
+          controller.close();
+          finish();
+        }
+      } catch (error) {
+        finish();
         throw error;
       }
-      firstResponse = null;
-      if (canceled) return;
-      if (!response) {
-        await reportInvalidChunk(index);
-        throw new Error("A downloaded audio chunk is missing.");
-      }
-      let data;
-      try { data = new Uint8Array(await response.arrayBuffer()); }
-      catch (error) {
-        if (!canceled) await reportInvalidChunk(index);
-        throw error;
-      }
-      if (canceled) return;
-      const chunkStart = index * manifest.chunkSize;
-      if (data.length !== chunkByteLength(manifest, index)) {
-        await reportInvalidChunk(index);
-        throw new Error("A downloaded audio chunk is incomplete.");
-      }
-      const from = Math.max(0, range.start - chunkStart);
-      const to = Math.min(data.length, range.end - chunkStart + 1);
-      controller.enqueue(data.subarray(from, to));
-      if (++index > lastChunk) controller.close();
     },
-    cancel() { canceled = true; firstResponse = null; },
+    cancel() {
+      streamAbort.abort();
+      void firstResponse?.body?.cancel().catch(() => { /* An unread chunk can already have errored. */ });
+      firstResponse = null;
+      finish();
+    },
   }, { highWaterMark: 0 });
   if (range.partial) {
     headers["content-length"] = String(range.end - range.start + 1);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MediaController } from "../js/media-controller.js?v=19";
+import { MediaController } from "../js/media-controller.js?v=20";
 
 class FakeAudio extends EventTarget {
   src = "";
@@ -81,6 +81,46 @@ test("offline first Play loads only the validated saved source and preserves laz
   media.seek(30);
   assert.equal(media.position(), 30);
   assert.equal(media.currentSource().url, "opus.webm");
+});
+
+test("the next transport Play starts a saved source that became available after a source-less stall", async (t) => {
+  const audio = new FakeAudio();
+  const attempts = [];
+  let savedUrl = "";
+  let online = false;
+  audio.playImpl = async (url) => { attempts.push(url); };
+  const media = new MediaController(audio, {
+    savedSourceUrl: () => savedUrl,
+    allowNetworkSource: () => online,
+  }, { isOnline: () => online });
+  t.after(() => media.destroy());
+  const source = sources[0];
+
+  await media.setSelection([source], source.id, 31);
+  await media.togglePlayback();
+  assert.equal(media.state, "stalled");
+  assert.equal(media.awaitingPlayback, true);
+  assert.equal(audio.src, "");
+  assert.deepEqual(attempts, []);
+  savedUrl = "saved-audio";
+  const play = media.togglePlayback();
+  assert.deepEqual(attempts, [savedUrl], "Play still reaches the audio element within the user gesture");
+  await play;
+  assert.equal(media.position(), 31);
+  await media.togglePlayback();
+  assert.equal(media.state, "paused");
+  assert.deepEqual(attempts, [savedUrl]);
+
+  for (const paused of [false, true]) {
+    online = false;
+    savedUrl = "";
+    await media.setSelection([source], source.id, 31);
+    await media.togglePlayback();
+    if (paused) media.requestPause();
+    online = true;
+    await media.handleReconnect();
+    assert.equal(audio.src, paused ? "" : source.url);
+  }
 });
 
 test("reconnection starts a fresh saved-source attempt after an offline failure", async (t) => {
@@ -193,6 +233,100 @@ test("a failed online source tries the matching saved copy once before codec fal
   assert.deepEqual(attempts.slice(0, 3), ["opus.webm", savedUrl, "opus-low.webm"]);
   assert.equal(media.currentSource().id, "opus-96");
   assert.equal(media.desiredTime, 12);
+});
+
+test("an offline copy that fails after reconnect retries the same recording online", async (t) => {
+  let online = false;
+  let rejectSaved;
+  const savedPlay = new Promise((_, reject) => { rejectSaved = reject; });
+  const audio = new FakeAudio();
+  const attempts = [];
+  audio.playImpl = (url) => {
+    attempts.push(url);
+    return url === "saved-audio" ? savedPlay : Promise.resolve();
+  };
+  const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" }, { isOnline: () => online });
+  t.after(() => media.destroy());
+  const play = media.setSelection([sources[0]], sources[0].id, 45, true);
+  assert.deepEqual(attempts, ["saved-audio"]);
+  online = true;
+  const reconnect = media.handleReconnect();
+  rejectSaved(new DOMException("The saved download was removed", "NotSupportedError"));
+  await Promise.all([play, reconnect]);
+  assert.equal(attempts.at(-1), sources[0].url);
+  audio.emit("loadedmetadata");
+  audio.emit("playing");
+  assert.equal(media.state, "playing");
+  assert.equal(media.position(), 45);
+});
+
+test("a saved copy's decode error does not reject an otherwise untested codec", async (t) => {
+  const audio = new FakeAudio();
+  const attempts = [];
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === sources[0].url) throw new DOMException("Unavailable", "NetworkError");
+    if (url === "saved-audio") throw new DOMException("Corrupt copy", "NotSupportedError");
+  };
+  const media = new MediaController(audio, { savedSourceUrl: (source) => source === sources[0] ? "saved-audio" : null });
+  t.after(() => media.destroy());
+  await media.setSelection(sources, sources[0].id, 0, true);
+  assert.deepEqual(attempts, [sources[0].url, "saved-audio", sources[1].url]);
+});
+
+test("a saved copy that fails after a connection loss gets one fresh online attempt", async (t) => {
+  const source = sources[0];
+  for (const restoredSourceWorks of [true, false]) {
+    const audio = new FakeAudio();
+    const attempts = [];
+    let online = true;
+    const media = new MediaController(audio, { savedSourceUrl: () => "saved-audio" }, { isOnline: () => online });
+    t.after(() => media.destroy());
+    audio.playImpl = async (url) => {
+      attempts.push(url);
+      if (attempts.length === 3 && !restoredSourceWorks) throw new DOMException("Unavailable", "NetworkError");
+      audio.currentTime = 0;
+      audio.emit("loadedmetadata");
+      audio.emit("playing");
+    };
+    await media.setSelection([source], source.id, 30, true);
+    online = false;
+    audio.error = { code: 2 };
+    audio.emit("error");
+    assert.deepEqual(attempts, [source.url, "saved-audio"]);
+    assert.equal(media.state, "playing");
+    audio.currentTime = 35;
+    audio.emit("timeupdate");
+
+    online = true;
+    await media.handleReconnect();
+    audio.error = { code: 3 };
+    audio.emit("error");
+    await new Promise(setImmediate);
+
+    assert.deepEqual(attempts, [source.url, "saved-audio", source.url]);
+    assert.equal(media.position(), 35);
+    assert.equal(media.state, restoredSourceWorks ? "playing" : "error");
+  }
+});
+
+test("Play after a saved-source failure uses the latest download without reconnecting", async (t) => {
+  const audio = new FakeAudio();
+  let savedUrl = "removed-copy";
+  const attempts = [];
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "removed-copy") throw new DOMException("This download is no longer active", "NotSupportedError");
+  };
+  const media = new MediaController(audio, { savedSourceUrl: () => savedUrl }, { isOnline: () => false });
+  t.after(() => media.destroy());
+  await media.setSelection([sources[0]], sources[0].id, 31, true);
+  assert.equal(media.state, "stalled");
+  media.requestPause();
+  savedUrl = "replacement-copy";
+  await media.requestPlay();
+  assert.deepEqual(attempts, ["removed-copy", "replacement-copy"]);
+  assert.equal(media.position(), 31);
 });
 
 test("a decode error retries the saved edition once before skipping the codec", async (t) => {

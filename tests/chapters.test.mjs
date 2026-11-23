@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=19";
-import { PlayerStorage } from "../js/storage.js?v=19";
-import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=19";
-import { RangeReader } from "../js/mp4-metadata.js?v=19";
-import { createCoverView } from "../js/cover.js?v=19";
-import { ChapterSession } from "../js/chapter-session.js?v=19";
+import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=20";
+import { PlayerStorage } from "../js/storage.js?v=20";
+import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=20";
+import { RangeReader } from "../js/mp4-metadata.js?v=20";
+import { createCoverView } from "../js/cover.js?v=20";
+import { ChapterSession } from "../js/chapter-session.js?v=20";
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));
@@ -58,11 +58,10 @@ function rangedFetch(file, total = 262144) {
     const match = String(options.headers.Range).match(/bytes=(\d+)-(\d+)/);
     const start = Number(match[1]);
     const end = Math.min(Number(match[2]), total - 1);
-    return {
+    return new Response(bytes.subarray(start, end + 1), {
       status: 206,
-      headers: { get: (name) => name === "Content-Range" ? `bytes ${start}-${end}/${total}` : null },
-      arrayBuffer: async () => bytes.slice(start, end + 1).buffer,
-    };
+      headers: { "Content-Range": `bytes ${start}-${end}/${total}` },
+    });
   };
 }
 
@@ -161,8 +160,7 @@ test("downloaded chapters and MP4 metadata must match the selected book identity
   const range = rangedFetch(file, file.length);
   const mp4Fetch = (episodeId, configBookId) => async (...args) => {
     const response = await range(...args);
-    const original = response.headers.get("Content-Range");
-    response.headers = new Headers({ "Content-Range": original, ...cachedHeaders(episodeId, configBookId) });
+    for (const [name, value] of Object.entries(cachedHeaders(episodeId, configBookId))) response.headers.set(name, value);
     return response;
   };
   await assert.rejects(loadEmbeddedMp4Chapters(source, {
@@ -600,6 +598,52 @@ test("MP4 metadata and QuickTime samples reject a changed strong HTTP validator"
   }
 });
 
+test("MP4 metadata and QuickTime samples reject a new redirect target with the same ETag and size", async (t) => {
+  const url = "https://example.test/book.m4b";
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", { configurable: true, value: new URL(url) });
+  t.after(() => {
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else delete globalThis.location;
+  });
+
+  const firstSample = 300_000;
+  const sampleSize = 3;
+  const moovStart = firstSample + sampleSize * 2;
+  const editions = [65, 66].map((title) => {
+    const file = quickTimeChapterFile(2, uint32Fields(0, sampleSize, 2), Uint8Array.of(0, 1, title), firstSample - 8);
+    return rangedFetch(file, file.length);
+  });
+  for (const stage of ["moov", "sample"]) {
+    const requests = [];
+    let switched = false;
+    const fetchImpl = async (requested, options) => {
+      assert.equal(requested, url);
+      const { Range: range, "If-Range": condition } = options.headers;
+      const [, first, last] = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(first);
+      const atChangedRange = stage === "moov" ? start === moovStart && Number(last) - start >= 16 : start === firstSample;
+      const edition = switched || atChangedRange ? 1 : 0;
+      const response = await editions[edition](requested, options);
+      Object.defineProperty(response, "url", { value: `https://cdn.test/edition-${edition}.m4b` });
+      response.headers.set("ETag", '"shared"');
+      requests.push({ range, edition, condition });
+      return response;
+    };
+
+    await assert.rejects(loadEmbeddedMp4Chapters(url, { fetchImpl }), /MP4 metadata URL changed/, stage);
+    assert.equal(requests[0].edition, 0, stage);
+    assert.equal(requests.at(-1).edition, 1, stage);
+
+    switched = true;
+    const retry = requests.length;
+    const chapters = await loadEmbeddedMp4Chapters(url, { fetchImpl });
+    assert.deepEqual(chapters.map(({ title }) => title), ["B", "B"], stage);
+    assert.equal(requests[retry].range, "bytes=0-262143", stage);
+    assert.ok(requests.every(({ condition }) => condition === undefined), "a redirect to a CDN does not send If-Range");
+  }
+});
+
 test("cross-origin MP4 ranges compare exposed ETags without requiring an If-Range preflight", async () => {
   const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
   Object.defineProperty(globalThis, "location", { configurable: true, value: new URL("https://player.test/") });
@@ -620,6 +664,33 @@ test("cross-origin MP4 ranges compare exposed ETags without requiring an If-Rang
     if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
     else delete globalThis.location;
   }
+});
+
+test("an oversized MP4 range cancels before reading the rest of the body", { timeout: 1000 }, async () => {
+  let pulls = 0;
+  let canceled = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls++;
+      if (pulls === 1) controller.enqueue(Uint8Array.of(1, 2, 3, 4));
+      else if (pulls === 2) controller.enqueue(Uint8Array.of(5));
+      else {
+        controller.enqueue(Uint8Array.of(6, 7, 8));
+        controller.close();
+      }
+    },
+    cancel() {
+      canceled = true;
+      return new Promise(() => {});
+    },
+  }, { highWaterMark: 0 });
+  const response = new Response(body, { status: 206, headers: { "Content-Range": "bytes 0-3/8" } });
+  const reader = new RangeReader("https://example.test/book.m4b", { fetchImpl: async () => response });
+
+  await assert.rejects(reader.read(0, 4), /exceeded its declared length/);
+  assert.equal(pulls, 2);
+  assert.ok(canceled);
+  assert.equal(body.locked, false);
 });
 
 test("QuickTime chapters reuse the initial range and fetch neighboring titles together", async () => {
@@ -950,7 +1021,7 @@ test("replacing an MP4 at the same URL refreshes chapters and artwork together f
   const savedFile = rangedFetch(neroMetadata(60));
   const offlineFetch = async (...args) => {
     const response = await savedFile(...args);
-    response.headers = new Headers({ "Content-Range": response.headers.get("Content-Range"), [versionHeader]: versionHeaderValue(1) });
+    response.headers.set(versionHeader, versionHeaderValue(1));
     return response;
   };
   assert.equal((await loadEmbeddedMp4Chapters(url, { cacheVersion: 1, fetchImpl: offlineFetch }))[1].start, 60);

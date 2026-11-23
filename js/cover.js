@@ -1,9 +1,8 @@
-import { resolveCover } from "./config.js?v=19";
-import { isPlayerServiceWorker } from "./utils.js?v=19";
-import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=19";
-import "./offline-manifest.js?v=19";
+import { resolveCover } from "./config.js?v=20";
+import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=20";
+import "./offline-manifest.js?v=20";
 
-export function createCoverView(image, button, { fetchImpl, getBookId, canUseCachedCover, canUseNativeCover, onShown, onFailure }) {
+export function createCoverView(image, button, { fetchImpl, isOnline = () => true, getBookId, getFileCoverUrl, canUseCachedCover, canUseNativeCover, onShown, onFailure }) {
   let coverGeneration = 0;
   let coverController = null;
   let coverObjectUrl = "";
@@ -11,9 +10,15 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
   let currentLanguage = "";
   let sourceUrl = "";
   let usingEmbedded = false;
+  let coverNeedsRetry = false;
+  let pendingOfflineCover = false;
+  let reconnectSourceUrl = null;
 
   function clearImage() {
     coverGeneration += 1;
+    coverNeedsRetry = false;
+    pendingOfflineCover = false;
+    reconnectSourceUrl = null;
     coverController?.abort();
     coverController = null;
     if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
@@ -28,6 +33,8 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
   function showCoverImage(src, generation, onFailure) {
     image.onload = () => {
       if (generation !== coverGeneration) return;
+      pendingOfflineCover = false;
+      reconnectSourceUrl = null;
       button.hidden = false;
       onShown();
     };
@@ -39,24 +46,21 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
 
   function coverFailed(generation, error) {
     if (generation !== coverGeneration) return;
+    if (reconnectSourceUrl !== null && currentBook && isOnline()) {
+      sourceUrl = reconnectSourceUrl;
+      loadCover(currentBook);
+      return;
+    }
     clearImage();
+    coverNeedsRetry = true;
     onFailure(error);
   }
 
   function fileCoverUrl(source, book) {
+    if (getFileCoverUrl) return getFileCoverUrl(source, book);
     const browser = image.ownerDocument?.defaultView;
     if (!browser?.location?.href) return source;
-    const base = new URL(".", browser.location.href);
-    const controller = browser.navigator?.serviceWorker?.controller;
-    const bookId = getBookId?.() || book.id;
-    if (new URL(source).origin !== base.origin) return source;
-    if (!isPlayerServiceWorker(controller, base) || !bookId || !book.id) return null;
-    const url = new URL("__compact_player_offline__/cover.json", base);
-    url.searchParams.set("url", source);
-    url.searchParams.set("version", String(book.cacheVersion ?? 1));
-    url.searchParams.set("book", bookId);
-    url.searchParams.set("config", book.id);
-    return url.href;
+    return new URL(source).origin === browser.location.origin ? null : source;
   }
 
   async function loadFileCoverFallback(source, book, generation, onError) {
@@ -92,6 +96,7 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
       coverFailed(generation);
       return;
     }
+    pendingOfflineCover ||= !isOnline();
     const controller = new AbortController();
     coverController = controller;
     try {
@@ -104,7 +109,7 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
       coverObjectUrl = URL.createObjectURL(new Blob([cover.data], { type: cover.mime }));
       showCoverImage(coverObjectUrl, generation, () => coverFailed(generation, new Error("The embedded cover image could not be decoded.")));
     } catch (error) {
-      if (error?.name !== "AbortError") coverFailed(generation, error);
+      if (!controller.signal.aborted) coverFailed(generation, error);
     } finally {
       if (coverController === controller) coverController = null;
     }
@@ -117,11 +122,17 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
       if (usingEmbedded && previousUrl !== sourceUrl) {
         clearImage();
         void applyEmbeddedCover(coverGeneration);
+      } else if (reconnectSourceUrl !== null) {
+        reconnectSourceUrl = sourceUrl;
       }
       return;
     }
     currentBook = book;
     currentLanguage = language;
+    loadCover(book);
+  }
+
+  function loadCover(book) {
     usingEmbedded = false;
     clearImage();
     const generation = coverGeneration;
@@ -129,6 +140,7 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
     if (mode === "none") return;
     const configuredCover = resolveCover(book);
     if ((mode === "file" || mode === "auto") && configuredCover) {
+      pendingOfflineCover = !isOnline();
       const url = fileCoverUrl(configuredCover, book);
       const fail = (error) => {
         if (mode === "auto") void applyEmbeddedCover(generation);
@@ -146,10 +158,21 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
     if (mode === "embedded" || mode === "auto") void applyEmbeddedCover(generation);
   }
 
+  function retryCover(source) {
+    if (!currentBook || !isOnline()) return;
+    const nextSourceUrl = source?.url || "";
+    if (coverNeedsRetry) {
+      sourceUrl = nextSourceUrl;
+      loadCover(currentBook);
+    } else if (pendingOfflineCover) {
+      reconnectSourceUrl = nextSourceUrl;
+    }
+  }
+
   function clearCover() {
     currentBook = null;
     clearImage();
   }
 
-  return { applyCover, clearCover };
+  return { applyCover, retryCover, clearCover };
 }

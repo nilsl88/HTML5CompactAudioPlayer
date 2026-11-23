@@ -67,7 +67,7 @@ export async function fetchWithRetry(url, options = {}, readResponse) {
     try {
       response = await fetchImpl(url, { ...fetchOptions, signal: controller.signal });
       if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === retries - 1) {
-        return readResponse ? await readResponse(response) : response;
+        return readResponse ? await readResponse(response, controller.signal) : response;
       }
       lastError = new Error(`Request failed with HTTP ${response.status}`);
       controller.abort();
@@ -90,9 +90,9 @@ export async function fetchWithRetry(url, options = {}, readResponse) {
   throw lastError || new Error("Request failed");
 }
 
-export function fetchTextWithRetry(url, options) {
-  return fetchWithRetry(url, options, async (response) => ({
-    ok: response.ok, status: response.status, headers: response.headers, text: response.ok ? await response.text() : "",
+export function fetchTextWithRetry(url, options, readText = (response) => response.text()) {
+  return fetchWithRetry(url, options, async (response, signal) => ({
+    ok: response.ok, status: response.status, headers: response.headers, text: response.ok ? await readText(response, signal) : "",
   }));
 }
 
@@ -111,8 +111,10 @@ export function asRecord(value) {
 export function isPlayerServiceWorker(worker, baseUrl) {
   try {
     const url = new URL(worker?.scriptURL);
-    const expected = new URL("sw.js", baseUrl);
-    return url.origin === expected.origin && url.pathname === expected.pathname;
+    const scope = new URL(".", baseUrl);
+    if (url.origin !== scope.origin || !url.pathname.startsWith(scope.pathname)) return false;
+    const file = url.pathname.slice(scope.pathname.length);
+    return file === "sw.js" || /^sw-[a-f0-9]{64}\.js$/.test(file);
   } catch {
     return false;
   }

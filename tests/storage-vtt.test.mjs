@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PlayerStorage } from "../js/storage.js?v=19";
-import { parseWebVtt } from "../js/vtt.js?v=19";
+import { PlayerStorage } from "../js/storage.js?v=20";
+import { parseWebVtt } from "../js/vtt.js?v=20";
 
 class MemoryStorage {
   map = new Map();

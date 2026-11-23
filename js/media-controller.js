@@ -1,5 +1,5 @@
-import { SourceFallback } from "./source-selection.js?v=19";
-import { clamp } from "./utils.js?v=19";
+import { SourceFallback } from "./source-selection.js?v=20";
+import { clamp } from "./utils.js?v=20";
 
 export class MediaController {
   constructor(audio, callbacks = {}, { sourceTimeoutMs = 15000, isOnline = () => globalThis.navigator?.onLine !== false } = {}) {
@@ -10,6 +10,7 @@ export class MediaController {
     this.generation = 0;
     this.playAttempt = 0;
     this.fallback = new SourceFallback();
+    this.resetSourceAttempts();
     this.playbackIntent = false;
     this.desiredTime = 0;
     this.playbackRate = 1;
@@ -83,6 +84,7 @@ export class MediaController {
     if (this.events.signal.aborted) return Promise.resolve(false);
     this.generation += 1;
     this.fallback = new SourceFallback(sources, selectedId);
+    this.resetSourceAttempts();
     this.desiredTime = Math.max(0, Number(position) || 0);
     this.playbackIntent = Boolean(shouldPlay && this.currentSource());
     this.clearTimeout();
@@ -94,7 +96,7 @@ export class MediaController {
   }
 
   togglePlayback() {
-    if (this.playbackIntent) return this.requestPause();
+    if (this.canPause) return this.requestPause();
     return this.requestPlay();
   }
 
@@ -104,11 +106,12 @@ export class MediaController {
     this.playbackIntent = true;
     if (this.fallback.exhausted) {
       this.generation += 1;
+      this.resetSourceAttempts();
       return this.loadSource(this.fallback.restart(), true);
     }
-    if (this.reloadOnReconnect && this.isOnline()) {
+    if (this.reloadOnReconnect && (this.isOnline() || this.usingSavedSource)) {
       this.generation += 1;
-      this.fallback.savedAttempted = false;
+      this.resetSourceAttempts();
       return this.loadSource(source, true);
     }
     if (!this.audio.src) return this.loadSource(source, true);
@@ -154,24 +157,43 @@ export class MediaController {
 
   currentSource() { return this.fallback.current; }
 
-  async loadSource(source, shouldPlay, playbackUrl = source.url) {
-    if (shouldPlay && !this.isOnline() && playbackUrl === source.url && !this.fallback.savedAttempted) {
-      const savedUrl = this.callbacks.savedSourceUrl?.(source);
-      if (savedUrl) {
-        this.fallback.savedAttempted = true;
-        playbackUrl = savedUrl;
-      }
+  resetSourceAttempts() {
+    this.sourceAttempts = { saved: false, network: false, rejectCodec: false };
+  }
+
+  savedSource(source) {
+    if (this.sourceAttempts.saved) return null;
+    if (this.callbacks.savedSource) return this.callbacks.savedSource(source);
+    const url = this.callbacks.savedSourceUrl?.(source);
+    return url ? { url } : null;
+  }
+
+  async loadSource(source, shouldPlay, saved = null) {
+    const online = this.isOnline();
+    if (!saved && shouldPlay && !online) saved = this.savedSource(source);
+    if (!saved && this.callbacks.allowNetworkSource?.(source) === false) {
+      this.clearTimeout();
+      if (this.audio.src) this.clearSource();
+      this.reloadOnReconnect = true;
+      this.setState("stalled");
+      this.callbacks.onOffline?.();
+      return false;
     }
+    if (saved) {
+      this.sourceAttempts.saved = true;
+      // A switch to saved audio while offline permits one network retry after reconnect.
+      if (!online) this.sourceAttempts.network = false;
+    } else if (online) this.sourceAttempts.network = true;
     const generation = this.generation;
     this.reloadOnReconnect = false;
     this.loaded = false;
     this.hasStarted = false;
-    this.usingSavedSource = playbackUrl !== source.url;
+    this.usingSavedSource = Boolean(saved);
     this.internalPause = true;
     try { this.audio.pause(); } catch {}
     this.internalPause = false;
     this.audio.preload = shouldPlay ? "auto" : "metadata";
-    this.audio.src = playbackUrl;
+    this.audio.src = saved?.url || source.url;
     this.applyMediaSettings();
     this.setState("loading");
     this.callbacks.onSourceChange?.(source);
@@ -207,22 +229,28 @@ export class MediaController {
   async failCurrent(error, skipCodec = false, expectedUrl = this.currentSource()?.url) {
     const failed = this.currentSource();
     if (!failed || failed.url !== expectedUrl || this.fallback.exhausted) return false;
-    if (this.playbackIntent && !this.fallback.savedAttempted) {
-      const savedUrl = this.callbacks.savedSourceUrl?.(failed);
-      if (savedUrl) {
-        this.fallback.savedAttempted = true;
+    const online = this.isOnline();
+    if (this.playbackIntent && online && !this.sourceAttempts.network) {
+      this.generation += 1;
+      return this.loadSource(failed, true);
+    }
+    if (!this.usingSavedSource && this.sourceAttempts.network && online) this.sourceAttempts.rejectCodec ||= skipCodec;
+    if (this.playbackIntent && !this.usingSavedSource) {
+      const saved = this.savedSource(failed);
+      if (saved) {
         this.generation += 1;
-        return this.loadSource(failed, true, savedUrl);
+        return this.loadSource(failed, true, saved);
       }
     }
-    if (!this.isOnline()) {
+    if (!online) {
       if (this.usingSavedSource || this.audio.error || skipCodec) this.reloadOnReconnect = true;
       if (!this.playbackIntent) return false;
       this.setState("stalled");
       this.callbacks.onOffline?.();
       return false;
     }
-    const next = this.fallback.afterFailure(skipCodec);
+    const next = this.fallback.afterFailure(this.sourceAttempts.rejectCodec);
+    this.resetSourceAttempts();
     this.callbacks.onSourceFailure?.(failed, error);
     if (!next) {
       this.clearTimeout();
@@ -275,6 +303,7 @@ export class MediaController {
   }
   position() { return this.loaded && !this.audio.seeking && Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : this.desiredTime; }
   duration() { return Number.isFinite(this.audio.duration) && this.audio.duration > 0 ? this.audio.duration : 0; }
+  get canPause() { return this.playbackIntent && Boolean(this.audio.src); }
   get awaitingPlayback() { return this.playbackIntent && (this.state === "loading" || this.state === "stalled"); }
   setState(state) {
     if (state === this.state) return;

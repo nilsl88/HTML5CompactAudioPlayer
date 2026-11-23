@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=19">
+  <link rel="stylesheet" href="./player.css?v=20">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -22,6 +22,7 @@
         <span class="skeleton-progress"></span>
         <span class="skeleton-controls"></span>
       </div>
+      <button id="startupReload" class="secondary-button" type="button" hidden>Reload page</button>
 
       <div class="player-bar">
         <button id="playPauseBtn" class="play-button" type="button" aria-label="Play" disabled>
@@ -118,6 +119,7 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script type="module" src="./player.js?v=19"></script>
+  <script src="./js/startup-error.js?v=20"></script>
+  <script type="module" src="./player.js?v=20" id="playerEntry"></script>
 </body>
 </html>
