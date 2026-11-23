@@ -1,7 +1,7 @@
-import { openAvailabilityCache, readAvailabilityCache, clearAvailability } from "./availability-cache.js";
-import { openChapterCache } from "./chapter-cache.js";
-import { asRecord, normalizeLanguageTag } from "./utils.js";
-import { skipInterval } from "./preferences.js";
+import { openAvailabilityCache, readAvailabilityCache, clearAvailability } from "./availability-cache.js?v=19";
+import { openChapterCache } from "./chapter-cache.js?v=19";
+import { asRecord, normalizeLanguageTag } from "./utils.js?v=19";
+import { skipInterval } from "./preferences.js?v=19";
 
 const SCHEMA_VERSION = 2;
 const UI_FIELDS = ["theme", "fontSize", "uiLanguage", "playbackRate", "volume", "skipSeconds"];

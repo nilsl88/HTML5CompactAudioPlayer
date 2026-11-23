@@ -277,6 +277,12 @@ Startup still prefers a downloaded book while offline, then a valid query, a sav
 
 Migration is optional: existing configurations, catalogs, and links continue to work. If both configuration filenames exist, `book.json` wins. Avoid maintaining different versions of the same book under both filenames.
 
+### Updating the player shell
+
+For each player release, increment the shell version in `sw.js` and the `?v=` values in `index.html`, `player.js`, `i18n.js`, the JavaScript modules, and their test imports. The static tests check that the module URLs and service-worker shell use the same version. Upload the complete JavaScript and CSS files first, then the service worker, and publish `index.html` last. Keep books and site configuration in place.
+
+Versioned module URLs prevent a new player from using an older cached module when the cache distinguishes query strings. A cache may still serve an old `index.html` or service worker until it revalidates or expires. Configure the hosting server and any intermediary cache to revalidate those entry points and to include the query string in module cache keys. If an intermediary forces its own cache lifetime or serves a different origin, project changes alone cannot guarantee immediate updates. Query strings also do not preserve previous releases on the server: a cache miss for an old URL can receive the new file after deployment. Keep previous releases at distinct, retained paths if old pages must continue to load reliably throughout a rollout.
+
 The loader tries `episode.json` only after `book.json` returns HTTP 404/410 or a network failure, including a timeout or interrupted response body. The timeout covers the headers and the response body for book configurations, the library, WebVTT files, and MP4 metadata ranges. Malformed JSON, invalid book configurations, and other HTTP errors are reported directly. Failed loads remain retryable. Concurrent selection and title requests share one load, while a cancelled selection cannot update a newer one.
 
 Existing preferences and progress are read from the original storage keys until the installation saves its own values or is reset. Offline manifests retain their existing fields, including `episodeId` and `episodeTitle`. On offline startup the player uses the configuration URL recorded with the download. This also works for a custom book folder or a legacy `episode.json` when the catalog is unavailable.

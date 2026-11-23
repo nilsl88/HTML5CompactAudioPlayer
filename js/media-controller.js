@@ -1,5 +1,5 @@
-import { SourceFallback } from "./source-selection.js";
-import { clamp } from "./utils.js";
+import { SourceFallback } from "./source-selection.js?v=19";
+import { clamp } from "./utils.js?v=19";
 
 export class MediaController {
   constructor(audio, callbacks = {}, { sourceTimeoutMs = 15000, isOnline = () => globalThis.navigator?.onLine !== false } = {}) {

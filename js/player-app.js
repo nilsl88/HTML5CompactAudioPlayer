@@ -1,23 +1,23 @@
-import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=18";
-import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js";
-import { BookSelection } from "./book-selection.js";
-import { AvailabilitySession } from "./availability-session.js";
-import { createCustomSelects } from "./custom-select.js";
-import { isMp4Audio, qualityLabelKey } from "./codecs.js";
-import { createChapterPanel } from "./chapter-panel.js";
-import { ChapterSession } from "./chapter-session.js";
-import { localizedValue, normalizeLibrary, resolveCover } from "./config.js";
-import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./dialogs.js";
-import { createMediaSession } from "./media-session.js";
-import { MediaController } from "./media-controller.js";
-import { createCoverView } from "./cover.js";
-import { createOfflinePanel } from "./offline-panel.js";
-import { OfflineManager, manifestMatchesSelection } from "./offline.js";
-import { visibleSources } from "./source-selection.js";
-import { SKIP_INTERVALS, skipInterval } from "./preferences.js";
-import { ProgressWriter } from "./progress-writer.js";
-import { SleepTimer } from "./sleep-timer.js";
-import { clearChildren, clamp, formatTime, safeUrl, setText, UNKNOWN_TIME } from "./utils.js";
+import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=19";
+import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js?v=19";
+import { BookSelection } from "./book-selection.js?v=19";
+import { AvailabilitySession } from "./availability-session.js?v=19";
+import { createCustomSelects } from "./custom-select.js?v=19";
+import { isMp4Audio, qualityLabelKey } from "./codecs.js?v=19";
+import { createChapterPanel } from "./chapter-panel.js?v=19";
+import { ChapterSession } from "./chapter-session.js?v=19";
+import { localizedValue, normalizeLibrary, resolveCover } from "./config.js?v=19";
+import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./dialogs.js?v=19";
+import { createMediaSession } from "./media-session.js?v=19";
+import { MediaController } from "./media-controller.js?v=19";
+import { createCoverView } from "./cover.js?v=19";
+import { createOfflinePanel } from "./offline-panel.js?v=19";
+import { OfflineManager, manifestMatchesSelection } from "./offline.js?v=19";
+import { visibleSources } from "./source-selection.js?v=19";
+import { SKIP_INTERVALS, skipInterval } from "./preferences.js?v=19";
+import { ProgressWriter } from "./progress-writer.js?v=19";
+import { SleepTimer } from "./sleep-timer.js?v=19";
+import { clearChildren, clamp, formatTime, isPlayerServiceWorker, safeUrl, setText, UNKNOWN_TIME } from "./utils.js?v=19";
 
 export function startPlayer({ window, storage, fetchImpl }) {
   const { document, location, navigator } = window;
@@ -549,7 +549,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     savedSourceUrl: (source) => {
       const selection = currentOfflineSelection();
       const saved = offline.snapshot().active;
-      if (navigator.serviceWorker?.controller?.scriptURL !== new URL("sw.js", documentBaseUrl).href
+      if (!isPlayerServiceWorker(navigator.serviceWorker?.controller, documentBaseUrl)
         || !selection || source !== bookSelection.source
         || !manifestMatchesSelection(saved, selection)) return "";
       const url = new URL("__compact_player_offline__/audio.json", documentBaseUrl);

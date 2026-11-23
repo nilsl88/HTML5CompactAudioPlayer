@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { BookConfigStore } from "../js/book-config.js";
-import { inspectAudioRange, downloadChunks } from "../js/offline-transfer.js";
-import { normalizeLibrary } from "../js/config.js";
-import { buildSources, chooseDefaultSource } from "../js/source-selection.js";
+import { BookConfigStore } from "../js/book-config.js?v=19";
+import { inspectAudioRange, downloadChunks } from "../js/offline-transfer.js?v=19";
+import { normalizeLibrary } from "../js/config.js?v=19";
+import { buildSources, chooseDefaultSource } from "../js/source-selection.js?v=19";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { createCoverView } from "../js/cover.js";
-import { loadChapterFile } from "../js/chapters.js";
+import { createCoverView } from "../js/cover.js?v=19";
+import { loadChapterFile } from "../js/chapters.js?v=19";
 import {
   OfflineManager,
   chunkBounds,
@@ -20,7 +20,7 @@ import {
   offlineManifestUrl,
   parseContentRange,
   validManifest,
-} from "../js/offline.js";
+} from "../js/offline.js?v=19";
 
 class MemoryCache {
   map = new Map();
@@ -71,7 +71,7 @@ async function workerContext(globals = {}, decorateContract) {
   context.importScripts = (...paths) => {
     for (const path of paths) {
       vm.runInContext(readFileSync(new URL(path, workerUrl), "utf8"), context);
-      if (decorateContract && path === "./js/offline-manifest.js") {
+      if (decorateContract && new URL(path, workerUrl).pathname === new URL("./js/offline-manifest.js", workerUrl).pathname) {
         context.CompactPlayerOfflineManifest = decorateContract(context.CompactPlayerOfflineManifest);
       }
     }
@@ -161,7 +161,7 @@ test("a stalled player navigation uses the installed shell and keeps waiting whe
   const page = new Request(scope + "?book=north");
   Object.defineProperty(page, "mode", { value: "navigate" });
   const module = new Request(scope + "js/config.js");
-  for (const [request, key, content] of [[page, scope + "index.html", "saved page"], [module, module.url, "saved module"]]) {
+  for (const [request, key, content] of [[page, scope + "index.html?v=19", "saved page"], [module, module.url, "saved module"]]) {
     const server = deferred();
     let signal;
     worker.fetch = (_request, options) => { signal = options?.signal; return server.promise; };
@@ -186,7 +186,7 @@ test("a stalled player navigation uses the installed shell and keeps waiting whe
   const uncached = worker.networkFirst(page);
   t.mock.timers.tick(60_000);
   await settle();
-  const live = new Response("slow live page");
+  const live = new Response('<link rel="stylesheet" href="./player.css?v=19"><script type="module" src="./player.js?v=19"></script>');
   server.resolve(live);
   assert.equal(await uncached, live);
 
@@ -197,7 +197,7 @@ test("a stalled player navigation uses the installed shell and keeps waiting whe
   const pending = worker.networkFirst(page);
   t.mock.timers.tick(3000);
   await settle();
-  const fresh = new Response("live page while cache is opening");
+  const fresh = new Response('<link rel="stylesheet" href="./player.css?v=19"><script type="module" src="./player.js?v=19"></script>');
   origin.resolve(fresh);
   assert.equal(await pending, fresh);
   disk.resolve(shell);
@@ -208,7 +208,7 @@ test("navigation preserves missing-page responses and returns cached content onl
   const caches = new MemoryCacheStorage();
   const worker = await workerContext({ caches, self: { registration: { scope }, addEventListener() {} } });
   const shell = await caches.open(vm.runInContext("SHELL_CACHE", worker));
-  await shell.put(scope + "index.html", new Response("player page"));
+  await shell.put(scope + "index.html?v=19", new Response("player page"));
   await shell.put(scope + "js/config.js", new Response("player module"));
   const manifest = { ...selection(), schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved-book",
     totalSize: 10, chunkSize: 10, totalChunks: 1, completed: [0] };
@@ -2493,4 +2493,16 @@ test("a truncated or oversized unversioned response cannot replace a playable do
     await assert.rejects(manager.start(selection()), { code: "incomplete" });
     assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
   }
+});
+
+test("worker registration uses the current version without cached imports", async () => {
+  const navigator = navigatorStub();
+  const calls = [];
+  navigator.serviceWorker.register = async (script, options) => { calls.push({ script, options }); return {}; };
+  const manager = new OfflineManager({ baseUrl: "https://example.test/player/", cacheStorage: new MemoryCacheStorage(),
+    navigatorObject: navigator, fetchImpl: async () => new Response(null, { status: 404 }) });
+  await manager.init();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].script.href, "https://example.test/player/sw.js?v=19");
+  assert.deepEqual(calls[0].options, { scope: "/player/", updateViaCache: "none" });
 });

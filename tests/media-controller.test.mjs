@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MediaController } from "../js/media-controller.js";
+import { MediaController } from "../js/media-controller.js?v=19";
 
 class FakeAudio extends EventTarget {
   src = "";

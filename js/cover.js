@@ -1,6 +1,7 @@
-import { resolveCover } from "./config.js";
-import { loadEmbeddedMp4Cover } from "./mp4-chapters.js";
-import "./offline-manifest.js";
+import { resolveCover } from "./config.js?v=19";
+import { isPlayerServiceWorker } from "./utils.js?v=19";
+import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=19";
+import "./offline-manifest.js?v=19";
 
 export function createCoverView(image, button, { fetchImpl, getBookId, canUseCachedCover, canUseNativeCover, onShown, onFailure }) {
   let coverGeneration = 0;
@@ -49,7 +50,7 @@ export function createCoverView(image, button, { fetchImpl, getBookId, canUseCac
     const controller = browser.navigator?.serviceWorker?.controller;
     const bookId = getBookId?.() || book.id;
     if (new URL(source).origin !== base.origin) return source;
-    if (controller?.scriptURL !== new URL("sw.js", base).href || !bookId || !book.id) return null;
+    if (!isPlayerServiceWorker(controller, base) || !bookId || !book.id) return null;
     const url = new URL("__compact_player_offline__/cover.json", base);
     url.searchParams.set("url", source);
     url.searchParams.set("version", String(book.cacheVersion ?? 1));

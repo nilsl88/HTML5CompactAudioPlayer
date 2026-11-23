@@ -1,5 +1,5 @@
-import { normalizeLanguageTag, safeUrl } from "./utils.js";
-import { CODECS } from "./codecs.js";
+import { normalizeLanguageTag, safeUrl } from "./utils.js?v=19";
+import { CODECS } from "./codecs.js?v=19";
 
 export { CODECS };
 

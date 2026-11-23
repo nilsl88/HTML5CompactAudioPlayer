@@ -1,14 +1,14 @@
 import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
-import { createCustomSelects } from "../js/custom-select.js";
-import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js";
+import { createCustomSelects } from "../js/custom-select.js?v=19";
+import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=19";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { OfflineManager } from "../js/offline.js";
-import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js";
-import { BookSelection } from "../js/book-selection.js";
-import { normalizeBook } from "../js/config.js";
-import { buildSources } from "../js/source-selection.js";
+import { OfflineManager } from "../js/offline.js?v=19";
+import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=19";
+import { BookSelection } from "../js/book-selection.js?v=19";
+import { normalizeBook } from "../js/config.js?v=19";
+import { buildSources } from "../js/source-selection.js?v=19";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },

@@ -107,3 +107,13 @@ export function setText(element, value) {
 export function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
+
+export function isPlayerServiceWorker(worker, baseUrl) {
+  try {
+    const url = new URL(worker?.scriptURL);
+    const expected = new URL("sw.js", baseUrl);
+    return url.origin === expected.origin && url.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}

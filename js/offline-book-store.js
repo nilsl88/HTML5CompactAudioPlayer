@@ -1,7 +1,7 @@
-import "./offline-manifest.js";
-import { sameOfflineSelection, manifestMatchesSelection, validateOfflineBookConfig } from "./offline-selection.js";
-export { sameOfflineSelection, manifestMatchesSelection } from "./offline-selection.js";
-import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled } from "./offline-transfer.js";
+import "./offline-manifest.js?v=19";
+import { sameOfflineSelection, manifestMatchesSelection, validateOfflineBookConfig } from "./offline-selection.js?v=19";
+export { sameOfflineSelection, manifestMatchesSelection } from "./offline-selection.js?v=19";
+import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled } from "./offline-transfer.js?v=19";
 
 const { validManifest, audioMimeType, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
   offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl, chunkByteLength } = globalThis.CompactPlayerOfflineManifest;
