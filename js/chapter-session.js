@@ -1,5 +1,5 @@
-import { loadChapters } from "./chapters.js?v=20";
-import { resolveLanguageAsset } from "./config.js?v=20";
+import { loadChapters } from "./chapters.js?v=22";
+import { resolveLanguageAsset } from "./config.js?v=22";
 
 export class ChapterSession {
   constructor({ fetchImpl, openCache, isOnline = () => globalThis.navigator?.onLine !== false, onStart, onLoaded, onFailure }) {

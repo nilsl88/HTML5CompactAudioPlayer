@@ -1,5 +1,5 @@
-import { createAbortError, normalizeLanguageTag, safeUrl } from "./utils.js?v=20";
-import { CODECS } from "./codecs.js?v=20";
+import { createAbortError, normalizeLanguageTag, safeUrl } from "./utils.js?v=22";
+import { CODECS } from "./codecs.js?v=22";
 
 export { CODECS };
 
@@ -13,7 +13,7 @@ class BookConfigTooLargeError extends Error {
   }
 }
 
-export async function readBookConfigText(response, signal) {
+export async function readBoundedText(response, signal, maxBytes, tooLarge) {
   const body = response.body;
   if (signal?.aborted) {
     void body?.cancel().catch(() => { /* The fetch may already have canceled the stream. */ });
@@ -40,7 +40,7 @@ export async function readBookConfigText(response, signal) {
         return text + decoder.decode();
       }
       bytes += value.byteLength;
-      if (bytes > BOOK_CONFIG_MAX_BYTES) throw new BookConfigTooLargeError();
+      if (bytes > maxBytes) throw tooLarge();
       text += decoder.decode(value, { stream: true });
     }
   } finally {
@@ -48,6 +48,10 @@ export async function readBookConfigText(response, signal) {
     cancel();
     reader.releaseLock();
   }
+}
+
+export function readBookConfigText(response, signal) {
+  return readBoundedText(response, signal, BOOK_CONFIG_MAX_BYTES, () => new BookConfigTooLargeError());
 }
 
 function audioLanguageTag(value) {

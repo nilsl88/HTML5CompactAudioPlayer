@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PlayerWorker } from "../js/player-worker.js?v=20";
+import { PlayerWorker } from "../js/player-worker.js?v=22";
 
 const baseUrl = "https://example.test/listen/";
 const sourceUrl = baseUrl + "media/book/recording.m4b";
@@ -146,4 +146,254 @@ test("the bridge worker for the same release keeps offline access without a new 
   await worker.register();
   await worker.prepare(download);
   assert.match(worker.savedAudio(download)?.url, /audio\.json\?download=one$/);
+});
+
+test("a capability timeout is retried and restores offline writes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const workers = new EventTarget();
+  workers.controller = {
+    scriptURL: baseUrl + "sw.js",
+    postMessage({ type }, [reply]) {
+      calls++;
+      if (calls > 1) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1 });
+      reply.close();
+    },
+  };
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers }, fetchImpl: assert.fail });
+  let recovered = 0;
+  worker.listen(assert.fail, () => { recovered++; });
+  const first = worker.supportsOfflineWrites();
+  t.mock.timers.tick(750);
+  assert.equal(await first, false);
+  t.mock.timers.tick(5000);
+  await worker.connection.hello;
+  assert.equal(await worker.supportsOfflineWrites(), true);
+  assert.equal(recovered, 1);
+  assert.equal(calls, 2);
+});
+
+test("an unknown hashed controller is not replaced by an older release", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const workers = {
+    controller: { scriptURL: baseUrl + `sw-${"b".repeat(64)}.js`, postMessage(_, [reply]) { reply.close(); } },
+    register: t.mock.fn(),
+  };
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: `sw-${"a".repeat(64)}.js`, releaseSequence: 1 });
+  const registration = worker.register();
+  t.mock.timers.tick(750);
+  await registration;
+  assert.equal(workers.register.mock.callCount(), 0);
+});
+
+test("opening offline controls can recover after repeated capability timeouts", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let attempts = 0;
+  const workers = new EventTarget();
+  workers.controller = {
+    scriptURL: baseUrl + "sw.js",
+    postMessage({ type }, [reply]) {
+      attempts++;
+      if (attempts >= 3) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1 });
+      reply.close();
+    },
+  };
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers } });
+  let updates = 0;
+  worker.listen(assert.fail, () => updates++);
+  const initial = worker.supportsOfflineWrites();
+  t.mock.timers.tick(750);
+  assert.equal(await initial, false);
+  t.mock.timers.tick(5000);
+  t.mock.timers.tick(750);
+  await worker.connection.hello;
+  assert.equal(worker.canWriteOfflineJournal, false);
+  assert.equal(await worker.retryCapabilities(), true);
+  assert.equal(attempts, 3);
+  assert.equal(updates, 1);
+});
+
+test("a delayed reply from an older worker resumes registration of the newer release", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  const workers = new EventTarget();
+  let attempts = 0;
+  workers.controller = {
+    scriptURL: baseUrl + `sw-${oldId}.js`,
+    postMessage({ type }, [reply]) {
+      if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
+        offlineJournal: 1, sequence: 1, releaseId: oldId });
+      reply.close();
+    },
+  };
+  const registrations = [];
+  workers.register = async (url) => { registrations.push(url.href); };
+  workers.ready = Promise.resolve();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: `sw-${newId}.js`, releaseSequence: 2 });
+  worker.listen(assert.fail);
+  const initial = worker.register();
+  t.mock.timers.tick(750);
+  await initial;
+  assert.deepEqual(registrations, []);
+  t.mock.timers.tick(5000);
+  await worker.connection.hello;
+  await new Promise(setImmediate);
+  assert.deepEqual(registrations, [baseUrl + `sw-${newId}.js`]);
+});
+
+test("a delayed newer controller does not downgrade to the current page", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  const workers = new EventTarget();
+  let attempts = 0;
+  workers.controller = {
+    scriptURL: baseUrl + `sw-${newId}.js`,
+    postMessage({ type }, [reply]) {
+      if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
+        offlineJournal: 1, sequence: 2, releaseId: newId });
+      reply.close();
+    },
+  };
+  workers.register = t.mock.fn();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: `sw-${oldId}.js`, releaseSequence: 1 });
+  worker.listen(assert.fail);
+  const initial = worker.register();
+  t.mock.timers.tick(750);
+  await initial;
+  t.mock.timers.tick(5000);
+  await worker.connection.hello;
+  await new Promise(setImmediate);
+  assert.equal(workers.register.mock.callCount(), 0);
+});
+
+test("a controller change resumes a deferred update against the replacement controller", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  const workers = new EventTarget();
+  workers.controller = { scriptURL: baseUrl + `sw-${oldId}.js`, postMessage(_, [reply]) { reply.close(); } };
+  const registrations = [];
+  workers.register = async (url) => { registrations.push(url.href); };
+  workers.ready = Promise.resolve();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers, onLine: true },
+    scriptName: `sw-${newId}.js`, releaseSequence: 2 });
+  worker.listen(assert.fail);
+  const initial = worker.register();
+  t.mock.timers.tick(750);
+  await initial;
+  workers.controller = {
+    scriptURL: baseUrl + "sw.js",
+    postMessage({ type }, [reply]) {
+      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1, sequence: 1, releaseId: oldId });
+      reply.close();
+    },
+  };
+  workers.dispatchEvent(new Event("controllerchange"));
+  await worker.connection.hello;
+  await new Promise(setImmediate);
+  assert.deepEqual(registrations, [baseUrl + `sw-${newId}.js`]);
+});
+
+test("a failed deferred registration can be retried from Options", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  let attempts = 0;
+  let registrations = 0;
+  const workers = new EventTarget();
+  workers.controller = {
+    scriptURL: baseUrl + `sw-${oldId}.js`,
+    postMessage({ type }, [reply]) {
+      if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
+        offlineJournal: 1, sequence: 1, releaseId: oldId });
+      reply.close();
+    },
+  };
+  workers.register = async () => {
+    if (++registrations === 1) throw new TypeError("Temporary registration failure");
+  };
+  workers.ready = Promise.resolve();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: `sw-${newId}.js`, releaseSequence: 2 });
+  worker.listen(assert.fail);
+  const initial = worker.register();
+  t.mock.timers.tick(750);
+  await initial;
+  t.mock.timers.tick(5000);
+  await worker.connection.hello;
+  await new Promise(setImmediate);
+  assert.equal(registrations, 1);
+  assert.equal(await worker.retryCapabilities(), true);
+  assert.equal(registrations, 2);
+  assert.equal(worker.connection.registrationDeferred, false);
+});
+
+test("a deferred update resumes if the old controller disappears", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  const workers = new EventTarget();
+  workers.controller = { scriptURL: baseUrl + `sw-${oldId}.js`, postMessage(_, [reply]) { reply.close(); } };
+  const registrations = [];
+  workers.register = async (url) => { registrations.push(url.href); };
+  workers.ready = Promise.resolve();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers, onLine: true },
+    scriptName: `sw-${newId}.js`, releaseSequence: 2 });
+  worker.listen(assert.fail);
+  const initial = worker.register();
+  t.mock.timers.tick(750);
+  await initial;
+  workers.controller = null;
+  workers.dispatchEvent(new Event("controllerchange"));
+  await new Promise(setImmediate);
+  assert.deepEqual(registrations, [baseUrl + `sw-${newId}.js`]);
+});
+
+test("a hashed controller without a release sequence is rechecked before an update", async () => {
+  const oldId = "a".repeat(64);
+  const newId = "b".repeat(64);
+  const workers = new EventTarget();
+  let sequence;
+  workers.controller = {
+    scriptURL: baseUrl + `sw-${newId}.js`,
+    postMessage({ type }, [reply]) {
+      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1, sequence, releaseId: newId });
+      reply.close();
+    },
+  };
+  let registrations = 0;
+  workers.register = async () => { registrations++; };
+  workers.ready = Promise.resolve();
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: `sw-${oldId}.js`, releaseSequence: 1 });
+  worker.listen(assert.fail);
+  await worker.register();
+  assert.equal(registrations, 0);
+  assert.equal(worker.connection.registrationDeferred, true);
+  sequence = 2;
+  await worker.retryCapabilities();
+  assert.equal(registrations, 0);
+  assert.equal(worker.connection.registrationDeferred, false);
+});
+
+test("a silent bridge updates its own registration instead of installing an old page's worker", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const controller = { scriptURL: baseUrl + "sw.js", postMessage(_, [reply]) { reply.close(); } };
+  const update = t.mock.fn(async () => {});
+  const workers = {
+    controller, register: assert.fail,
+    getRegistration: async () => ({ active: controller, update }),
+  };
+  const client = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers },
+    scriptName: "sw-" + "a".repeat(64) + ".js", releaseSequence: 1 });
+  const registration = client.register();
+  t.mock.timers.tick(750);
+  await registration;
+  assert.equal(update.mock.callCount(), 1);
 });

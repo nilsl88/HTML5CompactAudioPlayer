@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { setImmediate as settle } from "node:timers/promises";
-import { probeUrl } from "../js/availability.js?v=20";
+import { probeUrl } from "../js/availability.js?v=22";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { resolveUiLocale, translateAt, uiLanguageOptions, UI_STRINGS } from "../i18n.js?v=20";
+import { resolveUiLocale, translateAt, uiLanguageOptions, UI_STRINGS } from "../i18n.js?v=22";
 
 function response(status) {
   return { status, ok: status >= 200 && status < 300, body: { cancel: async () => {} } };

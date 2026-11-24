@@ -1,6 +1,6 @@
-import { parseContentRange } from "./http-range.js?v=20";
-import "./offline-manifest.js?v=20";
-import { createAbortError } from "./utils.js?v=20";
+import { parseContentRange } from "./http-range.js?v=22";
+import "./offline-manifest.js?v=22";
+import { createAbortError } from "./utils.js?v=22";
 
 const { audioMimeType, strongETag, strongLastModified, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
   maxChunkBytes } = globalThis.CompactPlayerOfflineManifest;

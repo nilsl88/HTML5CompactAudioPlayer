@@ -1,4 +1,4 @@
-import { normalizeLanguageTag } from "./js/utils.js?v=20";
+import { normalizeLanguageTag } from "./js/utils.js?v=22";
 
 export const UI_STRINGS = {
   en: {

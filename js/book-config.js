@@ -1,18 +1,23 @@
-import { normalizeLibrary, parseBookConfig, parseJson, readBookConfigText } from "./config.js?v=20";
-export { validateOfflineBookConfig } from "./offline-selection.js?v=20";
-import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=20";
-import "./offline-manifest.js?v=20";
+import { normalizeLibrary, parseBookConfig, parseJson, readBookConfigText, readBoundedText } from "./config.js?v=22";
+export { validateOfflineBookConfig } from "./offline-selection.js?v=22";
+import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=22";
+import "./offline-manifest.js?v=22";
 
 const { versionHeader, networkStatusHeader } = globalThis.CompactPlayerOfflineManifest;
+const MAX_CACHED_CONFIGS = 24;
 
 function isDownloadedResponse(response) {
   return response.headers?.get?.(versionHeader) != null;
 }
 
+export function readLibraryText(response, signal) {
+  return readBoundedText(response, signal, 2 * 1024 ** 2, () => new Error("Library catalog exceeds 2 MiB."));
+}
+
 export function fetchLibraryCatalog(url, fetchImpl) {
-  return fetchWithRetry(url, { fetchImpl, cache: "no-store", credentials: "same-origin" }, async (response) => {
+  return fetchWithRetry(url, { fetchImpl, cache: "no-store", credentials: "same-origin" }, async (response, signal) => {
     if (!response.ok) return null;
-    const library = normalizeLibrary(parseJson(await response.text(), "media/library.json"));
+    const library = normalizeLibrary(parseJson(await readLibraryText(response, signal), "media/library.json"));
     return { library, fromDownload: isDownloadedResponse(response) };
   });
 }
@@ -46,6 +51,8 @@ export class BookConfigStore {
     this.documentBaseUrl = documentBaseUrl;
     this.fetchOptions = { fetchImpl, retries, retryDelayMs, timeoutMs, credentials: "same-origin" };
     this.cache = new Map();
+    this.titles = new Map();
+    this.selectedKey = null;
     this.requests = new Map();
     this.titlesRequest = null;
   }
@@ -56,16 +63,19 @@ export class BookConfigStore {
     this.library = library;
     if (!fromDownload) this.downloadedConfig = null;
     if (saved?.fromDownload && this.configUrls(recordedId).includes(saved.configUrl)) {
-      this.cache.set(this.configKey(recordedId), saved);
+      const key = this.configKey(recordedId);
+      this.rememberConfig(key, saved);
+      this.titles.set(key, saved.book.title);
     }
     const retained = new Set();
     for (const record of library.books) {
       const key = this.configKey(record.id);
       retained.add(key);
-      const cached = this.cache.get(key);
-      if (cached) record.title = cached.book.title;
+      const title = this.titles.get(key) ?? this.cache.get(key)?.book.title;
+      if (title) record.title = title;
     }
     for (const key of this.cache.keys()) if (!retained.has(key)) this.cache.delete(key);
+    for (const key of this.titles.keys()) if (!retained.has(key)) this.titles.delete(key);
     for (const [key, request] of this.requests) {
       if (key === this.configKey(request.id)) continue;
       this.requests.delete(key);
@@ -78,7 +88,7 @@ export class BookConfigStore {
     return JSON.stringify([id, recordedUrl, this.library.byId.get(id)?.folder || id]);
   }
 
-  async load(id, { signal, revalidate = false } = {}) {
+  async load(id, { signal, revalidate = false, titleOnly = false } = {}) {
     while (!signal?.aborted) {
       const recordedUrl = this.downloadedConfig?.id === id ? this.downloadedConfig.url : null;
       if (!recordedUrl && !isBookId(id, this.library)) throw new Error("Invalid book identifier.");
@@ -86,7 +96,11 @@ export class BookConfigStore {
       try {
         const lookup = this.sharedRequest(id, key, recordedUrl, revalidate);
         const result = await waitForConfig(lookup, signal);
-        if (result && !signal?.aborted && key === this.configKey(id)) return result;
+        if (result && !signal?.aborted && key === this.configKey(id)) {
+          if (!titleOnly) this.selectedKey = key;
+          this.rememberConfig(key, result);
+          return result;
+        }
       } catch (error) {
         if (signal?.aborted || key === this.configKey(id)) throw error;
       }
@@ -104,9 +118,12 @@ export class BookConfigStore {
     const cache = cached ? "no-cache" : "default";
     request.promise = waitForConfig(this.fetchConfig(id, recordedUrl, controller.signal, cache), controller.signal).then((result) => {
       if (controller.signal.aborted) return null;
-      this.cache.set(key, result);
+      this.rememberConfig(key, result);
       const record = this.library.byId.get(id);
-      if (record) record.title = result.book.title;
+      if (record) {
+        record.title = result.book.title;
+        this.titles.set(key, record.title);
+      }
       return result;
     }, (error) => {
       if (controller.signal.aborted) return null;
@@ -119,6 +136,17 @@ export class BookConfigStore {
       if (this.requests.get(key) === request) this.requests.delete(key);
     });
     return request.promise;
+  }
+
+  rememberConfig(key, result) {
+    this.cache.delete(key);
+    this.cache.set(key, result);
+    if (this.cache.size <= MAX_CACHED_CONFIGS) return;
+    for (const oldest of this.cache.keys()) {
+      if (oldest === this.selectedKey) continue;
+      this.cache.delete(oldest);
+      break;
+    }
   }
 
   configUrls(id, recordedUrl) {
@@ -171,13 +199,13 @@ export class BookConfigStore {
   loadTitles(onError = (id, error) => console.warn(`Could not load book title (${id}).`, error), onTitle) {
     if (this.titlesRequest) return this.titlesRequest;
     const library = this.library;
-    const records = library.books.filter((record) => !this.cache.has(this.configKey(record.id)));
+    const records = library.books.filter((record) => !this.titles.has(this.configKey(record.id)));
     if (!records.length) return Promise.resolve();
     let cursor = 0;
     const worker = async () => {
       while (library === this.library && cursor < records.length) {
         const record = records[cursor]; cursor += 1;
-        try { await this.load(record.id); }
+        try { await this.load(record.id, { titleOnly: true }); }
         catch (error) { onError(record.id, error); continue; }
         if (library === this.library) onTitle?.(record);
       }

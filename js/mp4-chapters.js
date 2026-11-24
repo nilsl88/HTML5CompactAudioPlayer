@@ -1,6 +1,6 @@
-import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js?v=20";
-import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=20";
-export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=20";
+import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js?v=22";
+import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=22";
+export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=22";
 export const MP4_COVER_LIMIT_BYTES = 10 * 1024 * 1024;
 const MAX_QUICKTIME_SAMPLES = 10_000;
 const MAX_SAMPLE_GAP_BYTES = 4096;
@@ -161,6 +161,7 @@ export async function loadEmbeddedMp4Cover(url, options = {}) {
 }
 
 export async function loadEmbeddedMp4Chapters(url, options = {}) {
+  const deadline = Date.now() + (options.timeoutMs ?? 20000);
   const metadata = await loadMp4Metadata(url, options);
   const { moovBuffer } = metadata;
   const nero = findAtoms(moovBuffer, "chpl");
@@ -187,7 +188,7 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
     throw error;
   }
   if (!samples?.length) return [];
-  const reader = new RangeReader(url, options, metadata);
+  const reader = new RangeReader(url, { ...options, deadline }, metadata);
   const chapters = [];
   for (let i = 0; i < samples.length;) {
     const start = samples[i].offset;

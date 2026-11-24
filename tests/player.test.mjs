@@ -1,14 +1,14 @@
 import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
-import { createCustomSelects } from "../js/custom-select.js?v=20";
-import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=20";
+import { createCustomSelects } from "../js/custom-select.js?v=22";
+import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=22";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { OfflineManager } from "../js/offline.js?v=20";
-import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=20";
-import { BookSelection } from "../js/book-selection.js?v=20";
-import { normalizeBook } from "../js/config.js?v=20";
-import { buildSources } from "../js/source-selection.js?v=20";
+import { OfflineManager } from "../js/offline.js?v=22";
+import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=22";
+import { BookSelection } from "../js/book-selection.js?v=22";
+import { normalizeBook } from "../js/config.js?v=22";
+import { buildSources } from "../js/source-selection.js?v=22";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
@@ -1252,4 +1252,12 @@ test("a successfully loaded empty catalog stays empty on reconnect", async (t) =
   await settle();
   assert.equal(catalogs, 1);
   assert.equal(elements.get("bookRow").hidden, true);
+});
+
+test("opening Options retries an unavailable worker connection", async (t) => {
+  const retry = t.mock.method(OfflineManager.prototype, "retryWorkerConnection", async () => {});
+  const page = await openPlayerPage(book, assert.fail, new Map());
+  await page.ready;
+  page.elements.get("optionsBtn").dispatchEvent(new Event("click"));
+  assert.equal(retry.mock.callCount(), 1);
 });

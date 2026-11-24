@@ -1,11 +1,15 @@
-import { resolveCover } from "./config.js?v=20";
-import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=20";
-import "./offline-manifest.js?v=20";
+import { resolveCover } from "./config.js?v=22";
+import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=22";
+import { fetchWithRetry } from "./utils.js?v=22";
+import "./offline-manifest.js?v=22";
+
+const COVER_TIMEOUT_MS = 8000;
 
 export function createCoverView(image, button, { fetchImpl, isOnline = () => true, getBookId, getFileCoverUrl, canUseCachedCover, canUseNativeCover, onShown, onFailure }) {
   let coverGeneration = 0;
   let coverController = null;
   let coverObjectUrl = "";
+  let imageTimeout;
   let currentBook = null;
   let currentLanguage = "";
   let sourceUrl = "";
@@ -21,6 +25,7 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     reconnectSourceUrl = null;
     coverController?.abort();
     coverController = null;
+    clearTimeout(imageTimeout);
     if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
     coverObjectUrl = "";
     button.hidden = true;
@@ -31,16 +36,26 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
   }
 
   function showCoverImage(src, generation, onFailure) {
+    clearTimeout(imageTimeout);
+    const fail = () => {
+      if (generation !== coverGeneration) return;
+      clearTimeout(imageTimeout);
+      image.onload = null;
+      image.onerror = null;
+      image.removeAttribute("src");
+      onFailure();
+    };
+    imageTimeout = setTimeout(fail, COVER_TIMEOUT_MS);
+    imageTimeout?.unref?.();
     image.onload = () => {
       if (generation !== coverGeneration) return;
+      clearTimeout(imageTimeout);
       pendingOfflineCover = false;
       reconnectSourceUrl = null;
       button.hidden = false;
       onShown();
     };
-    image.onerror = () => {
-      if (generation === coverGeneration) onFailure();
-    };
+    image.onerror = fail;
     image.src = src;
   }
 
@@ -67,19 +82,24 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     const controller = new AbortController();
     coverController = controller;
     try {
-      const response = await fetchImpl(source, { mode: "no-cors", cache: "no-cache", credentials: "same-origin", signal: controller.signal });
-      if (response.type === "opaque") {
+      const blob = await fetchWithRetry(source, {
+        fetchImpl, mode: "no-cors", cache: "no-cache", credentials: "same-origin",
+        signal: controller.signal, timeoutMs: COVER_TIMEOUT_MS, retries: 1,
+      }, async (response) => {
+        if (response.type === "opaque") return null;
+        if (!response.ok) throw new Error("The cover image could not be loaded.");
+        const { checkResponseVersion, versionHeader } = globalThis.CompactPlayerOfflineManifest;
+        checkResponseVersion(response, book.cacheVersion);
+        if (response.headers.get(versionHeader) != null && !await canUseCachedCover?.(book)) {
+          throw new Error("The downloaded cover belongs to a different book.");
+        }
+        return response.blob();
+      });
+      if (blob === null) {
         if (!await canUseNativeCover?.(book)) throw new Error("The cover image could not be checked against the downloaded book.");
         if (!controller.signal.aborted && generation === coverGeneration) showCoverImage(source, generation, onError);
         return;
       }
-      if (!response.ok) throw new Error("The cover image could not be loaded.");
-      const { checkResponseVersion, versionHeader } = globalThis.CompactPlayerOfflineManifest;
-      checkResponseVersion(response, book.cacheVersion);
-      if (response.headers.get(versionHeader) != null && !await canUseCachedCover?.(book)) {
-        throw new Error("The downloaded cover belongs to a different book.");
-      }
-      const blob = await response.blob();
       if (controller.signal.aborted || generation !== coverGeneration) return;
       coverObjectUrl = URL.createObjectURL(blob);
       showCoverImage(coverObjectUrl, generation, onError);

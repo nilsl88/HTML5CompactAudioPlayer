@@ -1,7 +1,7 @@
-import { parseBookConfig } from "./config.js?v=20";
-import { buildSources } from "./source-selection.js?v=20";
-import { normalizeLanguageTag } from "./utils.js?v=20";
-import "./offline-manifest.js?v=20";
+import { parseBookConfig } from "./config.js?v=22";
+import { buildSources } from "./source-selection.js?v=22";
+import { normalizeLanguageTag } from "./utils.js?v=22";
+import "./offline-manifest.js?v=22";
 
 const { validManifest } = globalThis.CompactPlayerOfflineManifest;
 

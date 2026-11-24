@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { BookConfigStore } from "../js/book-config.js?v=20";
-import { inspectAudioRange, downloadChunks } from "../js/offline-transfer.js?v=20";
-import { normalizeLibrary } from "../js/config.js?v=20";
-import { buildSources, chooseDefaultSource } from "../js/source-selection.js?v=20";
+import { BookConfigStore } from "../js/book-config.js?v=22";
+import { inspectAudioRange, downloadChunks } from "../js/offline-transfer.js?v=22";
+import { normalizeLibrary } from "../js/config.js?v=22";
+import { buildSources, chooseDefaultSource } from "../js/source-selection.js?v=22";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { createCoverView } from "../js/cover.js?v=20";
-import { loadChapterFile } from "../js/chapters.js?v=20";
+import { createCoverView } from "../js/cover.js?v=22";
+import { loadChapterFile } from "../js/chapters.js?v=22";
 import {
   OFFLINE_META_CACHE,
   OfflineManager,
@@ -22,7 +22,7 @@ import {
   offlineMetaUrl,
   parseContentRange,
   validManifest,
-} from "../js/offline.js?v=20";
+} from "../js/offline.js?v=22";
 
 class MemoryCache {
   map = new Map();
@@ -41,6 +41,10 @@ class MemoryCacheStorage {
       read: async (key, signal) => {
         if (signal?.aborted) throw signal.reason;
         return structuredClone(this.controlRecords.get(prefix + key));
+      },
+      readMany: async (keys, signal) => {
+        if (signal?.aborted) throw signal.reason;
+        return keys.map((key) => structuredClone(this.controlRecords.get(prefix + key)));
       },
       write: async (entries, signal) => {
         if (signal?.aborted) throw signal.reason;
@@ -221,7 +225,7 @@ test("stalled navigation uses the installed shell or waits for the network until
   const page = new Request(scope + "?book=north");
   Object.defineProperty(page, "mode", { value: "navigate" });
   const module = new Request(scope + "js/config.js");
-  for (const [request, key, content] of [[page, scope + "index.html?v=20", "saved page"], [module, module.url, "saved module"]]) {
+  for (const [request, key, content] of [[page, scope + "index.html?v=22", "saved page"], [module, module.url, "saved module"]]) {
     const server = deferred();
     let signal;
     worker.fetch = (_request, options) => { signal = options?.signal; return server.promise; };
@@ -246,7 +250,7 @@ test("stalled navigation uses the installed shell or waits for the network until
   const uncached = worker.networkFirst(page);
   t.mock.timers.tick(6000);
   await settle();
-  const html = '<link rel="stylesheet" href="./player.css?v=20"><script type="module" src="./player.js?v=20"></script>';
+  const html = '<link rel="stylesheet" href="./player.css?v=22"><script type="module" src="./player.js?v=22"></script>';
   server.resolve(new Response(html));
   assert.equal(await (await uncached).text(), html);
 
@@ -272,7 +276,7 @@ test("navigation preserves missing-page responses and returns cached content onl
   const caches = new MemoryCacheStorage();
   const worker = await workerContext({ caches, self: { registration: { scope }, addEventListener() {} } });
   const shell = await caches.open(vm.runInContext("SHELL_CACHE", worker));
-  await shell.put(scope + "index.html?v=20", new Response("player page"));
+  await shell.put(scope + "index.html?v=22", new Response("player page"));
   await shell.put(scope + "js/config.js", new Response("player module"));
   const manifest = { ...selection(), schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved-book",
     totalSize: 10, chunkSize: 10, totalChunks: 1, completed: [0] };
@@ -2118,7 +2122,9 @@ test("a successful network response wins and explicit download requests bypass t
     caches: { open: assert.fail },
   });
   const url = origin + "/media/library.json";
-  assert.equal(await worker.networkFirst(new Request(url)), live);
+  const response = await worker.networkFirst(new Request(url));
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "live catalog");
   events.fetch({ request: new Request(url, { headers: { "x-compact-player-download": "1" } }), respondWith: assert.fail });
 });
 
@@ -2961,7 +2967,7 @@ test("a corrupt streamed chunk is reported and the published download can be rep
   };
   const transient = await worker.cachedMediaResponse(new Request(saved.sourceUrl), initial, transientCache);
   await assert.rejects(transient.arrayBuffer(), { name: "UnknownError" });
-  if (reopened.damageCheck) await reopened.damageCheck;
+  if (reopened.damage.check) await reopened.damage.check;
   await reopened.refresh();
   assert.equal(reopened.active?.downloadId, saved.downloadId);
   assert.equal(reopened.staging, null);
@@ -3041,7 +3047,7 @@ test("damage reports survive concurrent refresh, denied locks, and a full marker
       await manager.refresh();
     }
     for (let tries = 0; tries < 40 && manager.active; tries++) await settle();
-    if (manager.damageCheck) await manager.damageCheck;
+    if (manager.damage.check) await manager.damage.check;
     assert.equal(manager.active, null, scenario);
     assert.equal(manager.staging?.downloadId, saved.downloadId, scenario);
     assert.deepEqual(manager.staging.completed, [], scenario);
@@ -3070,82 +3076,62 @@ test("a damage scan retries from fresh records when its lock wait expires", asyn
   const rebuild = t.mock.method(manager.store, "inspectDownloads");
   const apply = t.mock.method(manager, "applyInventory");
   manager.store.reportDamagedChunk(saved.downloadId, 0);
-  manager.pendingDamage = true;
-  manager.reconcileReportedDamage();
-  const firstCheck = manager.damageCheck;
+  manager.damage.report();
+  const firstCheck = manager.damage.check;
   try {
     await entered.promise;
     t.mock.timers.tick(3000);
     await settle();
     assert.equal(firstSignal?.aborted, true);
-    assert.notEqual(manager.damageCheck, firstCheck);
+    assert.notEqual(manager.damage.check, firstCheck);
     await firstCheck;
-    await manager.damageCheck;
+    await manager.damage.check;
     assert.equal(rebuild.mock.callCount(), 2);
     assert.equal(apply.mock.callCount(), 1);
     assert.equal(manager.active, null);
     assert.equal(manager.staging.downloadId, saved.downloadId);
-    assert.equal(manager.pendingDamage, false);
+    assert.equal(manager.damage.pending, false);
     late.resolve();
     await settle();
     assert.equal(apply.mock.callCount(), 1, "a late lock grant cannot apply its earlier scan");
   } finally {
     late.resolve();
     await firstCheck;
-    await manager.damageCheck;
+    await manager.damage.check;
   }
 });
 
-test("damage processing restarts after repeated lock timeouts without a new report", async (t) => {
+test("damage processing skips cache scans while another tab holds the lock", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { manager, options, saved } = await savedBookFixture();
-  const { cacheStorage: caches, baseUrl } = options;
-  const files = await caches.open(saved.cacheName);
-  await files.put(offlineChunkUrl(baseUrl, saved.downloadId, 0),
+  const files = await options.cacheStorage.open(saved.cacheName);
+  await files.put(offlineChunkUrl(options.baseUrl, saved.downloadId, 0),
     new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
   const peer = new OfflineManager(options);
   const acquired = deferred();
   const release = deferred();
   const holding = peer.withLock(async () => { acquired.resolve(); await release.promise; });
-  const queued = [deferred(), deferred()];
-  let waits = 0;
-  options.navigatorObject.locks = { request(name, settings, action) {
-    if (settings.signal) queued[waits++]?.resolve();
-    return locks.request(name, settings, action);
-  } };
+  const listing = t.mock.method(options.cacheStorage, "keys");
   try {
     await acquired.promise;
     manager.store.reportDamagedChunk(saved.downloadId, 0);
-    manager.pendingDamage = true;
-    manager.reconcileReportedDamage();
-    const first = manager.damageCheck;
-    await queued[0].promise;
-    t.mock.timers.tick(3000);
-    await first;
-    const second = manager.damageCheck;
-    await queued[1].promise;
-    t.mock.timers.tick(3000);
-    await second;
-    assert.equal(manager.damageCheck, null);
-    assert.equal(manager.pendingDamage, true);
-    assert.equal(manager.active.downloadId, saved.downloadId);
-
+    manager.damage.report();
+    await manager.damage.check;
+    await settle();
+    if (manager.damage.check) await manager.damage.check;
+    assert.equal(listing.mock.callCount(), 0);
+    assert.equal(manager.damage.pending, true);
     release.resolve();
     await holding;
     t.mock.timers.tick(3000);
     await settle();
-    await manager.damageCheck;
-    assert.equal(waits, 3);
-    assert.equal(manager.pendingDamage, false);
+    if (manager.damage.check) await manager.damage.check;
+    assert.equal(manager.damage.pending, false);
     assert.equal(manager.active, null);
     assert.equal(manager.staging.downloadId, saved.downloadId);
-    t.mock.timers.tick(30_000);
-    await settle();
-    assert.equal(waits, 3, "an applied report stops the retries");
   } finally {
     release.resolve();
     await holding;
-    await manager.damageCheck;
   }
 });
 
@@ -3184,28 +3170,29 @@ test("a stalled inventory releases the damage check and retains reports for a fr
     });
     const report = () => {
       manager.store.reportDamagedChunk(saved.downloadId, 0);
-      manager.pendingDamage = true;
-      manager.reconcileReportedDamage();
+      manager.damage.report();
     };
     report();
-    const firstCheck = manager.damageCheck;
+    const firstCheck = manager.damage.check;
     try {
       await entered.promise;
       if (stage === "list") report();
       t.mock.timers.tick(20_000);
       await settle();
       if (stage === "manifest") {
-        assert.equal(manager.damageCheck, null);
-        assert.equal(manager.pendingDamage, true);
+        assert.equal(manager.damage.check, null);
+        assert.equal(manager.damage.pending, true);
         assert.equal(manager.active.downloadId, saved.downloadId);
         report();
+        t.mock.timers.tick(3000);
+        await settle();
       } else {
-        assert.notEqual(manager.damageCheck, firstCheck);
+        assert.notEqual(manager.damage.check, firstCheck);
       }
       await firstCheck;
-      await manager.damageCheck;
+      await manager.damage.check;
       assert.equal(manager.active, null, stage);
-      assert.equal(manager.pendingDamage, false);
+      assert.equal(manager.damage.pending, false);
       assert.equal(manager.staging.downloadId, saved.downloadId);
       assert.deepEqual(manager.staging.completed, []);
       resumed = true;
@@ -3215,7 +3202,7 @@ test("a stalled inventory releases the damage check and retains reports for a fr
     } finally {
       release.resolve();
       await firstCheck;
-      await manager.damageCheck;
+      await manager.damage.check;
       lookup.mock.restore();
       list.mock.restore();
     }
@@ -3255,20 +3242,19 @@ test("a stalled fallback sync releases damage processing and retries pending rep
   });
   const report = () => {
     manager.store.reportDamagedChunk(saved.downloadId, 0);
-    manager.pendingDamage = true;
-    manager.reconcileReportedDamage();
+    manager.damage.report();
   };
   report();
-  const firstCheck = manager.damageCheck;
+  const firstCheck = manager.damage.check;
   try {
     await entered.promise;
     report();
     t.mock.timers.tick(3000);
     await settle();
-    assert.notEqual(manager.damageCheck, firstCheck);
+    assert.notEqual(manager.damage.check, firstCheck);
     await firstCheck;
-    await manager.damageCheck;
-    assert.equal(manager.pendingDamage, false);
+    await manager.damage.check;
+    assert.equal(manager.damage.pending, false);
     assert.equal(manager.active, null);
     assert.equal(manager.staging.downloadId, saved.downloadId);
     release.resolve();
@@ -3278,7 +3264,7 @@ test("a stalled fallback sync releases damage processing and retries pending rep
   } finally {
     release.resolve();
     await firstCheck;
-    await manager.damageCheck;
+    await manager.damage.check;
   }
 });
 
@@ -3302,7 +3288,7 @@ test("a damage report received during player startup is checked after registrati
   } }));
   registration.resolve({});
   await starting;
-  if (manager.damageCheck) await manager.damageCheck;
+  if (manager.damage.check) await manager.damage.check;
   assert.equal(manager.active, null);
   assert.equal(manager.staging?.downloadId, saved.downloadId);
   assert.deepEqual(manager.staging.completed, []);
@@ -3813,7 +3799,7 @@ test("an older controlling worker can read a legacy download while the player wa
   assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
   assert.equal(cacheStorage.controlRecords.size, 0);
 
-  workers.controller = workerController(baseUrl, "sw.js?v=20");
+  workers.controller = workerController(baseUrl, "sw.js?v=22");
   workers.dispatchEvent(new Event("controllerchange"));
   assert.equal(await manager.worker.supportsOfflineWrites(), true);
   const newBook = await manager.start({ ...selection(), episodeId: "next" });
@@ -3844,7 +3830,7 @@ test("download controls recover after a worker setup timeout when this installat
   for (const failure of ["register timeout", "ready timeout", "storage denied", "registration denied", "controlling worker"]) {
     const deferredSetup = deferred();
     const workers = new EventTarget();
-    const trusted = workerController(baseUrl, "sw.js?v=20");
+    const trusted = workerController(baseUrl, "sw.js?v=22");
     workers.register = async () => {
       if (failure === "registration denied") throw new DOMException("Worker denied", "SecurityError");
       if (failure === "register timeout" || failure === "controlling worker") return deferredSetup.promise;
@@ -3871,7 +3857,7 @@ test("download controls recover after a worker setup timeout when this installat
     assert.equal(row.hidden, failure !== "controlling worker", failure);
     if (failure === "controlling worker") continue;
 
-    const foreign = { scriptURL: "https://example.test/other/sw.js?v=20" };
+    const foreign = { scriptURL: "https://example.test/other/sw.js?v=22" };
     await takeControl(foreign);
     assert.equal(row.hidden, true, "another installation cannot restore download controls");
     workers.controller = trusted;
@@ -4497,7 +4483,7 @@ test("worker registration uses the current version without cached imports", asyn
     navigatorObject: navigator, fetchImpl: async () => new Response(null, { status: 404 }) });
   await manager.init();
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].script.href, "https://example.test/player/sw.js?v=20");
+  assert.equal(calls[0].script.href, "https://example.test/player/sw.js?v=22");
   assert.deepEqual(calls[0].options, { scope: "/player/", updateViaCache: "none" });
 });
 
@@ -4678,10 +4664,10 @@ test("refresh and damage scans let another tab remove a download while inventory
     });
     let scanning;
     if (reason === "damage report") {
-      reader.pendingDamage = true;
+      reader.damage.pending = true;
       reader.store.reportDamagedChunk(saved.downloadId, 0);
-      reader.reconcileReportedDamage();
-      scanning = reader.damageCheck;
+      reader.damage.resume();
+      scanning = reader.damage.check;
     } else {
       scanning = reader.refresh();
     }
@@ -5271,4 +5257,609 @@ test("canceling a download retires its draft before file deletion and leaves a n
       stalledDeletion.mock.restore();
     }
   }
+});
+
+test("a reclamation timeout preserves the prepared replacement", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  const mib = 1024 ** 2;
+  const total = 8 * mib + 4;
+  const { manager, options, saved } = await savedBookFixture();
+  const { cacheStorage: caches } = options;
+  manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(total), episodeId: "paused" }), /connection lost/);
+  const prior = manager.staging;
+  options.navigatorObject.storage.estimate = async () => ({ quota: 100 * mib, usage: 80 * mib });
+  manager.fetchImpl = rangedFetch(total);
+  const remove = caches.delete.bind(caches);
+  const entered = deferred();
+  const release = deferred();
+  t.mock.method(caches, "delete", async (name) => {
+    if (name === prior.cacheName) {
+      entered.resolve();
+      await release.promise;
+    }
+    return remove(name);
+  });
+  const replacement = assert.rejects(manager.start({ ...selection(total), episodeId: "new" }), { code: "storage-timeout" });
+  try {
+    await entered.promise;
+    const prepared = await manager.readRecord("staging");
+    assert.equal(prepared.episodeId, "new");
+    t.mock.timers.tick(3000);
+    await replacement;
+    assert.equal((await manager.readRecord("staging")).downloadId, prepared.downloadId);
+    assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+    release.resolve();
+    await waitForBookCacheRemoval(caches, prior.cacheName);
+  } finally { release.resolve(); }
+});
+
+
+test("a concurrent reset cannot restore an outdated active book in another tab", async (t) => {
+  const {manager, saved, options} = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  assert.equal(reader.snapshot().active?.downloadId, saved.downloadId);
+  const checked = deferred();
+  const finish = deferred();
+  const originalCheck = reader.store.checkReadyConfig.bind(reader.store);
+  t.mock.method(reader.store, "checkReadyConfig", async (...args) => {
+    const answer = await originalCheck(...args);
+    checked.resolve();
+    await finish.promise;
+    return answer;
+  });
+  const sync = reader.syncPublishedDownload();
+  try {
+    await checked.promise;
+    await manager.reset();
+    assert.notEqual((await reader.readRecord("active", true))?.downloadId, saved.downloadId);
+  } finally { finish.resolve(); }
+  await sync;
+  assert.equal(reader.snapshot().phase, "idle");
+  assert.equal(reader.snapshot().active, null);
+});
+
+test("sync retries an atomic snapshot when another tab cancels the staged download", async (t) => {
+  const { manager, options } = await savedBookFixture();
+  const total = 8 * 1024 ** 2 + 4;
+  manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(total), episodeId: "partial" }), /connection lost/);
+  const reader = new OfflineManager(options);
+  await reader.init();
+  assert.equal(reader.snapshot().staging.episodeId, "partial");
+  const entered = deferred();
+  const resume = deferred();
+  const original = reader.store.checkReadyConfig.bind(reader.store);
+  let once = true;
+  t.mock.method(reader.store, "checkReadyConfig", async (...args) => {
+    const result = await original(...args);
+    if (once) { once = false; entered.resolve(); await resume.promise; }
+    return result;
+  });
+  const syncing = reader.syncPublishedDownload();
+  try {
+    await entered.promise;
+    await manager.writeRecord("staging", null);
+  } finally { resume.resolve(); }
+  await syncing;
+  assert.equal(reader.snapshot().staging, null);
+  assert.equal(reader.snapshot().active.episodeId, "book");
+});
+
+test("a temporary registration error keeps a compatible worker available and can be retried", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { options, saved } = await savedBookFixture();
+  const workers = new EventTarget();
+  workers.controller = workerController(options.baseUrl, "sw.js?v=22");
+  let attempts = 0;
+  workers.register = async () => {
+    if (++attempts === 1) throw new TypeError("Temporary registration failure");
+  };
+  workers.ready = Promise.resolve();
+  const manager = new OfflineManager({ ...options, navigatorObject: { ...navigatorStub(), serviceWorker: workers } });
+  await manager.init();
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  assert.equal(manager.snapshot().supported, true);
+  assert.equal(manager.snapshot().canWrite, true);
+  assert.equal(manager.workerRegistrationFailed, true);
+  await manager.retryWorkerConnection();
+  assert.equal(attempts, 2);
+  assert.equal(manager.workerRegistrationFailed, false);
+  assert.equal(manager.snapshot().canWrite, true);
+});
+
+test("a temporary registration failure without a controller can be retried", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const { options } = await savedBookFixture();
+  const workers = new EventTarget();
+  let attempts = 0;
+  workers.register = async () => {
+    if (++attempts === 1) throw new TypeError("Temporary registration failure");
+  };
+  workers.ready = Promise.resolve();
+  const manager = new OfflineManager({ ...options, navigatorObject: { ...navigatorStub(), serviceWorker: workers } });
+  await manager.init();
+  assert.equal(manager.snapshot().supported, false);
+  await manager.retryWorkerConnection();
+  assert.equal(attempts, 2);
+  assert.equal(manager.snapshot().supported, false);
+  workers.controller = workerController(options.baseUrl, "sw.js?v=22");
+  workers.dispatchEvent(new Event("controllerchange"));
+  for (let i = 0; i < 30 && !manager.snapshot().supported; i++) await settle();
+  assert.equal(manager.snapshot().supported, true);
+  assert.equal(manager.snapshot().canWrite, true);
+});
+
+test("a transient cache scan failure automatically retries a damaged download", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  const { manager, options, saved } = await savedBookFixture();
+  const files = await options.cacheStorage.open(saved.cacheName);
+  await files.put(offlineChunkUrl(options.baseUrl, saved.downloadId, 0),
+    new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const list = options.cacheStorage.keys.bind(options.cacheStorage);
+  let attempts = 0;
+  t.mock.method(options.cacheStorage, "keys", async () => {
+    if (++attempts === 1) throw new Error("Temporary cache failure");
+    return list();
+  });
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  manager.damage.report();
+  await manager.damage.check;
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  assert.equal(manager.damage.pending, true);
+  t.mock.timers.tick(3000);
+  await settle();
+  await manager.damage.check;
+  assert.equal(manager.active, null);
+  assert.equal(manager.staging?.downloadId, saved.downloadId);
+  assert.equal(manager.damage.pending, false);
+});
+
+test("repeated stale damage scans wait before retrying and eventually repair the download", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { manager, options, saved } = await savedBookFixture();
+  const files = await options.cacheStorage.open(saved.cacheName);
+  await files.put(offlineChunkUrl(options.baseUrl, saved.downloadId, 0),
+    new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const apply = manager.applyInventory.bind(manager);
+  let attempts = 0;
+  t.mock.method(manager, "applyInventory", (...args) => {
+    if (++attempts <= 3) return Promise.resolve("stale");
+    return apply(...args);
+  });
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  manager.damage.report();
+  await manager.damage.check;
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 2);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  manager.damage.report();
+  t.mock.timers.tick(2999);
+  await settle();
+  assert.equal(attempts, 2);
+  t.mock.timers.tick(1);
+  await settle();
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 3);
+  t.mock.timers.tick(6000);
+  await settle();
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 4);
+  assert.equal(manager.active, null);
+  assert.equal(manager.staging?.downloadId, saved.downloadId);
+  assert.equal(manager.damage.pending, false);
+});
+
+test("new damage reports during repeated failed scans retain backoff and repair the download", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { manager, options, saved } = await savedBookFixture();
+  const files = await options.cacheStorage.open(saved.cacheName);
+  await files.put(offlineChunkUrl(options.baseUrl, saved.downloadId, 0),
+    new Response(Uint8Array.of(1), { headers: { "content-length": "10" } }));
+  const apply = manager.applyInventory.bind(manager);
+  let attempts = 0;
+  t.mock.method(manager, "applyInventory", (...args) => {
+    if (++attempts <= 3) {
+      manager.store.reportDamagedChunk(saved.downloadId, 0);
+      manager.damage.report();
+      return Promise.resolve("failed");
+    }
+    return apply(...args);
+  });
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  manager.damage.report();
+  await manager.damage.check;
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 2);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  t.mock.timers.tick(2999);
+  await settle();
+  assert.equal(attempts, 2);
+  t.mock.timers.tick(1);
+  await settle();
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 3);
+  t.mock.timers.tick(6000);
+  await settle();
+  if (manager.damage.check) await manager.damage.check;
+  assert.equal(attempts, 4);
+  assert.equal(manager.active, null);
+  assert.equal(manager.staging?.downloadId, saved.downloadId);
+  assert.equal(manager.damage.pending, false);
+});
+
+test("reset drops old damage reports and preserves reports from its new epoch", async (t) => {
+  const { manager, saved } = await savedBookFixture();
+  const epoch = "new-reset-epoch";
+  t.mock.method(manager.store, "newResetId", () => epoch);
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  const committed = deferred();
+  const release = deferred();
+  const original = manager.store.commitRemoval.bind(manager.store);
+  t.mock.method(manager.store, "commitRemoval", async (...args) => {
+    const result = await original(...args);
+    committed.resolve();
+    await release.promise;
+    return result;
+  });
+  const reset = manager.reset();
+  try {
+    await committed.promise;
+    manager.store.reportDamagedChunk(saved.downloadId, 1);
+    manager.store.reportDamagedChunk(epoch + ".new-download", 2);
+  } finally { release.resolve(); }
+  await reset;
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...manager.store.reportedChunks.get(epoch + ".new-download")], [2]);
+});
+
+test("a failed reset keeps the existing damage reports", async (t) => {
+  const { manager, saved } = await savedBookFixture();
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  t.mock.method(manager.store, "commitRemoval", async () => { throw new Error("Storage failed"); });
+  await assert.rejects(manager.reset(), /Storage failed/);
+  assert.deepEqual([...manager.store.reportedChunks.get(saved.downloadId)], [0]);
+  assert.equal(manager.active.downloadId, saved.downloadId);
+});
+
+test("sync after another tab resets removes old reports and keeps new epoch reports", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  await manager.reset();
+  const resetId = (await manager.store.readActiveState()).resetId;
+  reader.store.reportDamagedChunk(resetId + ".new-download", 1);
+  await reader.syncPublishedDownload();
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...reader.store.reportedChunks.get(resetId + ".new-download")], [1]);
+  reader.store.reportDamagedChunk(saved.downloadId, 2);
+  await reader.syncPublishedDownload();
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...reader.store.reportedChunks.get(resetId + ".new-download")], [1]);
+});
+
+test("confirming intact audio removes the empty damage-report entry", async () => {
+  const { manager, saved } = await savedBookFixture();
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  await manager.refresh();
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+});
+
+test("removing a download clears its damage reports after the removal is committed", async (t) => {
+  const { manager, saved } = await savedBookFixture();
+  const committed = deferred();
+  const release = deferred();
+  const original = manager.store.removePublishedBook.bind(manager.store);
+  t.mock.method(manager.store, "removePublishedBook", async (...args) => {
+    const result = await original(...args);
+    committed.resolve();
+    await release.promise;
+    return result;
+  });
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  manager.store.reportDamagedChunk("other-download", 7);
+  const removal = manager.removeActive();
+  try {
+    await committed.promise;
+    manager.store.reportDamagedChunk(saved.downloadId, 1);
+    manager.store.reportDamagedChunk("other-download", 8);
+  } finally { release.resolve(); }
+  await removal;
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...manager.store.reportedChunks.get("other-download")], [7, 8]);
+  assert.equal(manager.active, null);
+
+  manager.store.reportDamagedChunk(saved.downloadId, 2);
+  await manager.syncPublishedDownload();
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...manager.store.reportedChunks.get("other-download")], [7, 8]);
+});
+
+test("a failed removal retains damage reports", async (t) => {
+  const { manager, saved } = await savedBookFixture();
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  t.mock.method(manager.store, "removePublishedBook", async () => { throw new Error("Removal failed"); });
+  await assert.rejects(manager.removeActive(), /Removal failed/);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  assert.deepEqual([...manager.store.reportedChunks.get(saved.downloadId)], [0]);
+});
+
+test("canceling a staged download clears its reports while preserving the active book's reports", async () => {
+  const { manager, saved } = await savedBookFixture();
+  const total = 8 * 1024 ** 2 + 4;
+  manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(total), episodeId: "partial" }), /connection lost/);
+  const staging = manager.staging;
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  manager.store.reportDamagedChunk(staging.downloadId, 0);
+  await manager.cancel();
+  assert.equal(manager.store.reportedChunks.has(staging.downloadId), false);
+  assert.deepEqual([...manager.store.reportedChunks.get(saved.downloadId)], [0]);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+});
+
+test("canceling a staged record keeps reports for a still-active download with the same ID", async () => {
+  const { manager, saved } = await savedBookFixture();
+  manager.staging = { ...saved, status: "downloading" };
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  await manager.withLock(() => manager.removeStagingLocked());
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+  assert.deepEqual([...manager.store.reportedChunks.get(saved.downloadId)], [0]);
+});
+
+test("another tab's removal clears reports for the retired download on sync", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  reader.store.reportDamagedChunk("other-download", 1);
+  await manager.removeActive();
+  await reader.syncPublishedDownload();
+  assert.equal(reader.active, null);
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...reader.store.reportedChunks.get("other-download")], [1]);
+});
+
+test("publishing a replacement clears the retired download's reports", async () => {
+  const { manager, saved } = await savedBookFixture();
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  const replacement = await manager.start({ ...selection(), episodeId: "replacement" });
+  assert.notEqual(replacement.downloadId, saved.downloadId);
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.equal(manager.active?.downloadId, replacement.downloadId);
+});
+
+test("a late report for a canceled download is removed after a verified scan", async () => {
+  const { manager, saved } = await savedBookFixture();
+  const total = 8 * 1024 ** 2 + 4;
+  manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(total), episodeId: "partial" }), /connection lost/);
+  const staging = manager.staging;
+  await manager.cancel();
+  manager.store.reportDamagedChunk(staging.downloadId, 0);
+  manager.damage.report();
+  await manager.damage.check;
+  assert.equal(manager.store.reportedChunks.has(staging.downloadId), false);
+  assert.equal(manager.active?.downloadId, saved.downloadId);
+});
+
+test("another tab's cancellation clears the staged report while keeping the active report", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const total = 8 * 1024 ** 2 + 4;
+  manager.fetchImpl = rangedFetch(total, { failSecondChunk: true });
+  await assert.rejects(manager.start({ ...selection(total), episodeId: "partial" }), /connection lost/);
+  const staging = manager.staging;
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  reader.store.reportDamagedChunk(staging.downloadId, 0);
+  await manager.cancel();
+  await reader.syncPublishedDownload();
+  assert.equal(reader.store.reportedChunks.has(staging.downloadId), false);
+  assert.deepEqual([...reader.store.reportedChunks.get(saved.downloadId)], [0]);
+  assert.equal(reader.active?.downloadId, saved.downloadId);
+});
+
+test("reports received during an inspection survive cleanup of unreferenced downloads", async (t) => {
+  const { manager, saved } = await savedBookFixture();
+  const entered = deferred();
+  const release = deferred();
+  const apply = manager.store.applyInspection.bind(manager.store);
+  t.mock.method(manager.store, "applyInspection", async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return apply(...args);
+  });
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  const refresh = manager.refresh();
+  try {
+    await entered.promise;
+    manager.store.reportDamagedChunk("new-report", 1);
+  } finally { release.resolve(); }
+  await refresh;
+  assert.deepEqual([...manager.store.reportedChunks.get("new-report")], [1]);
+});
+
+test("a stale tab clears retired reports when a removal conflicts with a replacement", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  const replacement = await manager.start({ ...selection(), episodeId: "replacement" });
+  await assert.rejects(reader.removeActive(), { code: "conflict" });
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.equal(reader.active?.downloadId, replacement.downloadId);
+  assert.equal((await manager.readRecord("active")).downloadId, replacement.downloadId);
+});
+
+test("active-only sync remembers retired reports until staging is checked", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  const replacement = await manager.start({ ...selection(), episodeId: "replacement" });
+  await reader.syncPublishedDownload(false);
+  assert.equal(reader.active?.downloadId, replacement.downloadId);
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), true);
+  await reader.syncPublishedDownload();
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.equal(reader.pendingDamageRetirements.size, 0);
+});
+
+test("active-only sync preserves a report if the old ID is still staged", async (t) => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  await manager.start({ ...selection(), episodeId: "replacement" });
+  await reader.syncPublishedDownload(false);
+  const staging = { ...saved, status: "downloading" };
+  t.mock.method(reader.store, "readStagingState", async () => ({ manifest: staging, authoritative: true }));
+  await reader.syncPublishedDownload();
+  assert.equal(reader.staging?.downloadId, saved.downloadId);
+  assert.deepEqual([...reader.store.reportedChunks.get(saved.downloadId)], [0]);
+  assert.equal(reader.pendingDamageRetirements.size, 0);
+});
+
+test("full sync clears a late report for a download displaced by an earlier active-only sync", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const reader = new OfflineManager(options);
+  await reader.init();
+  const replacement = await manager.start({ ...selection(), episodeId: "replacement" });
+  await reader.syncPublishedDownload(false);
+  assert.equal(reader.active?.downloadId, replacement.downloadId);
+
+  reader.store.reportDamagedChunk(saved.downloadId, 0);
+  reader.store.reportDamagedChunk(replacement.downloadId, 0);
+  await reader.syncPublishedDownload();
+  assert.equal(reader.store.reportedChunks.has(saved.downloadId), false);
+  assert.deepEqual([...reader.store.reportedChunks.get(replacement.downloadId)], [0]);
+});
+
+test("the worker sees the new active and staging state together when a draft is published", async (t) => {
+  const { manager } = await interruptedReplacement(t);
+  const draft = manager.staging;
+  manager.store.reportDamagedChunk(draft.downloadId, 0);
+  const states = [];
+  t.mock.method(manager.worker, "prepare", async (active) => {
+    if (active?.downloadId === draft.downloadId) states.push(manager.staging);
+  });
+
+  const saved = await manager.resume();
+  assert.equal(saved.downloadId, draft.downloadId);
+  assert.deepEqual(states, [null]);
+  assert.equal(manager.active?.downloadId, draft.downloadId);
+});
+
+test("only reports for inspected downloads invalidate a damage scan", async () => {
+  const { manager, saved } = await savedBookFixture();
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  const records = await manager.inventoryRecords();
+  const scan = await manager.store.inspectDownloads(records);
+  manager.store.reportDamagedChunk("another-download", 0);
+  assert.equal(await manager.store.inspectionIsCurrent(scan), true);
+  await manager.store.applyInspection(scan);
+  assert.equal(manager.store.reportedChunks.has(saved.downloadId), false);
+  assert.equal(manager.store.reportedChunks.has("another-download"), true);
+
+  const next = await manager.store.inspectDownloads(records);
+  manager.store.reportDamagedChunk(saved.downloadId, 0);
+  assert.equal(await manager.store.inspectionIsCurrent(next), false);
+  await manager.store.applyInspection(next);
+  assert.equal(manager.store.reportedChunks.get(saved.downloadId).has(0), true);
+});
+
+test("concurrent sync requests share a read and changes trigger one follow-up", async (t) => {
+  const { manager } = await savedBookFixture();
+  const entered = deferred();
+  const release = deferred();
+  const read = t.mock.method(manager, "readPublishedBook", async () => {
+    entered.resolve();
+    await release.promise;
+    return true;
+  });
+  const first = manager.syncPublishedDownload();
+  await entered.promise;
+  assert.equal(manager.syncPublishedDownload(), first);
+  assert.equal(manager.syncPublishedDownload(true, { changed: true }), first);
+  assert.equal(manager.syncPublishedDownload(true, { changed: true }), first);
+  assert.equal(read.mock.callCount(), 1);
+  release.resolve();
+  await first;
+  assert.equal(read.mock.callCount(), 2);
+});
+
+test("removal rechecks worker compatibility after acquiring the write lock", async () => {
+  const { manager, options, saved } = await savedBookFixture();
+  const workers = options.navigatorObject.serviceWorker;
+  workers.controller = workerController(options.baseUrl, "sw.js?v=22");
+  const requesting = deferred();
+  const grant = deferred();
+  options.navigatorObject.locks = {
+    async request(name, settings, action) {
+      requesting.resolve();
+      await grant.promise;
+      return locks.request(name, settings, action);
+    },
+  };
+  const removing = assert.rejects(manager.removeActive(), { code: "unsupported" });
+  try {
+    await requesting.promise;
+    workers.controller = workerController(options.baseUrl, "sw.js?v=21", { offlineJournal: 0 });
+  } finally {
+    grant.resolve();
+  }
+  await removing;
+  assert.equal((await manager.readRecord("active")).downloadId, saved.downloadId);
+  assert.equal(heldLocks.size, 0);
+
+  workers.controller = workerController(options.baseUrl, "sw.js?v=22");
+  await manager.removeActive();
+  assert.equal(await manager.readRecord("active"), null);
+});
+
+test("other tabs see the first draft and its saved progress when the download is interrupted", async (t) => {
+  const total = 8 * 1024 ** 2 + 4;
+  const firstChunk = deferred();
+  const range = rangedFetch(total, { failSecondChunk: true });
+  const options = { baseUrl: "https://example.test/first-draft/", cacheStorage: new MemoryCacheStorage(),
+    navigatorObject: navigatorStub() };
+  const manager = new OfflineManager({ ...options, fetchImpl: async (url, init) => {
+    if (init.headers.Range === "bytes=0-8388607") await firstChunk.promise;
+    return range(url, init);
+  } });
+  const draftSeen = deferred();
+  const partialSeen = deferred();
+  const reader = new OfflineManager({ ...options, onChange: ({ staging }) => {
+    if (staging?.completed.length === 0) draftSeen.resolve(staging);
+    if (staging?.completed.length === 1) partialSeen.resolve(staging);
+  } });
+  await manager.init();
+  await reader.init();
+  manager.listenForPublishedChanges(BroadcastChannel);
+  reader.listenForPublishedChanges(BroadcastChannel);
+  t.after(() => {
+    manager.changeChannel.close();
+    reader.changeChannel.close();
+  });
+
+  const path = new URL("audio.webm", options.baseUrl).href;
+  const failed = assert.rejects(manager.start({ ...selection(total), sourceUrl: path }), /connection lost/);
+  let draft;
+  try {
+    draft = await draftSeen.promise;
+    assert.equal(draft.downloadId, manager.staging?.downloadId);
+  } finally {
+    firstChunk.resolve();
+  }
+  await failed;
+  const paused = await partialSeen.promise;
+  assert.equal(paused.downloadId, draft.downloadId);
+  assert.deepEqual(paused.completed, [0]);
+  assert.equal(reader.snapshot().phase, "paused");
 });

@@ -125,7 +125,10 @@ globalThis.CompactPlayerOfflineManifest = (() => {
           }
         };
         const abort = () => interrupt(signal.reason);
-        transaction.oncomplete = () => { finish(); resolve(request?.result); };
+        transaction.oncomplete = () => {
+          finish();
+          resolve(Array.isArray(request) ? request.map((item) => item.result) : request?.result);
+        };
         transaction.onabort = () => { finish(); reject(interrupted ?? transaction.error); };
         signal?.addEventListener("abort", abort, { once: true });
         timer = setTimeout(() => interrupt(new DOMException("Offline control storage timed out.", "TimeoutError")), controlTimeoutMs);
@@ -141,6 +144,9 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     const scope = new URL(baseUrl).pathname;
     return {
       read(key, signal) { return transactOfflineControl("readonly", (store) => store.get([scope, key]), signal); },
+      readMany(keys, signal) {
+        return transactOfflineControl("readonly", (store) => keys.map((key) => store.get([scope, key])), signal);
+      },
       write(entries, signal) {
         return transactOfflineControl("readwrite", (store) => {
           for (const [key, value] of Object.entries(entries)) store.put(value, [scope, key]);
@@ -149,10 +155,10 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     };
   }
 
-  async function readActiveState(baseUrl, read, signal, cacheStorage, requireControl = false) {
+  async function readActiveState(baseUrl, read, signal, cacheStorage, requireControl = false, snapshot) {
     const url = offlineMetaUrl(baseUrl, "active");
     let pointer;
-    try { pointer = await offlineControl(baseUrl, cacheStorage).read("active", signal); }
+    try { pointer = snapshot ? snapshot.active : await offlineControl(baseUrl, cacheStorage).read("active", signal); }
     catch (error) {
       if (requireControl || signal?.aborted
         || !["NotSupportedError", "SecurityError", "NotAllowedError"].includes(error?.name)) throw error;

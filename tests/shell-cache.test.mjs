@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { webcrypto } from "node:crypto";
-import { isPlayerServiceWorker } from "../js/utils.js?v=20";
+import { isPlayerServiceWorker } from "../js/utils.js?v=22";
 
 const run = promisify(execFile);
 const sourceWorker = new URL("../sw.js", import.meta.url);
@@ -86,10 +86,10 @@ function dispatchFetch(handlers, request) {
 
 test("both old and versioned player workers are recognized only in their own installation", () => {
   const base = "https://example.test/player/";
-  for (const scriptURL of [base + "sw.js", base + "sw.js?v=20"]) {
+  for (const scriptURL of [base + "sw.js", base + "sw.js?v=22"]) {
     assert.equal(isPlayerServiceWorker({ scriptURL }, base), true);
   }
-  for (const scriptURL of ["https://other.test/player/sw.js?v=20", "https://example.test/other/sw.js?v=20", "invalid"]) {
+  for (const scriptURL of ["https://other.test/player/sw.js?v=22", "https://example.test/other/sw.js?v=22", "invalid"]) {
     assert.equal(isPlayerServiceWorker({ scriptURL }, base), false);
   }
   assert.equal(isPlayerServiceWorker(null, base), false);
@@ -682,4 +682,95 @@ test("a stalled shell or book cache fallback preserves the original network resu
     assert.equal(reads, 0, "an expired lookup should not start new cache work");
     assert.equal(waiting.length, lookups);
   }
+});
+
+test("a stalled cover request falls back to the saved cover", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { context, scope } = createWorker();
+  const source = scope + "media/book/cover.jpg";
+  const url = new URL(scope + "__compact_player_offline__/cover.json");
+  url.search = new URLSearchParams({ url: source, version: "3", book: "one", config: "one" });
+  context.fetch = () => new Promise(() => {});
+  context.activeManifest = async () => ({ episodeId: "one", configBookId: "one", cacheVersion: 3, cacheName: "saved" });
+  await (await context.caches.open("saved")).put(source, new Response("saved cover"));
+  const response = context.networkFirstCover(new Request(url), url);
+  t.mock.timers.tick(3000);
+  assert.equal(await (await response).text(), "saved cover");
+});
+
+test("the extracted release handler serves the installed source shell", async () => {
+  const { context, handlers, scope } = createWorker();
+  await dispatch(handlers, "install");
+  const pageRequest = new Request(scope);
+  Object.defineProperty(pageRequest, "mode", { value: "navigate" });
+  assert.equal(await (await context.cachedShell(pageRequest)).text(), page(version));
+});
+
+test("a saved book configuration loads while the network request is still pending", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { context, scope } = createWorker();
+  const url = scope + "media/book/book.json";
+  context.activeManifest = async () => ({ episodeId: "book", cacheVersion: 1, cacheName: "saved" });
+  await (await context.caches.open("saved")).put(url, new Response("saved config"));
+  let signal;
+  context.fetch = (_request, options) => {
+    signal = options.signal;
+    return new Promise(() => {});
+  };
+  const response = context.networkFirst(new Request(url));
+  t.mock.timers.tick(3000);
+  assert.equal(await (await response).text(), "saved config");
+  assert.equal(signal.aborted, true);
+});
+
+test("offline navigation uses the verified predecessor when the current release page is missing", async (t) => {
+  const { directory, workerPath } = await generateRelease(t);
+  const workerUrl = pathToFileURL(join(directory, workerPath));
+  const { scope, context, stores } = createWorker({ workerUrl });
+  const prefix = vm.runInContext("VERIFIED_RELEASE_CACHE_PREFIX", context);
+  const marker = vm.runInContext("RELEASE_READY_URL", context);
+  const predecessor = "0".repeat(64);
+  stores.set(prefix + predecessor, new Map([
+    [marker, new Response(predecessor)], [scope + "release-" + predecessor + ".html", new Response("older player")],
+  ]));
+  const unverified = "1".repeat(64);
+  stores.set(prefix + unverified, new Map([
+    [scope + "release-" + unverified + ".html", new Response("incomplete release")],
+  ]));
+  context.fetch = async () => { throw new TypeError("Offline"); };
+  const request = new Request(scope + "?book=saved");
+  Object.defineProperty(request, "mode", { value: "navigate" });
+  assert.equal(await (await context.networkFirst(request)).text(), "older player");
+});
+
+test("an unfinished cover body falls back to the saved image after headers have arrived", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { context, scope } = createWorker();
+  const source = scope + "media/book/cover.jpg";
+  const url = new URL(scope + "__compact_player_offline__/cover.json");
+  url.search = new URLSearchParams({ url: source, version: "3", book: "one", config: "one" });
+  let canceled = false;
+  context.fetch = async () => new Response(new ReadableStream({ cancel() { canceled = true; } }));
+  context.activeManifest = async () => ({ episodeId: "one", configBookId: "one", cacheVersion: 3, cacheName: "saved" });
+  await (await context.caches.open("saved")).put(source, new Response("saved cover"));
+  const response = context.networkFirstCover(new Request(url), url);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(3000);
+  assert.equal(await (await response).text(), "saved cover");
+  assert.equal(canceled, true);
+});
+
+test("a saved book configuration loads when network headers arrive but the body stalls", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { context, scope } = createWorker();
+  const url = scope + "media/book/book.json";
+  context.activeManifest = async () => ({ episodeId: "book", cacheVersion: 1, cacheName: "saved" });
+  await (await context.caches.open("saved")).put(url, new Response("saved config"));
+  let canceled = false;
+  context.fetch = async () => new Response(new ReadableStream({ cancel() { canceled = true; } }));
+  const response = context.networkFirst(new Request(url));
+  await new Promise(setImmediate);
+  t.mock.timers.tick(3000);
+  assert.equal(await (await response).text(), "saved config");
+  assert.equal(canceled, true);
 });

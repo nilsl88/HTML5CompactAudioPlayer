@@ -1,4 +1,4 @@
-import { asRecord } from "./utils.js?v=20";
+import { asRecord } from "./utils.js?v=22";
 
 const AVAILABILITY_TTL = 7 * 86400000;
 

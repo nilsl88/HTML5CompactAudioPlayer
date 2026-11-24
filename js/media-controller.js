@@ -1,5 +1,5 @@
-import { SourceFallback } from "./source-selection.js?v=20";
-import { clamp } from "./utils.js?v=20";
+import { SourceFallback } from "./source-selection.js?v=22";
+import { clamp } from "./utils.js?v=22";
 
 export class MediaController {
   constructor(audio, callbacks = {}, { sourceTimeoutMs = 15000, isOnline = () => globalThis.navigator?.onLine !== false } = {}) {
@@ -13,6 +13,7 @@ export class MediaController {
     this.resetSourceAttempts();
     this.playbackIntent = false;
     this.desiredTime = 0;
+    this.pendingSeek = false;
     this.playbackRate = 1;
     this.volume = 1;
     this.loaded = false;
@@ -34,10 +35,13 @@ export class MediaController {
     listen("loadedmetadata", () => {
       this.loaded = true;
       this.applyMediaSettings();
-      this.applyDesiredTime();
+      this.restoreDesiredTime();
       this.callbacks.onTime?.(this.position(), this.duration());
       if (!this.playbackIntent) { this.clearTimeout(); this.setState("paused"); }
       else this.armTimeout(this.generation, this.currentSource()?.url);
+    });
+    listen("canplay", () => {
+      if (this.loaded && this.pendingSeek) this.restoreDesiredTime();
     });
     listen("playing", () => {
       if (!this.audio.src || this.audio.paused) return;
@@ -70,9 +74,11 @@ export class MediaController {
           this.clearTimeout();
           this.setState("playing");
         }
-        const moved = this.desiredTime !== this.audio.currentTime;
-        this.desiredTime = this.audio.currentTime;
-        if (moved && this.hasStarted) this.callbacks.onProgress?.(this.desiredTime);
+        if (!this.pendingSeek) {
+          const moved = this.desiredTime !== this.audio.currentTime;
+          this.desiredTime = this.audio.currentTime;
+          if (moved && this.hasStarted) this.callbacks.onProgress?.(this.desiredTime);
+        }
         this.callbacks.onTime?.(this.audio.currentTime, this.duration());
       }
     });
@@ -86,6 +92,7 @@ export class MediaController {
     this.fallback = new SourceFallback(sources, selectedId);
     this.resetSourceAttempts();
     this.desiredTime = Math.max(0, Number(position) || 0);
+    this.pendingSeek = false;
     this.playbackIntent = Boolean(shouldPlay && this.currentSource());
     this.clearTimeout();
     if (this.playbackIntent) return this.loadSource(this.currentSource(), true);
@@ -281,7 +288,12 @@ export class MediaController {
     const duration = this.duration();
     this.desiredTime = duration ? clamp(Number(seconds) || 0, 0, Math.max(0, duration - .01)) : Math.max(0, Number(seconds) || 0);
     if (this.awaitingPlayback) this.waitPosition = this.desiredTime;
-    if (this.loaded) this.applyDesiredTime();
+    this.pendingSeek = this.loaded && !this.applyDesiredTime();
+    if (this.pendingSeek) {
+      const position = this.position();
+      this.callbacks.onTime?.(position, duration);
+      return position;
+    }
     this.callbacks.onProgress?.(this.desiredTime, true);
     this.callbacks.onTime?.(this.desiredTime, duration);
     return this.desiredTime;
@@ -292,7 +304,22 @@ export class MediaController {
       const duration = this.duration();
       const target = duration ? clamp(this.desiredTime, 0, Math.max(0, duration - .01)) : this.desiredTime;
       if (Math.abs((this.audio.currentTime || 0) - target) > .05) this.audio.currentTime = target;
-    } catch {}
+      this.desiredTime = target;
+      return true;
+    } catch (error) {
+      console.warn("[CompactAudioPlayer] Could not seek to the requested position.", error);
+      return false;
+    }
+  }
+
+  restoreDesiredTime() {
+    const pendingSeek = this.pendingSeek;
+    if (!this.applyDesiredTime()) return;
+    this.pendingSeek = false;
+    if (pendingSeek) {
+      this.callbacks.onProgress?.(this.desiredTime, true);
+      this.callbacks.onTime?.(this.desiredTime, this.duration());
+    }
   }
 
   setPlaybackRate(value) { this.playbackRate = clamp(Number(value) || 1, .5, 2); this.applyMediaSettings(); }

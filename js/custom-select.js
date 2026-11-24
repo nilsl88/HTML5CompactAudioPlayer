@@ -1,4 +1,4 @@
-import { clearChildren } from "./utils.js?v=20";
+import { clearChildren } from "./utils.js?v=22";
 
 export function createCustomSelects(document, window) {
   const customSelectStates = new Map();

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { createCoverView } from "../js/cover.js?v=20";
+import { createCoverView } from "../js/cover.js?v=22";
 
 test("offline cover failures retry on reconnect without duplicating pending or successful loads", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });

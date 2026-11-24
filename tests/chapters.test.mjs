@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=20";
-import { PlayerStorage } from "../js/storage.js?v=20";
-import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=20";
-import { RangeReader } from "../js/mp4-metadata.js?v=20";
-import { createCoverView } from "../js/cover.js?v=20";
-import { ChapterSession } from "../js/chapter-session.js?v=20";
+import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=22";
+import { PlayerStorage } from "../js/storage.js?v=22";
+import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=22";
+import { RangeReader, MP4_METADATA_MAX_REQUESTS } from "../js/mp4-metadata.js?v=22";
+import { createCoverView } from "../js/cover.js?v=22";
+import { ChapterSession } from "../js/chapter-session.js?v=22";
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));
@@ -207,11 +207,7 @@ test("chapter requests use the browser cache and parse WebVTT", async () => {
   let requestOptions;
   const fetchImpl = async (_url, options) => {
     requestOptions = options;
-    return {
-      ok: true,
-      status: 200,
-      text: async () => "WEBVTT\n\n00:00:00.000 --> 00:00:10.000\nOpening",
-    };
+    return new Response("WEBVTT\n\n00:00:00.000 --> 00:00:10.000\nOpening");
   };
 
   const result = await loadChapterFile("https://example.test/chapters.vtt", { fetchImpl });
@@ -1120,10 +1116,48 @@ test("auto mode keeps usable WebVTT ahead of embedded metadata", async () => {
     sourceMime: "audio/mp4; codecs=\"mp4a.40.2\"",
     fetchImpl: async () => {
       requests += 1;
-      return { ok: true, status: 200, text: async () => "WEBVTT\n\n00:00.000 --> 00:10.000\nOpening" };
+      return new Response("WEBVTT\n\n00:00.000 --> 00:10.000\nOpening");
     },
   });
   assert.equal(result.kind, "vtt");
   assert.equal(result.cues[0].title, "Opening");
   assert.equal(requests, 1);
+});
+
+test("an oversized streamed WebVTT file is canceled at the chapter byte limit", async () => {
+  let canceled = false;
+  let reads = 0;
+  const fetchImpl = async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode("WEBVTT\n")); },
+    pull(controller) { reads++; controller.enqueue(new Uint8Array(512 * 1024)); },
+    cancel() { canceled = true; },
+  }));
+  await assert.rejects(loadChapterFile("https://example.test/chapters.vtt", { fetchImpl }), /exceeds 1 MiB/);
+  assert.equal(canceled, true);
+  assert.ok(reads <= 3);
+});
+
+test("MP4 ranges share an overall deadline and request limit", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  let stalled = false;
+  const fetchImpl = async (_url, { headers }) => {
+    calls++;
+    if (stalled) return new Promise(() => {});
+    const index = Number(headers.Range.match(/^bytes=(\d+)-/)[1]);
+    t.mock.timers.tick(7);
+    return new Response(Uint8Array.of(0), { status: 206, headers: { "content-range": `bytes ${index}-${index}/100` } });
+  };
+  const bounded = new RangeReader("https://example.test/audio.m4b", { fetchImpl, timeoutMs: 10 });
+  await bounded.read(0, 1);
+  stalled = true;
+  const pending = assert.rejects(bounded.read(1, 2), { name: "TimeoutError" });
+  t.mock.timers.tick(3);
+  await pending;
+
+  stalled = false;
+  const counted = new RangeReader("https://example.test/audio.m4b", { fetchImpl }, { requestsUsed: MP4_METADATA_MAX_REQUESTS - 1 });
+  await counted.read(0, 1);
+  await assert.rejects(counted.read(1, 2), /request limit/);
+  assert.equal(calls, 3);
 });

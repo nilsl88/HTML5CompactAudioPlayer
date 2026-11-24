@@ -1,23 +1,24 @@
-import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=20";
-import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js?v=20";
-import { BookSelection } from "./book-selection.js?v=20";
-import { AvailabilitySession } from "./availability-session.js?v=20";
-import { createCustomSelects } from "./custom-select.js?v=20";
-import { isMp4Audio, qualityLabelKey } from "./codecs.js?v=20";
-import { createChapterPanel } from "./chapter-panel.js?v=20";
-import { ChapterSession } from "./chapter-session.js?v=20";
-import { localizedValue, normalizeLibrary, resolveCover } from "./config.js?v=20";
-import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./dialogs.js?v=20";
-import { createMediaSession } from "./media-session.js?v=20";
-import { MediaController } from "./media-controller.js?v=20";
-import { createCoverView } from "./cover.js?v=20";
-import { createOfflinePanel } from "./offline-panel.js?v=20";
-import { OfflineManager, manifestMatchesSelection } from "./offline.js?v=20";
-import { visibleSources } from "./source-selection.js?v=20";
-import { SKIP_INTERVALS, skipInterval } from "./preferences.js?v=20";
-import { ProgressWriter } from "./progress-writer.js?v=20";
-import { SleepTimer } from "./sleep-timer.js?v=20";
-import { clearChildren, clamp, formatTime, safeUrl, setText, UNKNOWN_TIME } from "./utils.js?v=20";
+import { resolveUiLocale, translateAt, uiLanguageOptions } from "../i18n.js?v=22";
+import { BookConfigStore, fetchLibraryCatalog, queryBookId } from "./book-config.js?v=22";
+import { BookSelection } from "./book-selection.js?v=22";
+import { BookSession } from "./book-session.js?v=22";
+import { AvailabilitySession } from "./availability-session.js?v=22";
+import { createCustomSelects } from "./custom-select.js?v=22";
+import { isMp4Audio, qualityLabelKey } from "./codecs.js?v=22";
+import { createChapterPanel } from "./chapter-panel.js?v=22";
+import { ChapterSession } from "./chapter-session.js?v=22";
+import { localizedValue, normalizeLibrary, resolveCover } from "./config.js?v=22";
+import { bindDialogDismiss, closeDialog, closePanel, openDialog, openPanel } from "./dialogs.js?v=22";
+import { createMediaSession } from "./media-session.js?v=22";
+import { MediaController } from "./media-controller.js?v=22";
+import { createCoverView } from "./cover.js?v=22";
+import { createOfflinePanel } from "./offline-panel.js?v=22";
+import { OfflineManager, manifestMatchesSelection } from "./offline.js?v=22";
+import { visibleSources } from "./source-selection.js?v=22";
+import { SKIP_INTERVALS, skipInterval } from "./preferences.js?v=22";
+import { ProgressWriter } from "./progress-writer.js?v=22";
+import { SleepTimer } from "./sleep-timer.js?v=22";
+import { clearChildren, clamp, formatTime, safeUrl, setText, UNKNOWN_TIME } from "./utils.js?v=22";
 
 export function startPlayer({ window, storage, fetchImpl }) {
   const { document, location, navigator } = window;
@@ -49,7 +50,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
   let book = null;
   let bookConfigUrl = "";
   let bookSelection = null;
-  let pendingBookConfig = null;
+  const bookSession = new BookSession();
   let requestedBookId = "";
   const availability = new AvailabilitySession({
     window, fetchImpl, isOnline,
@@ -84,8 +85,6 @@ export function startPlayer({ window, storage, fetchImpl }) {
       markActiveChapter(media.position());
     },
   });
-  let bookController = null;
-  let bookGeneration = 0;
   let durationUnlocked = false;
   let seekDragging = false;
   let uiBusy = false;
@@ -333,7 +332,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
   async function recoverLibrary() {
     if (!bookConfigs || !isOnline()) return;
     if (libraryRetry) return libraryRetry;
-    const generation = bookGeneration;
+    const generation = bookSession.generation;
     libraryRetry = (async () => {
       if (libraryNeedsRetry) {
         const catalog = await loadLibrary();
@@ -342,25 +341,23 @@ export function startPlayer({ window, storage, fetchImpl }) {
           library = catalog.library;
           bookConfigs.setLibrary(library, { fromDownload: catalog.fromDownload });
           populateLibrarySelect();
-          if (!book && bookController) setLoading(true);
-        } else if (!book && !bookController) return;
+          if (!book && bookSession.controller) setLoading(true);
+        } else if (!book && !bookSession.controller) return;
       } else if (bookConfigs.downloadedConfig) bookConfigs.setLibrary(library);
       if (!els.optionsPanel.hidden) void loadLibraryTitles();
       await startupBookRequest;
-      if (resetRemaining || bookController || !isOnline()) return;
+      if (resetRemaining || bookSession.controller || !isOnline()) return;
       if (bookSelection) {
         const id = bookSelection.bookId;
-        const currentGeneration = bookGeneration;
+        const currentGeneration = bookSession.generation;
         try {
           const refreshed = await bookConfigs.load(id, { revalidate: true });
-          if (resetRemaining || currentGeneration !== bookGeneration || !isOnline()) return;
-          if (!refreshed.fromDownload && (refreshed.book !== book || refreshed.configUrl !== bookConfigUrl)) {
-            pendingBookConfig = refreshed;
-          }
+          if (resetRemaining || currentGeneration !== bookSession.generation || !isOnline()) return;
+          bookSession.stageRefresh(refreshed, book, bookConfigUrl);
           const record = library.byId.get(id);
           if (record) updateOptionLabel(els.bookSelect, id, libraryLabel(record));
         } catch (error) { reportError("book configuration refresh", error); }
-      } else if (generation === bookGeneration) await loadStartupBook();
+      } else if (generation === bookSession.generation) await loadStartupBook();
     })().finally(() => { libraryRetry = null; });
     return libraryRetry;
   }
@@ -373,9 +370,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
 
   async function loadBook(id) {
     if (resetRemaining) return;
-    bookController?.abort();
-    bookController = new AbortController();
-    const generation = ++bookGeneration;
+    const request = bookSession.begin();
+    const { generation } = request;
     requestedBookId = id;
     populateLibrarySelect();
     const firstBook = !book;
@@ -387,8 +383,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
     setBusy(true);
 
     try {
-      const loaded = await bookConfigs.load(id, { signal: bookController.signal, revalidate: isOnline() });
-      if (generation !== bookGeneration) return;
+      const loaded = await bookSession.load(bookConfigs, id, request, isOnline());
+      if (!loaded) return;
 
       if (new URL(location.href).searchParams.get("clearAvailCache") === "1") storage.clearAvailability(loaded.book.id, loaded.book.cacheVersion);
       applyBookConfig(id, loaded);
@@ -397,13 +393,13 @@ export function startPlayer({ window, storage, fetchImpl }) {
       renderOfflineUi();
       if (firstBook && library.ui.onboardingEnabled && !storage.hasSeenOnboarding()) openOnboarding();
     } catch (error) {
-      if (generation !== bookGeneration) return;
+      if (generation !== bookSession.generation) return;
       requestedBookId = bookSelection?.bookId || id;
       populateLibrarySelect();
       if (!book) setMeta(t("errorLoading"), true);
       throw error;
     } finally {
-      if (generation === bookGeneration) { bookController = null; setLoading(false); setBusy(false); renderOfflineUi(); }
+      if (bookSession.finish(generation)) { setLoading(false); setBusy(false); renderOfflineUi(); }
     }
   }
 
@@ -422,7 +418,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
       ? media.position()
       : storage.getProgress(id, next.languageCode);
     if (!previousSelection || sleep.mode === "chapter") sleep.cancel(true);
-    pendingBookConfig = null;
+    bookSession.pendingConfig = null;
     book = loaded.book;
     bookConfigUrl = loaded.configUrl;
     bookSelection = next;
@@ -868,9 +864,8 @@ export function startPlayer({ window, storage, fetchImpl }) {
   }
 
   function prepareExplicitPlay() {
-    if (!media.canPause && pendingBookConfig && isOnline() && !bookController && !resetRemaining) {
-      const refreshed = pendingBookConfig;
-      pendingBookConfig = null;
+    const refreshed = bookSession.takePending({ playing: media.canPause, online: isOnline(), resetting: resetRemaining });
+    if (refreshed) {
       try { applyBookConfig(bookSelection.bookId, refreshed, bookSelection); }
       catch (error) { reportError("apply refreshed book configuration", error); }
     }
@@ -920,6 +915,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     if (!els.optionsPanel.hidden) { closePanel(els.optionsPanel, els.optionsBtn, true); return; }
     closeAllPanels(els.optionsPanel);
     openPanel(els.optionsPanel, els.optionsBtn, els.bookRow.hidden ? selectFocusTarget(els.langSelect) : selectFocusTarget(els.bookSelect));
+    void offline.retryWorkerConnection();
     if (libraryNeedsRetry || !book) void recoverLibrary();
     void loadLibraryTitles();
     availability.request({ immediate: true });
@@ -991,8 +987,7 @@ export function startPlayer({ window, storage, fetchImpl }) {
     if (!resetRemaining) {
       resetRemaining = { local: true, offline: true };
       progress.stop();
-      bookGeneration++;
-      bookController?.abort();
+      bookSession.invalidate();
       chapters.reset();
       availability.selectLanguage("");
       clearCover();

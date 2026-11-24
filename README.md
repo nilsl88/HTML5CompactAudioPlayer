@@ -102,6 +102,7 @@ js/
   config.js             Configuration validation and normalization
   book-config.js        Book loading, legacy filename fallback, and shared title requests
   book-selection.js     Language and quality choices for the active book
+  book-session.js       Book load cancellation and configuration updates
   cover.js              Cover loading, image fallback, and object URL lifetime
   custom-select.js      Select popups, keyboard navigation, and focus restoration
   dialogs.js            Dialog, panel, and focus behavior
@@ -119,6 +120,8 @@ js/
   offline-lock.js       Coordinate offline writes across tabs
   offline-manifest.js   Offline storage addresses and manifest validation shared with the worker
   offline-transfer.js   Version checks, range validation, and streamed audio chunks
+  offline-damage-recovery.js  Schedule and retry checks for damaged saved audio
+  shell-release.js      Player shell installation, validation, and cache recovery
   progress-writer.js    Batches listening positions and cancels pending writes on reset
   source-selection.js   MIME evidence, quality display, and fallback ordering
   sleep-timer.js         Timed and end-of-chapter pauses, countdown, and volume fade
@@ -137,7 +140,7 @@ tools/make-chapters.py  Time-based WebVTT chapters for audio without chapter met
 
 Each book has its own `media/<folder>/book.json`. The separate `media/library.json` is a catalog of book IDs and folders, not a second copy of their configuration. This keeps each book's audio, chapters, artwork, and configuration together.
 
-The player prefers `book.json` and accepts the old `episode.json` filename as described under [Migrating existing sites](#migrating-existing-sites). The bundled example keeps its stable `episode-001` ID and media folder.
+The player prefers `book.json` and accepts the old `episode.json` filename. The bundled example keeps its stable `episode-001` ID and media folder.
 
 Required fields:
 
@@ -259,7 +262,7 @@ Each entry needs only a stable `id`. Its folder defaults to that ID; add `folder
 
 `ui.onboardingEnabled` is a library-wide setting. It defaults to `true`; set it to `false` when the first-visit help dialog should never open automatically. Book-level onboarding settings are no longer used because the browser stores onboarding state once for the whole player.
 
-The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. The player reuses configurations loaded from the server for the rest of the page session. Options lists the catalog IDs as soon as the catalog arrives, even while the startup book is loading or retrying. You can select another book immediately. Each title replaces its ID when its lookup finishes. A failed optional title request does not prevent the current book from playing.
+The selected book configuration loads during startup. Other titles load when Options is first opened, with at most two small configuration requests running at once. The player keeps up to 24 full configurations in memory, including the selected book. It keeps resolved catalog titles for the page session. Options lists the catalog IDs as soon as the catalog arrives, even while the startup book is loading or retrying. You can select another book immediately. Each title replaces its ID when its lookup finishes. A failed optional title request does not prevent the current book from playing.
 
 If the service worker supplies a downloaded configuration, the player checks the server again when the connection returns or when you select that book online. A failed check leaves the downloaded configuration available. A valid update changes the title in Options. Playback continues with the current configuration until the next Play from pause while online. The player then uses the new configuration and keeps the position and quality choice for the selected language when they are still available.
 
@@ -269,15 +272,7 @@ Use `?book=<id>` to select a book. Old `?episode=<id>` links still work. A non-e
 
 Startup still prefers a downloaded book while offline, then a valid query, a saved library selection, the library default, and finally the legacy `episode-001` ID.
 
-## Migrating existing sites
-
-1. Deploy the player using the release instructions below. Then rename any book configuration files you want to migrate.
-2. Optionally rename each `episode.json` to `book.json`. Keep the JSON fields, book ID, folder, audio paths, and `cacheVersion` unchanged for a filename-only migration.
-3. Prefer `books` for the catalog collection and `?book=<id>` for new links. Replace the old collection key instead of adding a second competing list.
-
-Migration is optional: existing configurations, catalogs, and links continue to work. If both configuration filenames exist, `book.json` wins. Avoid maintaining different versions of the same book under both filenames.
-
-### Updating the player shell
+## Updating the player shell
 
 For a public deployment, prepare the static files from a single checkout:
 
@@ -285,7 +280,7 @@ For a public deployment, prepare the static files from a single checkout:
 node tools/prepare-release.mjs /tmp/compact-player-release
 ```
 
-Use an empty output directory. Copy the generated `releases/` tree into the installation without replacing previous release directories. Then upload `release-<id>.html` and `sw-<id>.js`, followed by `sw.js` and finally `index.html`. Leave `media/` and site configuration in place. Keep earlier release paths available so open tabs can still load their own files. The generated worker checks the decoded byte count and SHA-256 digest of each shell asset before caching it. It stops reading a response as soon as it exceeds the manifest's size and marks the cache ready after the last asset is stored. An interrupted installation cannot replace the last complete release in the cache. The deployed files run on a static server without Node.js.
+Use an empty output directory. Copy the generated `releases/` tree into the installation without replacing previous release directories. Then upload `release-<id>.html` and `sw-<id>.js`, followed by `sw.js` and finally `index.html`. Leave `media/` and site configuration in place. Keep earlier release paths available so open tabs can still load their own files. The generated worker checks the decoded byte count and SHA-256 digest of each shell asset before caching it. It stops reading a response as soon as it exceeds the manifest's size and marks the cache ready after the last asset is stored. An interrupted installation cannot replace the last complete release in the cache. If the current player page is missing while offline, the homepage can open the previous verified release. The deployed files run on a static server without Node.js.
 
 The generated page includes an import map with the SHA-256 digest of every JavaScript module. Browsers with [import map integrity support](https://html.spec.whatwg.org/multipage/webappapis.html#resolve-a-module-integrity-metadata) check the actual module responses on first load, before a service worker is present. If a module fails to load, **Reload page** retries the same URL and keeps the selected book in the link. Older browsers still use the version-specific paths and the worker's installation checks. If the site sets a Content Security Policy, allow the inline import map with its own hash or nonce so the browser can use this check.
 
@@ -294,6 +289,8 @@ A cache can delay delivery of the unversioned homepage or worker. If the old wor
 The loader tries `episode.json` only after `book.json` returns HTTP 404/410 or a network failure, including a timeout or interrupted response body. If the worker supplies a downloaded `book.json` after one of those failures, the loader can still use a valid server `episode.json`. It keeps the downloaded configuration if that lookup fails. Invalid primary configurations and other HTTP errors are reported directly when there is no saved copy. The timeout covers both headers and body for book configurations, the library, WebVTT files, and MP4 metadata ranges. Failed loads remain retryable. Concurrent selection and title requests share one load, while a cancelled selection cannot update a newer one.
 
 Each `book.json` or `episode.json` can contain up to 1 MiB of decoded UTF-8 bytes. The player stops reading larger responses, including cached configurations.
+
+The library catalog can contain up to 2 MiB of decoded UTF-8 bytes. The same limit applies when saving the catalog for offline use.
 
 Existing preferences and progress are read from the original storage keys until the installation saves its own values or is reset. Offline manifests retain their existing fields, including `episodeId` and `episodeTitle`. On offline startup the player uses the configuration URL recorded with the download. This also works for a custom book folder or a legacy `episode.json` when the catalog is unavailable. Startup gives the published download up to three seconds to become available and resumes immediately if the connection returns. Cache inventory and repair run in the background.
 
@@ -405,7 +402,7 @@ The player checks `navigator.storage.estimate()` before confirmation and again u
 
 Audio requests use the browser's media loader. This avoids a [Firefox service-worker streaming issue](https://bugzilla.mozilla.org/show_bug.cgi?id=1637325) that can interrupt online chapter seeking. At first Play while offline, the player uses a downloaded copy only when its book, language, source, and `cacheVersion` match. If an active source fails or times out, the player tries that matching copy once. During an update, the older worker can still serve existing downloads. The player enables changes to downloads once a worker that supports the IndexedDB records takes control. With an older worker, the player retries a failed saved-audio route check in the background. Other requests, including chapter and cover metadata, remain network-first with version-checked cached fallback.
 
-For navigation to the installation root or `index.html`, the service worker gives the server three seconds before looking for an installed page. If that lookup finds no usable response, the original request can still finish within the 15-second deadline. The deadline covers headers and validation of the body, including for each packaged release file. The ordinary player page can contain up to 256 KiB of decoded HTML. Cache lookups for the shell and ordinary book files get up to 750 ms. If a fallback lookup fails or times out, the worker returns the original server response or network error.
+For navigation to the installation root or `index.html`, the service worker gives the server three seconds before looking for an installed page. If that lookup finds no usable response, the original request can still finish within the 15-second deadline. The deadline covers headers and validation of the body, including for each packaged release file. The ordinary player page can contain up to 256 KiB of decoded HTML. Cache lookups for the shell and ordinary book files get up to 750 ms. For ordinary book files, the worker starts the lookup after three seconds without a network response. The same three-second window covers headers and body for readable cover responses through the worker, up to 16 MiB. If a fallback lookup fails or times out, the worker returns the original server response or network error.
 
 When a current release file cannot be read from cache, the worker fetches and verifies it. A verified response can restore a missing file in a cache marked ready. If the marker is missing, a verified response from the installed release starts one background rebuild for the cache. The rebuild has a 60-second deadline and records readiness only after all files are verified and stored. A later verified request can retry an incomplete rebuild. Cleanup of earlier caches runs separately from claiming open pages and has its own deadline. The `release-<id>.html` entry also works offline, including links with a book parameter.
 
@@ -434,7 +431,7 @@ When a book opens or the audio language changes, the selected language's WebVTT 
 
 The service worker identifies downloaded chapter and MP4 metadata by catalog ID, configuration ID, and `cacheVersion`. Legacy manifests without a configuration ID use the saved catalog ID. The chapter cache is also keyed by catalog ID, so separate catalog entries do not share cached chapters when their configurations have the same ID. Existing entries keyed only by a different configuration ID are not reused for an alias. During a worker upgrade, a cached response from an older worker that supplies only a version is rejected until the new worker takes control.
 
-Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. Chapter requests allow 20 seconds per attempt. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, a valid empty WebVTT file leads to embedded chapters for that edition. If the WebVTT request fails, the player keeps the embedded list available offline and checks WebVTT again on reconnection or the next online visit.
+Audio availability probes wait until chapter loading finishes and the browser is idle. Opening Options starts the scan sooner, but an active chapter request keeps priority. WebVTT requests allow 20 seconds per attempt and accept up to 1 MiB of decoded text. Each MP4 metadata operation allows up to 20 seconds and 128 HTTP requests, including retries and any QuickTime chapter samples. Failed requests and HTML error pages show a Retry action in the chapter panel and are retried when connectivity returns. In WebVTT mode, a valid file with no cues displays an empty chapter list. In auto mode, a valid empty WebVTT file leads to embedded chapters for that edition. If the WebVTT request fails, the player keeps the embedded list available offline and checks WebVTT again on reconnection or the next online visit.
 
 If the chapter server is unavailable, a downloaded WebVTT file can supply chapters for the same book version. With a different version, the chapter panel offers Retry. Cached WebVTT text and embedded cues are each limited to 512 KiB measured as UTF-8. Older cache entries exceeding that limit are loaded again from their source. Change `cacheVersion` whenever a chapter file changes. Reset Player removes the persistent chapter cache. Storage restrictions, corrupt values, or quota errors disable this extra cache without affecting network chapter loading.
 
@@ -487,7 +484,7 @@ After a reset, new chapter keys begin with `chapter-reset:<reset-id>:`. An outst
 
 Progress writes are throttled and flushed when the page is hidden or left.
 
-Cache Storage holds one completed audiobook and one interrupted download per player installation. Open tabs update their download status after another tab replaces or removes the saved book. The worker checks the active download before serving its audio. **Remove download** updates the player and releases the write lock when the removal record is saved. If Cache Storage is full, both **Remove download** and **Reset Player** can save their removal records in IndexedDB alone. If IndexedDB also rejects the record, the saved audio is kept. File cleanup gets up to three seconds. A later cache scan also removes unused metadata left by interrupted activations. Players hosted in different folders on the same origin manage their downloads separately, even when they use the same audio URL. Older downloads still belong to the folder containing their manifest URL. Reset Player clears the current installation's saved settings and invalidates its old downloads before spending up to three seconds removing their files. Any remaining files are eligible for cleanup on a later visit. If another tab is updating downloads, the reset dialog reports the conflict. If either store cannot be cleared, the dialog lists the unfinished part. **Try again** retries only that part. The service-worker app shell remains installed so a later online visit can refresh it.
+Cache Storage holds one completed audiobook and one interrupted download per player installation. Open tabs update their download status when another tab saves or pauses a draft or replaces or removes the saved book. The worker checks the active download before serving its audio. **Remove download** updates the player and releases the write lock when the removal record is saved. If Cache Storage is full, both **Remove download** and **Reset Player** can save their removal records in IndexedDB alone. If IndexedDB also rejects the record, the saved audio is kept. File cleanup gets up to three seconds. A later cache scan also removes unused metadata left by interrupted activations. Players hosted in different folders on the same origin manage their downloads separately, even when they use the same audio URL. Older downloads still belong to the folder containing their manifest URL. Reset Player clears the current installation's saved settings and invalidates its old downloads before spending up to three seconds removing their files. Any remaining files are eligible for cleanup on a later visit. If another tab is updating downloads, the reset dialog reports the conflict. If either store cannot be cleared, the dialog lists the unfinished part. **Try again** retries only that part. The service-worker app shell remains installed so a later online visit can refresh it.
 
 ## Accessibility and keyboard controls
 
