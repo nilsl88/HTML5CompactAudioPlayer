@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MediaController } from "../js/media-controller.js?v=20";
+import { MediaController } from "../js/media-controller.js?v=22";
 
 class FakeAudio extends EventTarget {
   src = "";
@@ -720,4 +720,32 @@ test("paused chapter seeks survive zero-time events before the first Play", asyn
     audio.emit("loadedmetadata");
     assert.equal(audio.currentTime, 2193.255);
   } finally { media.destroy(); }
+});
+
+test("a rejected seek leaves progress at the actual position until the element accepts it", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const audio = new FakeAudio();
+  audio.duration = 60;
+  audio.currentTime = 5;
+  const progress = [];
+  const media = new MediaController(audio, { onProgress: (position) => progress.push(position) });
+  await media.setSelection(sources, sources[0].id, 5, true);
+  audio.emit("loadedmetadata");
+  let accepted = false;
+  let actual = 5;
+  Object.defineProperty(audio, "currentTime", {
+    get: () => actual,
+    set(position) {
+      if (!accepted) throw new DOMException("Temporarily unseekable", "InvalidStateError");
+      actual = position;
+    },
+  });
+  assert.equal(media.seek(20), 5);
+  audio.emit("timeupdate");
+  assert.deepEqual(progress, []);
+  accepted = true;
+  audio.emit("canplay");
+  assert.equal(media.position(), 20);
+  assert.deepEqual(progress, [20]);
+  media.destroy();
 });

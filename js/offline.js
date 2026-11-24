@@ -1,11 +1,13 @@
-import "./offline-manifest.js?v=20";
-import { readBookConfigText } from "./config.js?v=20";
-import { createAbortError, fetchWithRetry } from "./utils.js?v=20";
-import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js?v=20";
-import { withOfflineLock } from "./offline-lock.js?v=20";
-import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange, withOfflineDeadline as prepareWithTimeout } from "./offline-transfer.js?v=20";
-import { PlayerWorker, PlayerWorkerSetupTimeout } from "./player-worker.js?v=20";
-export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js?v=20";
+import "./offline-manifest.js?v=22";
+import { readBookConfigText } from "./config.js?v=22";
+import { readLibraryText } from "./book-config.js?v=22";
+import { createAbortError, fetchWithRetry } from "./utils.js?v=22";
+import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js?v=22";
+import { withOfflineLock } from "./offline-lock.js?v=22";
+import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange, withOfflineDeadline as prepareWithTimeout } from "./offline-transfer.js?v=22";
+import { PlayerWorker, PlayerWorkerSetupTimeout } from "./player-worker.js?v=22";
+import { OfflineDamageRecovery } from "./offline-damage-recovery.js?v=22";
+export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js?v=22";
 
 const PREPARATION_TIMEOUT_MS = 20_000;
 const OPTIONAL_ASSET_TIMEOUT_MS = 3000;
@@ -15,8 +17,6 @@ const PUBLISHED_STARTUP_TIMEOUT_MS = 3000;
 const PUBLISHED_SYNC_TIMEOUT_MS = 3000;
 const INVENTORY_SCAN_TIMEOUT_MS = 20_000;
 const INVENTORY_LOCK_TIMEOUT_MS = 3000;
-const DAMAGE_LOCK_RETRY_MS = 3000;
-const DAMAGE_LOCK_MAX_RETRY_MS = 30_000;
 const INVENTORY_CHECK_TIMEOUT_MS = 3000;
 const RESET_CLEANUP_TIMEOUT_MS = 3000;
 const BOOK_CLEANUP_TIMEOUT_MS = 3000;
@@ -28,7 +28,7 @@ const {
   validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength,
 } = globalThis.CompactPlayerOfflineManifest;
 export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
-export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js?v=20";
+export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js?v=22";
 
 export function completedBytes(manifest) {
   if (!validManifest(manifest)) return 0;
@@ -68,6 +68,8 @@ export class OfflineManager {
       baseUrl: this.baseUrl, navigatorObject, fetchImpl, scriptName: workerScriptName, releaseSequence: workerReleaseSequence,
     });
     this.workerSetupTimedOut = false;
+    this.workerRegistrationFailed = false;
+    this.workerRegistrationRetry = null;
     this.getCacheStorage = getCacheStorage;
     this.store = new OfflineBookStore(this.baseUrl, null);
     this.supported = false;
@@ -84,10 +86,12 @@ export class OfflineManager {
     this.phase = "idle";
     this.abortController = null;
     this.currentPromise = null;
-    this.pendingDamage = false;
-    this.damageCheck = null;
-    this.damageRetryTimer = null;
-    this.damageRetryDelay = DAMAGE_LOCK_RETRY_MS;
+    this.damage = new OfflineDamageRecovery({
+      canRun: () => this.supported && !this.currentPromise,
+      inspect: () => this.inspectAndReconcileDownloads(true),
+      sync: () => this.syncPublishedDownload(),
+    });
+    this.pendingDamageRetirements = new Set();
     this.publishedRevision = 0;
     this.publishedReady = Promise.resolve();
   }
@@ -124,6 +128,27 @@ export class OfflineManager {
 
   emit() { this.onChange(this.snapshot()); }
 
+  async retryWorkerConnection() {
+    if (!this.supported && !this.workerSetupTimedOut) return;
+    try {
+      await this.worker.retryCapabilities();
+      await this.recoverFromWorkerTimeout();
+      this.emit();
+      if (this.workerRegistrationFailed) {
+        if (!this.workerRegistrationRetry) {
+          this.workerRegistrationRetry = this.worker.register().then(() => {
+            this.workerRegistrationFailed = false;
+          }).finally(() => { this.workerRegistrationRetry = null; });
+        }
+        await this.workerRegistrationRetry;
+        await this.recoverFromWorkerTimeout();
+        this.emit();
+      }
+    } catch (error) {
+      console.warn("[CompactAudioPlayer] Could not retry the offline worker connection.", error);
+    }
+  }
+
   setPhase(phase) {
     this.phase = phase;
     this.emit();
@@ -136,8 +161,7 @@ export class OfflineManager {
       const saved = [this.active, this.repairable, this.staging].find((item) => item?.downloadId === downloadId);
       if (!Number.isSafeInteger(index) || index < 0 || (saved && index >= saved.totalChunks)) return;
       this.store.reportDamagedChunk(downloadId, index);
-      this.pendingDamage = true;
-      this.reconcileReportedDamage();
+      this.damage.report();
     }, () => {
       void this.worker.supportsOfflineWrites().then(() => this.recoverFromWorkerTimeout()).then(() => this.emit()).catch((error) => {
         console.warn("[CompactAudioPlayer] Could not recover offline controls after the worker took control.", error);
@@ -145,10 +169,10 @@ export class OfflineManager {
     });
     const registration = this.worker.register().catch((error) => {
       console.warn("[CompactAudioPlayer] Could not register the offline player.", error);
-      if (error instanceof PlayerWorkerSetupTimeout && this.supported) {
-        if (this.worker.controller) return;
-        this.workerSetupTimedOut = true;
-      }
+      const retryable = error instanceof PlayerWorkerSetupTimeout || ["TypeError", "NetworkError", "TimeoutError"].includes(error?.name);
+      if (retryable) this.workerRegistrationFailed = true;
+      if (retryable && this.worker.controller) return;
+      if (retryable && this.supported) this.workerSetupTimedOut = true;
       this.supported = false;
       this.emit();
     });
@@ -181,7 +205,9 @@ export class OfflineManager {
     const prepare = async () => {
       if (!this.worker.controller) await registration;
       if (signal.aborted || (!this.supported && !this.worker.controller)) return;
-      if (await this.readPublishedBook(false, signal) && !signal.aborted) await this.worker.prepare(this.active);
+      let read = await this.readPublishedBook(false, signal);
+      if (!read && !signal.aborted) read = await this.readPublishedBook(false, signal);
+      if (read && !signal.aborted) await this.worker.prepare(this.active);
     };
     try {
       const deadline = new Promise((resolve) => {
@@ -199,7 +225,7 @@ export class OfflineManager {
     try {
       this.changeChannel = new BroadcastChannel(`compact-player-offline:${this.baseUrl}`);
       this.changeChannel.addEventListener("message", ({ data }) => {
-        if (data === PUBLISHED_DOWNLOAD_CHANGED) void this.syncPublishedDownload();
+        if (data === PUBLISHED_DOWNLOAD_CHANGED) void this.syncPublishedDownload(true, { changed: true });
       });
     } catch (error) {
       console.warn("[CompactAudioPlayer] Could not listen for offline changes in other tabs.", error);
@@ -211,8 +237,30 @@ export class OfflineManager {
     catch (error) { console.warn("[CompactAudioPlayer] Could not tell other tabs about the offline change.", error); }
   }
 
-  async syncPublishedDownload(syncStaging = true) {
-    if (!this.cacheStorage) return;
+  syncPublishedDownload(syncStaging = true, { changed = false } = {}) {
+    if (!this.cacheStorage) return Promise.resolve();
+    const running = this.publishedSync;
+    if (running) {
+      if (changed || (syncStaging && !running.syncStaging)) running.next = Boolean(running.next || syncStaging);
+      return running.promise;
+    }
+    const job = { syncStaging, next: null };
+    job.promise = Promise.resolve().then(async () => {
+      try {
+        do {
+          await this.syncPublishedPass(job.syncStaging);
+          job.syncStaging = job.next;
+          job.next = null;
+        } while (job.syncStaging !== null);
+      } finally {
+        this.publishedSync = null;
+      }
+    });
+    this.publishedSync = job;
+    return job.promise;
+  }
+
+  async syncPublishedPass(syncStaging) {
     const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the published download timed out.");
     try {
       await prepareWithTimeout(async (signal) => {
@@ -222,7 +270,9 @@ export class OfflineManager {
           this.publishedSyncPending = true;
           return;
         }
-        if (await this.readPublishedBook(syncStaging, signal) && !signal.aborted) {
+        let read = await this.readPublishedBook(syncStaging, signal);
+        if (!read && !signal.aborted && !this.currentPromise) read = await this.readPublishedBook(syncStaging, signal);
+        if (read && !signal.aborted) {
           this.setPhase(this.staging ? "paused" : this.active ? "ready" : "idle");
         }
       }, undefined, PUBLISHED_SYNC_TIMEOUT_MS, timeout);
@@ -241,12 +291,12 @@ export class OfflineManager {
   }
 
   async withLock(action, whenBusy, waitMs) {
-    if (!await this.worker.supportsOfflineWrites()) {
-      throw new OfflineDownloadError("unsupported", "The player is waiting for the updated offline worker.");
-    }
+    const unsupported = () => new OfflineDownloadError("unsupported", "The player is waiting for the updated offline worker.");
+    if (!await this.worker.supportsOfflineWrites()) throw unsupported();
     const jobs = [];
     try {
       return await withOfflineLock(this.navigator, `compact-player-offline:${this.baseUrl}`, async () => {
+        if (!await this.worker.supportsOfflineWrites() || !this.worker.canWriteOfflineJournal) throw unsupported();
         this.cleanupJobs = jobs;
         try { return await action(); }
         finally { this.cleanupJobs = null; }
@@ -256,11 +306,32 @@ export class OfflineManager {
     }
   }
 
-  setPublishedBook(saved) {
-    this.publishedRevision++;
-    this.active = saved?.status === "ready" ? saved : null;
-    this.repairable = ["needs-config", "needs-audio"].includes(saved?.status) ? saved : null;
-    void this.worker.prepare(this.active);
+  updateDownloadState({ saved, staging, resetId, damageRevision, deferDamageCleanup = false }) {
+    const previousSaved = (this.active || this.repairable)?.downloadId;
+    const previousStaging = this.staging?.downloadId;
+    if (saved !== undefined) {
+      this.publishedRevision++;
+      this.active = saved?.status === "ready" ? saved : null;
+      this.repairable = ["needs-config", "needs-audio"].includes(saved?.status) ? saved : null;
+    }
+    if (staging !== undefined) this.staging = staging;
+
+    const savedId = (this.active || this.repairable)?.downloadId;
+    const stagingId = this.staging?.downloadId;
+    if (previousSaved && previousSaved !== savedId) this.pendingDamageRetirements.add(previousSaved);
+    if (previousStaging && previousStaging !== stagingId) this.pendingDamageRetirements.add(previousStaging);
+    if (saved?.status === "removed") this.pendingDamageRetirements.add(saved.downloadId);
+
+    // Wait for the staging record before retiring a previously published ID.
+    if (staging !== undefined && !deferDamageCleanup) {
+      if (damageRevision !== undefined) this.store.forgetUnreferencedDamage([savedId, stagingId], damageRevision);
+      for (const id of this.pendingDamageRetirements) {
+        if (id !== savedId && id !== stagingId) this.store.forgetDamage(id);
+      }
+      this.pendingDamageRetirements.clear();
+    }
+    if (resetId) this.store.setDamageEpoch(resetId);
+    if (saved !== undefined) void this.worker.prepare(this.active);
   }
 
   recordIds() {
@@ -279,8 +350,7 @@ export class OfflineManager {
         return current;
       }, signal, INVENTORY_CHECK_TIMEOUT_MS, timeout);
       checkCanceled(signal);
-      this.setPublishedBook(saved);
-      this.staging = staging;
+      this.updateDownloadState({ saved, staging });
       if (this.active?.downloadId !== expected.activeId || this.repairable?.downloadId !== expected.repairableId
         || this.staging?.downloadId !== expected.stagingId) {
         this.emit();
@@ -293,18 +363,27 @@ export class OfflineManager {
   async readPublishedBook(syncStaging = false, signal) {
     const revision = ++this.publishedRevision;
     try {
-      const saved = await this.readRecord("active", true, signal);
+      const snapshot = await this.store.readControlSnapshot(signal);
+      const state = await this.store.readActiveState(signal, false, snapshot);
+      const saved = await this.store.readRecord("active", true, signal, state);
       if (signal?.aborted) return false;
       const checked = saved?.status === "ready" ? await this.store.checkReadyConfig(saved, signal) : saved;
       if (signal?.aborted) return false;
-      const staging = syncStaging ? await this.readRecord("staging", false, signal) : null;
+      const staging = syncStaging ? (await this.store.readStagingState(false, signal, state, snapshot)).manifest : null;
       if (signal?.aborted || revision !== this.publishedRevision) return false;
+      if (snapshot) {
+        const current = await this.store.readControlSnapshot(signal);
+        if (signal?.aborted || revision !== this.publishedRevision) return false;
+        if (JSON.stringify(current) !== JSON.stringify(snapshot)) return false;
+      }
       if (syncStaging && this.currentPromise) {
         this.publishedSyncPending = true;
         return false;
       }
-      this.setPublishedBook(checked);
-      if (syncStaging) this.staging = staging?.downloadId !== saved?.downloadId ? staging : null;
+      this.updateDownloadState({
+        saved: checked, resetId: state.resetId,
+        staging: syncStaging ? (staging?.downloadId !== saved?.downloadId ? staging : null) : undefined,
+      });
       return true;
     } catch (error) {
       if (!signal?.aborted) console.warn("[CompactAudioPlayer] Could not read the published offline book.", error);
@@ -322,44 +401,9 @@ export class OfflineManager {
       await this.syncPublishedDownload(false);
       this.emit();
     } finally {
-      if (this.pendingDamage) this.reconcileReportedDamage();
+      this.damage.resume();
     }
     return this.snapshot();
-  }
-
-  reconcileReportedDamage(retryLock = true) {
-    if (!this.supported || !this.pendingDamage || this.damageCheck || this.currentPromise) return;
-    clearTimeout(this.damageRetryTimer);
-    this.damageRetryTimer = null;
-    let retry = false;
-    let lockTimedOut = false;
-    this.damageCheck = Promise.resolve().then(async () => {
-      this.pendingDamage = false;
-      const outcome = await this.inspectAndReconcileDownloads(true);
-      lockTimedOut = outcome === "lock-timeout";
-      if (outcome !== "applied" && outcome !== "timed-out" && !lockTimedOut) await this.syncPublishedDownload();
-      const queued = this.pendingDamage;
-      if (outcome !== "applied") this.pendingDamage = true;
-      retry = outcome === "applied" || outcome === "stale" || (queued && ["failed", "timed-out"].includes(outcome))
-        || (lockTimedOut && (retryLock || queued));
-    }).catch((error) => {
-      this.pendingDamage = true;
-      console.warn("[CompactAudioPlayer] Could not check the damaged audio chunk.", error);
-    }).finally(() => {
-      this.damageCheck = null;
-      if (!lockTimedOut) this.damageRetryDelay = DAMAGE_LOCK_RETRY_MS;
-      if (retry && this.pendingDamage) this.reconcileReportedDamage(!lockTimedOut);
-      else if (lockTimedOut && this.pendingDamage) this.scheduleDamageRetry();
-    });
-  }
-
-  scheduleDamageRetry() {
-    if (this.damageRetryTimer !== null) return;
-    this.damageRetryTimer = setTimeout(() => {
-      this.damageRetryTimer = null;
-      this.reconcileReportedDamage(false);
-    }, this.damageRetryDelay);
-    this.damageRetryDelay = Math.min(this.damageRetryDelay * 2, DAMAGE_LOCK_MAX_RETRY_MS);
   }
 
   async inventoryRecords(signal, includeUnpublishedStaging = true) {
@@ -377,6 +421,10 @@ export class OfflineManager {
   async inspectAndReconcileDownloads(waitForLock = false) {
     if (!this.supported || this.currentPromise) return "busy";
     if (!await this.worker.supportsOfflineWrites()) return "busy";
+    if (waitForLock) {
+      const available = await this.withLock(() => true, () => false);
+      if (!available) return "lock-timeout";
+    }
     let records;
     let inventory;
     try {
@@ -417,8 +465,7 @@ export class OfflineManager {
       // The write lock and rechecked journal identify abandoned candidates. Candidate names are never reused.
       const abandoned = inventory.journalCandidates.filter((name) => !records.journalCaches.includes(name));
       if (abandoned.length) this.cleanupJobs.push((signal) => this.store.deletePublicationCaches(abandoned, signal));
-      this.setPublishedBook(records.saved);
-      this.staging = records.staging;
+      this.updateDownloadState({ saved: records.saved, staging: records.staging, deferDamageCleanup: true });
       await this.store.applyInspection(inventory);
       await this.reconcileDownloads(records, inventory);
       return "applied";
@@ -433,14 +480,14 @@ export class OfflineManager {
     return "failed";
   }
 
-  async reconcileDownloads({ resetId }, { bookNames, active, staging, damaged, completion }) {
+  async reconcileDownloads({ resetId }, { bookNames, active, staging, damaged, completion, damageRevision }) {
     this.stagingCheck = completion;
     const candidate = completion?.status === "ready" ? completion : active;
     const recoveredStaging = staging && staging.downloadId !== candidate?.downloadId
       && staging.downloadId !== this.staging?.downloadId ? staging : undefined;
-    this.staging = staging;
+    this.updateDownloadState({ staging, deferDamageCleanup: true });
     if (candidate && candidate.downloadId !== this.active?.downloadId) {
-      return this.publish(candidate, bookNames, undefined, recoveredStaging);
+      return this.publish(candidate, bookNames, undefined, { recoveredStaging, damageRevision });
     }
     const previous = this.active || this.repairable;
     const published = active || damaged;
@@ -448,7 +495,7 @@ export class OfflineManager {
       ? { status: "removed", downloadId: previous.downloadId } : published;
     if (recoveredStaging) await this.store.commitActive(retired, { recoveredStaging });
     else await this.store.reconcileRecord("active", previous, retired);
-    this.setPublishedBook(published);
+    this.updateDownloadState({ saved: published ?? null, staging, resetId, damageRevision });
     if (previous?.status !== published?.status || previous?.downloadId !== published?.downloadId) this.announcePublishedChange();
     this.queueBookCleanup(bookNames, resetId);
     this.setPhase(this.staging ? "paused" : "idle");
@@ -514,7 +561,7 @@ export class OfflineManager {
   async putManifest(files, manifest, signal) {
     await writeStagingData(() => files.writeManifest(manifest), signal);
     await this.writeRecord("staging", manifest, signal);
-    this.staging = manifest;
+    this.updateDownloadState({ staging: manifest });
   }
 
   async createStaging(selection, preflight, signal, resetId) {
@@ -529,10 +576,8 @@ export class OfflineManager {
       throw error;
     }
     this.stagingCheck = null;
-    if (previous) {
-      if (!preflight.reclaimStaging) this.queueBookCleanup([previous.cacheName], resetId, previous);
-      this.announcePublishedChange();
-    }
+    if (previous && !preflight.reclaimStaging) this.queueBookCleanup([previous.cacheName], resetId, previous);
+    this.announcePublishedChange();
     return { files, manifest, configPrepared: Boolean(previous) };
   }
 
@@ -552,6 +597,11 @@ export class OfflineManager {
           checkCanceled(assetSignal);
         }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (url === new URL("media/library.json", this.baseUrl).href) {
+          const text = await readLibraryText(response, assetSignal);
+          await files.writeAsset(url, new Response(text, { status: response.status, headers: response.headers }));
+          return;
+        }
         await files.writeAsset(url, response);
       });
       try {
@@ -575,7 +625,7 @@ export class OfflineManager {
       this.abortController = null;
       this.currentPromise = null;
       if (this.busy) this.setPhase(this.staging ? "paused" : "idle");
-      if (this.pendingDamage) this.reconcileReportedDamage();
+      this.damage.resume();
       if (this.publishedSyncPending) {
         this.publishedSyncPending = false;
         void this.syncPublishedDownload();
@@ -637,7 +687,7 @@ export class OfflineManager {
     let stored = await this.checkStaging(this.staging, selection, signal);
     checkCanceled(signal);
     if (!stored || stored.status === "downloading") {
-      if (stored) this.staging = stored;
+      if (stored) this.updateDownloadState({ staging: stored });
       return;
     }
     const check = { ...expected, totalSize: stored.totalSize, remainingBytes: 0, requiredBytes: 0, canResume: true };
@@ -712,10 +762,11 @@ export class OfflineManager {
     }, signal));
   }
 
-  async publish(manifest, bookNames = [(this.active || this.repairable)?.cacheName], signal, recoveredStaging) {
+  async publish(manifest, bookNames = [(this.active || this.repairable)?.cacheName], signal,
+    { recoveredStaging, damageRevision } = {}) {
     let committed;
+    const consumeStaging = this.staging?.downloadId === manifest.downloadId;
     try {
-      const consumeStaging = this.staging?.downloadId === manifest.downloadId;
       committed = await this.store.publish(manifest, signal, recoveredStaging, consumeStaging);
     } catch (error) {
       if (this.staging?.downloadId === manifest.downloadId && (signal?.aborted || error?.code === "storage-timeout")) {
@@ -723,9 +774,9 @@ export class OfflineManager {
       }
       throw error;
     }
-    this.setPublishedBook(manifest);
+    this.updateDownloadState({ saved: manifest, staging: consumeStaging ? null : this.staging,
+      resetId: committed.resetId, damageRevision });
     this.announcePublishedChange();
-    if (this.staging?.downloadId === manifest.downloadId) this.staging = null;
     this.queueBookCleanup(bookNames, committed.resetId);
     this.setPhase(this.staging ? "paused" : "ready");
   }
@@ -749,6 +800,7 @@ export class OfflineManager {
     this.setPhase("preparing");
     const reclaim = preflight.reclaimStaging ? this.staging : null;
     let manifest;
+    let reclaiming = false;
     try {
       let files;
       let configPrepared = false;
@@ -756,7 +808,11 @@ export class OfflineManager {
         manifest = this.staging;
         files = await this.store.openStagingFiles(manifest, signal);
       } else ({ files, manifest, configPrepared } = await this.createStaging(selection, preflight, signal, resetId));
-      if (reclaim) await this.reclaimRetiredStaging(reclaim, resetId, signal);
+      if (reclaim) {
+        reclaiming = true;
+        await this.reclaimRetiredStaging(reclaim, resetId, signal);
+        reclaiming = false;
+      }
       if (!configPrepared) {
         const configured = await this.prepareRequiredConfig(manifest, selection, signal);
         if (configured !== manifest) await this.putManifest(files, configured, signal);
@@ -781,14 +837,14 @@ export class OfflineManager {
       }
       if (manifest.status === "needs-config") throw new OfflineDownloadError("config", "The saved book configuration is missing or invalid.");
       if (manifest.status !== "ready") {
-        this.staging = manifest;
+        this.updateDownloadState({ staging: manifest });
         throw new OfflineDownloadError("incomplete", "A downloaded audio chunk is missing.");
       }
       this.setPhase("finalizing");
       await this.publish(manifest, undefined, signal);
       return manifest;
     } catch (error) {
-      if ((signal.aborted || error?.code === "storage-timeout") && this.phase !== "finalizing") {
+      if ((signal.aborted || (error?.code === "storage-timeout" && !reclaiming)) && this.phase !== "finalizing") {
         if (manifest && this.staging?.downloadId === manifest.downloadId) await this.removeStagingLocked();
         if (signal.aborted) {
           this.setPhase(this.staging ? "paused" : "idle");
@@ -796,6 +852,7 @@ export class OfflineManager {
         }
       }
       this.setPhase(this.staging ? "paused" : "idle");
+      if (this.staging && this.staging.downloadId === manifest?.downloadId) this.announcePublishedChange();
       if (isQuotaError(error)) throw new OfflineDownloadError("quota", "The browser does not have enough storage for this download.");
       throw error;
     }
@@ -829,7 +886,7 @@ export class OfflineManager {
     const staging = this.staging;
     if (!staging) return;
     const resetId = await this.store.retireStaging();
-    this.staging = null;
+    this.updateDownloadState({ staging: null });
     this.stagingCheck = null;
     this.announcePublishedChange();
     this.queueBookCleanup([staging.cacheName], resetId, staging);
@@ -840,7 +897,7 @@ export class OfflineManager {
       const saved = this.active || this.repairable;
       if (!saved) return;
       const committed = await this.store.removePublishedBook(saved);
-      this.setPublishedBook(null);
+      this.updateDownloadState({ saved: null, staging: this.staging });
       this.announcePublishedChange();
       this.queueBookCleanup([saved.cacheName], committed.resetId, saved);
       this.setPhase(this.staging ? "paused" : "idle");
@@ -861,8 +918,7 @@ export class OfflineManager {
         return [];
       });
       const resetId = await this.store.clearDownloads();
-      this.setPublishedBook(null);
-      this.staging = null;
+      this.updateDownloadState({ saved: null, staging: null, resetId });
       this.stagingCheck = null;
       this.announcePublishedChange();
       this.setPhase("idle");

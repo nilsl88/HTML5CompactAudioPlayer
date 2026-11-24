@@ -1,8 +1,8 @@
-import "./offline-manifest.js?v=20";
-import { readBookConfigText } from "./config.js?v=20";
-import { sameOfflineSelection, manifestMatchesSelection, validateOfflineBookConfig } from "./offline-selection.js?v=20";
-export { sameOfflineSelection, manifestMatchesSelection } from "./offline-selection.js?v=20";
-import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled, withOfflineDeadline } from "./offline-transfer.js?v=20";
+import "./offline-manifest.js?v=22";
+import { readBookConfigText } from "./config.js?v=22";
+import { sameOfflineSelection, manifestMatchesSelection, validateOfflineBookConfig } from "./offline-selection.js?v=22";
+export { sameOfflineSelection, manifestMatchesSelection } from "./offline-selection.js?v=22";
+import { OFFLINE_CHUNK_SIZE, OfflineDownloadError, sameAudioRevision, checkCanceled, withOfflineDeadline } from "./offline-transfer.js?v=22";
 
 const { validManifest, audioMimeType, metaCache: OFFLINE_META_CACHE, schemaVersion: OFFLINE_SCHEMA_VERSION,
   offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl, confirmedChunkUrl, damageVersionHeader, chunkByteLength,
@@ -96,13 +96,37 @@ export class OfflineBookStore {
     this.bookCachePrefix = OFFLINE_BOOK_CACHE_PREFIX + scope + ":";
     this.stagingMetaCacheName = STAGING_META_CACHE_PREFIX + scope;
     this.reportedChunks = new Map();
+    this.damageVersions = new Map();
     this.damageRevision = 0;
   }
 
   reportDamagedChunk(downloadId, index) {
     this.damageRevision++;
+    this.damageVersions.set(downloadId, this.damageRevision);
     if (!this.reportedChunks.has(downloadId)) this.reportedChunks.set(downloadId, new Set());
     this.reportedChunks.get(downloadId).add(index);
+  }
+
+  forgetDamage(downloadId) {
+    if (this.reportedChunks.delete(downloadId)) {
+      this.damageVersions.delete(downloadId);
+      this.damageRevision++;
+    }
+  }
+
+  forgetUnreferencedDamage(downloadIds, revision) {
+    if (revision !== this.damageRevision) return;
+    const retained = new Set(downloadIds);
+    for (const downloadId of this.reportedChunks.keys()) {
+      if (!retained.has(downloadId)) this.forgetDamage(downloadId);
+    }
+  }
+
+  setDamageEpoch(resetId) {
+    if (!resetId) return;
+    for (const downloadId of this.reportedChunks.keys()) {
+      if (!String(downloadId).startsWith(resetId + ".")) this.forgetDamage(downloadId);
+    }
   }
 
   newResetId() { return createDownloadId(); }
@@ -303,7 +327,7 @@ export class OfflineBookStore {
     await this.cacheStorage.delete(manifest.cacheName);
   }
 
-  async readStagingState(includeUnpublished, signal, activeState) {
+  async readStagingState(includeUnpublished, signal, activeState, snapshot) {
     const key = offlineMetaUrl(this.baseUrl, "staging");
     const verifyCandidate = async (record) => {
       const manifest = record?.manifest;
@@ -327,7 +351,7 @@ export class OfflineBookStore {
       checkCanceled(signal);
       return verifyCandidate(await responseJson(await this.cacheStorage.match(key, { cacheName }), signal));
     };
-    const current = await this.control.read("staging", signal);
+    const current = snapshot ? snapshot.staging : await this.control.read("staging", signal);
     if (current !== undefined) {
       return { manifest: await verifyCandidate(current), authoritative: true };
     }
@@ -338,12 +362,22 @@ export class OfflineBookStore {
     return { manifest: await verifyCandidate({ cacheName: manifest?.cacheName, manifest }), authoritative: false };
   }
 
-  readActiveState(signal, requireControl = false) {
+  readActiveState(signal, requireControl = false, snapshot) {
     checkCanceled(signal);
     return readActiveState(this.baseUrl, async (url, cacheName) => {
       checkCanceled(signal);
       return responseJson(await this.cacheStorage.match(url, { cacheName }), signal);
-    }, signal, this.cacheStorage, requireControl);
+    }, signal, this.cacheStorage, requireControl, snapshot);
+  }
+
+  async readControlSnapshot(signal) {
+    try {
+      const [active, staging] = await this.control.readMany(["active", "staging"], signal);
+      return { active, staging };
+    } catch (error) {
+      if (signal?.aborted || !["NotSupportedError", "SecurityError", "NotAllowedError"].includes(error?.name)) throw error;
+      return null;
+    }
   }
 
   async readRecord(type, includeUnpublished = false, signal, activeState) {
@@ -459,9 +493,10 @@ export class OfflineBookStore {
     return { bookNames, journalCandidates, active, staging, damaged, completion, inspections, damageRevision };
   }
 
-  async inspectionIsCurrent({ inspections, damageRevision }, signal) {
+  async inspectionIsCurrent({ inspections }, signal) {
     checkCanceled(signal);
-    if (damageRevision !== this.damageRevision) return false;
+    const damageUnchanged = () => inspections.every(({ downloadId, damageVersion }) => this.damageVersions.get(downloadId) === damageVersion);
+    if (!damageUnchanged()) return false;
     const url = offlineManifestUrl(this.baseUrl);
     const repairUrl = offlineMetaUrl(this.baseUrl, "manifest-repair");
     const unchanged = await Promise.all(inspections.map(async ({ cacheName, original, repairRecord }) => {
@@ -473,13 +508,13 @@ export class OfflineBookStore {
         && (current !== null || await this.cacheStorage.has(cacheName));
     }));
     checkCanceled(signal);
-    return unchanged.every(Boolean) && damageRevision === this.damageRevision;
+    return unchanged.every(Boolean) && damageUnchanged();
   }
 
   async applyInspection({ inspections }, signal) {
     const timeout = new OfflineDownloadError("storage-write-timeout", "Saving offline repairs timed out.");
     await withOfflineDeadline(async (writeSignal) => {
-      for (const { cacheName, repair, repairBase, confirmedChunks, damageRevision } of inspections) {
+      for (const { cacheName, repair, repairBase, confirmedChunks, downloadId, damageVersion } of inspections) {
         if (!repair && !confirmedChunks.size) continue;
         checkCanceled(writeSignal);
         const cache = await this.cacheStorage.open(cacheName);
@@ -491,10 +526,17 @@ export class OfflineBookStore {
         }
         for (const { url, version, damage } of confirmedChunks.values()) {
           checkCanceled(writeSignal);
-          if (damageRevision !== this.damageRevision) break;
+          if (damageVersion !== this.damageVersions.get(downloadId)) break;
           if (url) await cache.put(url, new Response("", { headers: { [damageVersionHeader]: version } }));
           checkCanceled(writeSignal);
-          if (damage && damageRevision === this.damageRevision) this.reportedChunks.get(damage.downloadId)?.delete(damage.index);
+          if (damage && damageVersion === this.damageVersions.get(downloadId)) {
+            const reported = this.reportedChunks.get(damage.downloadId);
+            reported?.delete(damage.index);
+            if (reported?.size === 0) {
+              this.reportedChunks.delete(damage.downloadId);
+              this.damageVersions.delete(damage.downloadId);
+            }
+          }
         }
       }
     }, signal, REPAIR_WRITE_TIMEOUT_MS, timeout);
@@ -570,7 +612,7 @@ export class OfflineBookStore {
   }
 
   async inspectBookManifest(cacheName, saved, { restoreMissing = true, signal } = {}) {
-    const damageRevision = this.damageRevision;
+    const damageVersions = new Map(this.damageVersions);
     const match = (url) => readForVerification(() => this.cacheStorage.match(url, { cacheName }), signal);
     const response = await match(offlineManifestUrl(this.baseUrl));
     const original = await readForVerification((readSignal) => responseJson(response, readSignal), signal);
@@ -578,8 +620,9 @@ export class OfflineBookStore {
     const repairRecord = await readForVerification((readSignal) => responseJson(repairResponse, readSignal), signal);
     const repairBase = JSON.stringify(original);
     const restored = repairedManifest(original, repairRecord, cacheName, saved);
+    const downloadId = restored?.downloadId ?? saved?.downloadId;
     const inspection = { cacheName, original, repairRecord, repairBase, restored, match, signal,
-      repair: null, confirmedChunks: new Map(), damageRevision };
+      repair: null, confirmedChunks: new Map(), downloadId, damageVersion: damageVersions.get(downloadId) };
     inspection.manifest = await this.verifyLocalManifest(inspection, saved, restoreMissing);
     return inspection;
   }

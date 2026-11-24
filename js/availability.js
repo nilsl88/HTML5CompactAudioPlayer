@@ -1,4 +1,4 @@
-import { createAbortError, fetchWithRetry } from "./utils.js?v=20";
+import { createAbortError, fetchWithRetry } from "./utils.js?v=22";
 
 async function probeStatus(fetchImpl, url, options, signal, timeoutMs) {
   try {

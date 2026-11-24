@@ -1,12 +1,14 @@
-import { isMp4Audio } from "./codecs.js?v=20";
-import { fetchWithRetry, metadataRequestCache } from "./utils.js?v=20";
-import { parseWebVtt } from "./vtt.js?v=20";
-import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js?v=20";
-import "./offline-manifest.js?v=20";
+import { isMp4Audio } from "./codecs.js?v=22";
+import { fetchWithRetry, metadataRequestCache } from "./utils.js?v=22";
+import { parseWebVtt } from "./vtt.js?v=22";
+import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js?v=22";
+import { readBoundedText } from "./config.js?v=22";
+import "./offline-manifest.js?v=22";
 
 const { checkResponseVersion } = globalThis.CompactPlayerOfflineManifest;
 
 export const CHAPTER_REQUEST_TIMEOUT_MS = 20000;
+const VTT_MAX_BYTES = 1024 ** 2;
 
 function embeddedChapters(cues) {
   return { kind: "embedded", text: "", cues };
@@ -34,10 +36,10 @@ export async function loadChapterFile(url, {
     credentials: "same-origin",
     signal,
     timeoutMs,
-  }, (response) => {
+  }, (response, readSignal) => {
     if (!response.ok) throw new Error(`Chapter request failed with HTTP ${response.status}.`);
     checkResponseVersion(response, cacheVersion, bookIdentity);
-    return response.text();
+    return readBoundedText(response, readSignal, VTT_MAX_BYTES, () => new Error("WebVTT file exceeds 1 MiB."));
   });
   const chapters = parseChapterText(text);
   if (!chapters) throw new Error("The chapter file does not contain WebVTT.");

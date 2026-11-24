@@ -1,8 +1,8 @@
-importScripts("./js/offline-manifest.js?v=20", "./js/offline-media-response.js?v=20");
+importScripts("./js/offline-manifest.js?v=22", "./js/offline-media-response.js?v=22", "./js/shell-release.js?v=22");
 const { validManifest, downloadHeader: DOWNLOAD_HEADER, versionHeader, versionHeaderValue, bookHeader, bookHeaderValue,
   offlineMetaUrl, offlineChunkUrl, damagedChunkUrl, damageVersionHeader, networkStatusHeader, readActiveState,
   chunkReadTimeoutMs: SAVED_AUDIO_BODY_WAIT_MS } = globalThis.CompactPlayerOfflineManifest;
-const SHELL_VERSION = "v20";
+const SHELL_VERSION = "v22";
 const SHELL_RELEASE = null;
 const SHELL_CACHE_PREFIX = `compact-player-app-shell:${encodeURIComponent(new URL(self.registration.scope).pathname)}:`;
 const RELEASE_CACHE_PREFIX = SHELL_CACHE_PREFIX + "release-";
@@ -16,56 +16,65 @@ const SHELL_CLEANUP_WAIT_MS = 1000;
 const CACHE_FALLBACK_WAIT_MS = 750;
 const SAVED_AUDIO_CACHE_WAIT_MS = 1500;
 const SAVED_AUDIO_REPORT_WINDOW_MS = 60000;
+const COVER_MAX_BYTES = 16 * 1024 ** 2;
 const RELEASE_REBUILD_TIMEOUT_MS = 60000;
 const SHELL_URLS = [
-  "./?v=20",
-  "./index.html?v=20",
-  "./player.css?v=20",
-  "./player.js?v=20",
-  "./js/startup-error.js?v=20",
-  "./i18n.js?v=20",
-  "./js/player-app.js?v=20",
-  "./js/player-worker.js?v=20",
-  "./js/availability-cache.js?v=20",
-  "./js/chapter-cache.js?v=20",
-  "./js/chapter-panel.js?v=20",
-  "./js/http-range.js?v=20",
-  "./js/mp4-atoms.js?v=20",
-  "./js/mp4-metadata.js?v=20",
-  "./js/offline-media-response.js?v=20",
-  "./js/offline-panel.js?v=20",
-  "./js/offline-selection.js?v=20",
-  "./js/availability-session.js?v=20",
-  "./js/availability.js?v=20",
-  "./js/chapters.js?v=20",
-  "./js/chapter-session.js?v=20",
-  "./js/config.js?v=20",
-  "./js/codecs.js?v=20",
-  "./js/preferences.js?v=20",
-  "./js/cover.js?v=20",
-  "./js/book-config.js?v=20",
-  "./js/book-selection.js?v=20",
-  "./js/dialogs.js?v=20",
-  "./js/custom-select.js?v=20",
-  "./js/media-controller.js?v=20",
-  "./js/media-session.js?v=20",
-  "./js/mp4-chapters.js?v=20",
-  "./js/offline.js?v=20",
-  "./js/offline-book-store.js?v=20",
-  "./js/progress-writer.js?v=20",
-  "./js/offline-transfer.js?v=20",
-  "./js/offline-lock.js?v=20",
-  "./js/offline-manifest.js?v=20",
-  "./js/source-selection.js?v=20",
-  "./js/storage.js?v=20",
-  "./js/sleep-timer.js?v=20",
-  "./js/utils.js?v=20",
-  "./js/vtt.js?v=20",
+  "./?v=22",
+  "./index.html?v=22",
+  "./player.css?v=22",
+  "./player.js?v=22",
+  "./js/startup-error.js?v=22",
+  "./js/shell-release.js?v=22",
+  "./i18n.js?v=22",
+  "./js/player-app.js?v=22",
+  "./js/player-worker.js?v=22",
+  "./js/availability-cache.js?v=22",
+  "./js/chapter-cache.js?v=22",
+  "./js/chapter-panel.js?v=22",
+  "./js/http-range.js?v=22",
+  "./js/mp4-atoms.js?v=22",
+  "./js/mp4-metadata.js?v=22",
+  "./js/offline-media-response.js?v=22",
+  "./js/offline-panel.js?v=22",
+  "./js/offline-selection.js?v=22",
+  "./js/availability-session.js?v=22",
+  "./js/availability.js?v=22",
+  "./js/chapters.js?v=22",
+  "./js/chapter-session.js?v=22",
+  "./js/config.js?v=22",
+  "./js/codecs.js?v=22",
+  "./js/preferences.js?v=22",
+  "./js/cover.js?v=22",
+  "./js/book-config.js?v=22",
+  "./js/book-selection.js?v=22",
+  "./js/book-session.js?v=22",
+  "./js/dialogs.js?v=22",
+  "./js/custom-select.js?v=22",
+  "./js/media-controller.js?v=22",
+  "./js/media-session.js?v=22",
+  "./js/mp4-chapters.js?v=22",
+  "./js/offline.js?v=22",
+  "./js/offline-damage-recovery.js?v=22",
+  "./js/offline-book-store.js?v=22",
+  "./js/progress-writer.js?v=22",
+  "./js/offline-transfer.js?v=22",
+  "./js/offline-lock.js?v=22",
+  "./js/offline-manifest.js?v=22",
+  "./js/source-selection.js?v=22",
+  "./js/storage.js?v=22",
+  "./js/sleep-timer.js?v=22",
+  "./js/utils.js?v=22",
+  "./js/vtt.js?v=22",
 ];
 const SHELL_PATHS = new Set(SHELL_URLS.map((path) => new URL(path, self.registration.scope).pathname));
 const PLAYER_PAGES = new Set(["./", "index.html"].map((path) => new URL(path, self.registration.scope).pathname));
 const RELEASE_ASSETS = new Map(Object.entries(SHELL_RELEASE?.assets || {}).map(([path, asset]) => [scopeUrl(path), asset]));
-let releaseRebuild;
+var { cancelResponseBody, cachedShell, invalidReleaseAsset, readShellBytes, decodedShellResponse, matchesReleaseBytes, fetchVerifiedReleaseAsset, readCache, currentReleaseCache, populateRelease, rebuildRelease, releaseAsset, releaseRequest, isReleaseCache, isCompleteRelease, previousReleaseAsset, validShellPage, readShellPage, rebuildFromPage, fetchShell, installRelease, installSourceShell, previousCompleteRelease, cleanUpShellCaches } = createShellRelease({
+  scopeUrl, withCacheDeadline, withShellNetworkDeadline, SHELL_VERSION, SHELL_RELEASE,
+  SHELL_CACHE_PREFIX, RELEASE_CACHE_PREFIX, VERIFIED_RELEASE_CACHE_PREFIX, SHELL_CACHE,
+  RELEASE_READY_URL, SHELL_NETWORK_WAIT_MS, SHELL_PAGE_MAX_BYTES, CACHE_FALLBACK_WAIT_MS,
+  RELEASE_REBUILD_TIMEOUT_MS, SHELL_URLS, PLAYER_PAGES, RELEASE_ASSETS,
+});
 
 function scopeUrl(path) {
   return new URL(path, self.registration.scope).href;
@@ -224,7 +233,13 @@ async function networkFirstCover(request, url) {
   if (target.origin !== self.location.origin || version === null || !bookId || !configId) return new Response(null, { status: 400 });
   let response;
   try {
-    response = await fetch(target.href, { mode: "no-cors", cache: "no-cache", credentials: "same-origin", signal: request.signal });
+    response = await withAbortDeadline(async (signal) => {
+      const network = await fetch(target.href, { mode: "no-cors", cache: "no-cache", credentials: "same-origin", signal });
+      if (!network.ok) return network;
+      const bytes = await readShellBytes(network.body, COVER_MAX_BYTES, signal);
+      if (!bytes) throw new Error("Cover image exceeds 16 MiB.");
+      return decodedShellResponse(network, bytes);
+    }, { parent: request.signal, timeoutMs: SHELL_NETWORK_WAIT_MS, timeoutMessage: "Cover request timed out." });
     if (response.ok || response.type === "opaque") return response;
   } catch (error) {
     if (request.signal.aborted) throw error;
@@ -244,250 +259,33 @@ function cachedFallback(request, networkStatus, signal) {
   return SHELL_PATHS.has(new URL(request.url).pathname) ? cachedShell(request, signal) : cachedBookResponse(request, networkStatus, signal);
 }
 
-async function cachedShell(request, signal) {
-  const shell = await caches.open(SHELL_CACHE);
-  if (signal?.aborted) return null;
-  if (request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname)) {
-    if (SHELL_RELEASE) {
-      const ready = (await shell.match(RELEASE_READY_URL))?.ok;
-      return ready && !signal?.aborted ? shell.match(scopeUrl(SHELL_RELEASE.page)) : null;
-    }
-    const installed = await shell.match(scopeUrl(`index.html?v=${SHELL_VERSION.slice(1)}`));
-    if (installed || signal?.aborted) return installed;
-    return shell.match(scopeUrl(`./?v=${SHELL_VERSION.slice(1)}`));
-  }
-  return shell.match(request);
-}
-
-function invalidReleaseAsset(url) {
-  return new Error(`Release asset does not match its manifest: ${url}`);
-}
-
-function cancelResponseBody(stream) {
-  void stream?.cancel().catch(() => { /* The response body may already have failed. */ });
-}
-
-async function readShellBytes(body, maxBytes, signal) {
-  if (signal?.aborted) {
-    cancelResponseBody(body);
-    throw signal.reason;
-  }
-  if (!body) return new Uint8Array(0);
-  const bytes = new Uint8Array(maxBytes);
-  const reader = body.getReader();
-  let offset = 0;
-  let ended = false;
-  const cancel = () => {
-    if (ended) return;
-    ended = true;
-    cancelResponseBody(reader);
-  };
-  signal?.addEventListener("abort", cancel, { once: true });
-  try {
-    while (!ended) {
-      const { done, value } = await reader.read();
-      if (signal?.aborted) throw signal.reason;
-      ended = done;
-      if (done) break;
-      if (value.byteLength > bytes.length - offset) return null;
-      bytes.set(value, offset);
-      offset += value.byteLength;
-    }
-    return bytes.subarray(0, offset);
-  } finally {
-    signal?.removeEventListener("abort", cancel);
-    cancel();
-    reader.releaseLock();
-  }
-}
-
-function decodedShellResponse(response, bytes) {
-  // Fetch exposes decoded bytes, even when the server sends a compressed response.
-  const headers = new Headers(response.headers);
-  headers.delete("content-encoding");
-  headers.delete("transfer-encoding");
-  headers.set("content-length", String(bytes.byteLength));
-  return new Response(bytes, { status: response.status, statusText: response.statusText, headers });
-}
-
-async function matchesReleaseBytes(bytes, asset) {
-  if (bytes?.byteLength !== asset.bytes) return false;
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  const hex = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return hex === asset.sha256;
-}
-
-function fetchVerifiedReleaseAsset(url, asset, parent) {
-  return withShellNetworkDeadline(async (signal) => {
-    const response = await fetch(url, { cache: "reload", redirect: "error", signal });
-    if (response.status !== 200 || response.redirected) {
-      cancelResponseBody(response.body);
-      throw invalidReleaseAsset(url);
-    }
-    const bytes = await readShellBytes(response.body, asset.bytes, signal);
-    if (!await matchesReleaseBytes(bytes, asset)) throw invalidReleaseAsset(url);
-    return decodedShellResponse(response, bytes);
-  }, parent);
-}
-
-async function readCache(operation) {
-  try {
-    return await withCacheDeadline(operation, CACHE_FALLBACK_WAIT_MS);
-  } catch (error) {
-    console.warn("[CompactAudioPlayer] Could not read Cache Storage.", error);
-    return null;
-  }
-}
-
-function currentReleaseCache(url) {
-  return readCache(async (signal) => {
-    const shell = await caches.open(SHELL_CACHE);
-    if (signal.aborted) return null;
-    const ready = (await shell.match(RELEASE_READY_URL))?.ok === true;
-    if (signal.aborted) return null;
-    return { shell, ready, response: ready && url ? await shell.match(url) : null };
-  });
-}
-
-async function populateRelease(shell, seed, signal) {
-  for (const [url, asset] of RELEASE_ASSETS) {
-    if (signal?.aborted) return;
-    const response = seed?.url === url ? seed.response : await fetchVerifiedReleaseAsset(url, asset, signal);
-    if (signal?.aborted) return;
-    await shell.put(url, response);
-  }
-  if (!signal?.aborted) await shell.put(RELEASE_READY_URL, new Response(SHELL_RELEASE.id));
-}
-
-function rebuildRelease(shell, seedUrl, verified) {
-  if (!releaseRebuild) {
-    const seed = verified && { url: seedUrl, response: verified.clone() };
-    releaseRebuild = withCacheDeadline(async (signal) => {
-      const ready = (await shell.match(RELEASE_READY_URL))?.ok;
-      if (!ready && !signal.aborted) await populateRelease(shell, seed, signal);
-    }, RELEASE_REBUILD_TIMEOUT_MS).catch((error) => {
-      console.warn("[CompactAudioPlayer] Could not rebuild the release cache.", error);
-    }).finally(() => { releaseRebuild = null; });
-  }
-  return releaseRebuild;
-}
-
-async function releaseAsset(request, url, asset, keepAlive) {
-  const installed = await currentReleaseCache(url);
-  if (installed?.response) return installed.response;
-  const verified = await fetchVerifiedReleaseAsset(url, asset, request.signal);
-  if (installed?.ready) {
-    try {
-      await withCacheDeadline(() => installed.shell.put(url, verified.clone()), CACHE_FALLBACK_WAIT_MS);
-    } catch (error) {
-      console.warn("[CompactAudioPlayer] Could not restore the release asset in Cache Storage.", error);
-    }
-  } else if (installed && keepAlive) {
-    keepAlive(rebuildRelease(installed.shell, url, verified));
-  }
-  return verified;
-}
-
-function releaseRequest(request) {
-  if (!SHELL_RELEASE || request.method !== "GET" || !request.url.startsWith(self.registration.scope)) return null;
-  const relative = request.url.slice(self.registration.scope.length);
-  const alias = request.mode === "navigate" && /^release-([a-f0-9]{64})\.html(?:\?.*)?$/.exec(relative);
-  if (alias) return { id: alias[1], url: scopeUrl(`release-${alias[1]}.html`) };
-  const asset = /^releases\/([a-f0-9]{64})\//.exec(relative);
-  return asset ? { id: asset[1], url: request.url } : null;
-}
-
-function isReleaseCache(name, prefix) {
-  return name.startsWith(prefix) && /^[a-f0-9]{64}$/.test(name.slice(prefix.length));
-}
-
-async function isCompleteRelease(cacheName) {
-  return (await caches.match(RELEASE_READY_URL, { cacheName }))?.ok === true;
-}
-
-async function previousReleaseAsset(release, signal) {
-  const cacheName = VERIFIED_RELEASE_CACHE_PREFIX + release.id;
-  if (await isCompleteRelease(cacheName) && !signal.aborted) {
-    const response = await caches.match(release.url, { cacheName });
-    if (response) return response;
-  }
-  return signal.aborted ? null : caches.match(release.url, { cacheName: RELEASE_CACHE_PREFIX + release.id });
-}
-
-function validShellPage(html, allowNewer) {
-  html = html.replace(/<!--[\s\S]*?-->/g, "");
-  const attributeValue = (tag, attribute) => {
-    const match = tag.match(new RegExp(`\\s${attribute}\\s*=\\s*(["'])(.*?)\\1`, "i"));
-    return match?.[2];
-  };
-  const scripts = html.match(/<script\b[^>]*>/gi) || [];
-  const links = html.match(/<link\b[^>]*>/gi) || [];
-  if (allowNewer) {
-    const worker = html.match(/<meta name="compact-player-worker" content="sw-([a-f0-9]{64})\.js">/)?.[1];
-    if (worker) {
-      const sequence = Number(html.match(/<meta name="compact-player-release" content="(\d+)">/)?.[1]);
-      if (!Number.isSafeInteger(sequence) || sequence < (SHELL_RELEASE?.sequence || 0)) return false;
-      const base = `./releases/${worker}/`;
-      return scripts.some((tag) => attributeValue(tag, "type") === "module" && attributeValue(tag, "src") === `${base}player.js`)
-        && links.some((tag) => attributeValue(tag, "rel") === "stylesheet" && attributeValue(tag, "href") === `${base}player.css`);
-    }
-    if (SHELL_RELEASE) return false;
-  }
-  const scriptVersions = scripts.filter((tag) => attributeValue(tag, "type") === "module")
-    .map((tag) => attributeValue(tag, "src")?.match(/^\.\/player\.js\?v=(\d+)$/)?.[1]);
-  const styleVersions = links.filter((tag) => attributeValue(tag, "rel") === "stylesheet")
-    .map((tag) => attributeValue(tag, "href")?.match(/^\.\/player\.css\?v=(\d+)$/)?.[1]);
-  const current = Number(SHELL_VERSION.slice(1));
-  return scriptVersions.some((version) => version && styleVersions.includes(version)
-    && (allowNewer ? Number(version) >= current : Number(version) === current));
-}
-
-async function readShellPage(response, allowNewer, signal) {
-  if (!response?.ok) return null;
-  const bytes = await readShellBytes(response.body, SHELL_PAGE_MAX_BYTES, signal);
-  if (!bytes || !validShellPage(new TextDecoder().decode(bytes), allowNewer)) return null;
-  return { bytes, response: decodedShellResponse(response, bytes) };
-}
-
-async function rebuildFromPage(bytes) {
-  try {
-    const url = scopeUrl(SHELL_RELEASE.page);
-    if (!await matchesReleaseBytes(bytes, RELEASE_ASSETS.get(url))) return;
-    const installed = await currentReleaseCache();
-    if (installed && !installed.ready) await rebuildRelease(installed.shell);
-  } catch (error) {
-    console.warn("[CompactAudioPlayer] Could not check the player page for cache recovery.", error);
-  }
-}
-
-async function fetchShell(request, keepAlive) {
+async function fetchBook(request) {
   const controller = new AbortController();
-  const isPage = request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname);
-  const network = withShellNetworkDeadline(async (signal) => {
-    const response = await fetch(request, { signal });
-    if (signal.aborted) {
-      cancelResponseBody(response.body);
-      throw signal.reason;
-    }
-    if (!isPage || !response.ok) return response;
-    const page = await readShellPage(response, true, signal);
-    if (page) {
-      if (!signal.aborted && SHELL_RELEASE && keepAlive) keepAlive(rebuildFromPage(page.bytes));
-      return page.response;
-    }
-    throw new Error("Player shell version does not match the worker");
-  }, request.signal, controller);
+  const signal = AbortSignal.any?.([request.signal, controller.signal]) ?? request.signal;
+  const network = Promise.resolve(fetch(request, { signal })).then(async (response) => {
+    const name = new URL(request.url).pathname.split("/").at(-1);
+    if (request.method !== "GET" || response.status !== 200
+      || !["book.json", "episode.json", "library.json"].includes(name)) return response;
+    const bytes = await readShellBytes(response.body, (name === "library.json" ? 2 : 1) * 1024 ** 2, signal);
+    if (!bytes) return new Response(null, { status: 413 });
+    return decodedShellResponse(response, bytes);
+  });
   let timer;
   try {
-    const deadline = new Promise((resolve) => { timer = setTimeout(resolve, SHELL_NETWORK_WAIT_MS); });
-    const response = await Promise.race([network, deadline]);
+    const delay = new Promise((resolve) => { timer = setTimeout(resolve, SHELL_NETWORK_WAIT_MS); });
+    const response = await Promise.race([network, delay]);
     if (response) return response;
-    // Keep the network in the race while Cache Storage opens, including on a cache miss.
-    const cached = await Promise.race([network.then(() => null), readCache((signal) => cachedShell(request, signal))]);
+    const cached = await Promise.race([
+      network.then(() => null),
+      readCache((cacheSignal) => cachedBookResponse(request, "network-error", cacheSignal)),
+    ]);
     if (!cached?.ok) return network;
     controller.abort();
+    void network.then((response) => cancelResponseBody(response.body), () => {});
     return cached;
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function networkFirst(request, keepAlive) {
@@ -507,39 +305,13 @@ async function networkFirst(request, keepAlive) {
     const path = new URL(request.url).pathname;
     const paths = request.mode === "navigate" ? PLAYER_PAGES : SHELL_PATHS;
     const useShell = request.method === "GET" && paths.has(path);
-    response = await (useShell ? fetchShell(request, keepAlive) : fetch(request));
+    response = await (useShell ? fetchShell(request, keepAlive) : fetchBook(request));
     if (response.ok) return response;
   } catch (error) { networkError = error; }
   const cached = await readCache((signal) => cachedFallback(request, response?.status ?? "network-error", signal));
   if (cached) return cached;
   if (response) return response;
   throw networkError;
-}
-
-async function installRelease() {
-  if (await isCompleteRelease(SHELL_CACHE)) return;
-  try {
-    await populateRelease(await caches.open(SHELL_CACHE));
-  } catch (error) {
-    try { await caches.delete(SHELL_CACHE); }
-    catch (cause) { console.warn("[CompactAudioPlayer] Could not remove the incomplete release cache.", cause); }
-    throw error;
-  }
-}
-
-async function installSourceShell() {
-  const stagingName = `${SHELL_CACHE}:install:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  const staging = await caches.open(stagingName);
-  try {
-    await staging.addAll(SHELL_URLS.map((path) => new Request(scopeUrl(path), { cache: "reload" })));
-    for (const page of [`./?v=${SHELL_VERSION.slice(1)}`, `./index.html?v=${SHELL_VERSION.slice(1)}`]) {
-      if (!await readShellPage(await staging.match(scopeUrl(page)), false)) throw new Error("Player shell version does not match the worker");
-    }
-    const cache = await caches.open(SHELL_CACHE);
-    for (const request of await staging.keys()) await cache.put(request, await staging.match(request));
-  } finally {
-    await caches.delete(stagingName);
-  }
 }
 
 self.addEventListener("install", (event) => {
@@ -549,26 +321,6 @@ self.addEventListener("install", (event) => {
     await self.skipWaiting();
   })());
 });
-
-async function previousCompleteRelease(names, signal) {
-  for (const name of names.slice().reverse()) {
-    if (signal.aborted) return null;
-    if (name !== SHELL_CACHE && isReleaseCache(name, VERIFIED_RELEASE_CACHE_PREFIX) && await isCompleteRelease(name)) return name;
-  }
-  return null;
-}
-
-async function cleanUpShellCaches(signal) {
-  const names = await caches.keys();
-  if (signal.aborted) return;
-  const previousRelease = SHELL_RELEASE && await previousCompleteRelease(names, signal);
-  if (signal.aborted) return;
-  // Older release caches have no marker. Keep them until we can retain a known complete predecessor instead.
-  const obsolete = names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX) && name !== SHELL_CACHE
-    && name !== previousRelease && !name.includes(":install:")
-    && (!SHELL_RELEASE || previousRelease || !isReleaseCache(name, RELEASE_CACHE_PREFIX)));
-  await Promise.all(obsolete.map((name) => caches.delete(name)));
-}
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(Promise.all([

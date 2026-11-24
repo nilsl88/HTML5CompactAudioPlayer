@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { BookConfigStore, queryBookId } from "../js/book-config.js?v=20";
-import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=20";
+import { BookConfigStore, queryBookId } from "../js/book-config.js?v=22";
+import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=22";
 
 const baseUrl = "https://example.test/";
 const configuration = (id = "one") => ({
@@ -313,4 +313,40 @@ test("a stale cancelled book load cannot overwrite a newer selection", async (t)
   await ready;
   await flush();
   assert.equal(elements.get("bookTitle").textContent, "Book new");
+});
+
+test("an oversized streamed catalog is rejected before the whole response is read", async () => {
+  const { fetchLibraryCatalog } = await import("../js/book-config.js?v=22");
+  let reads = 0;
+  let cancelled = false;
+  const fetch = () => new Response(new ReadableStream({
+    pull(controller) { reads++; controller.enqueue(new Uint8Array(1024 * 1024).fill(32)); },
+    cancel() { cancelled = true; },
+  }));
+  await assert.rejects(fetchLibraryCatalog("https://example.test/media/library.json", fetch), /exceeds 2 MiB/);
+  assert.ok(reads <= 4);
+  assert.equal(cancelled, true);
+});
+
+test("large title lists keep titles without retaining every full book configuration", async () => {
+  const books = Array.from({ length: 30 }, (_, index) => ({ id: `book-${index}` }));
+  const requests = [];
+  const configs = new BookConfigStore({
+    library: normalizeLibrary({ books }), documentBaseUrl: baseUrl,
+    fetchImpl: async (url) => {
+      const id = new URL(url).pathname.split("/").at(-2);
+      requests.push(id);
+      return Response.json(configuration(id));
+    },
+  });
+  const selected = await configs.load("book-0");
+  await configs.loadTitles();
+  assert.equal(requests.length, 30);
+  assert.equal(configs.cache.size, 24);
+  assert.equal(configs.library.byId.get("book-1").title.en, "Book book-1");
+  await configs.loadTitles();
+  assert.equal(requests.length, 30);
+  assert.equal(await configs.load("book-0"), selected);
+  await configs.load("book-1");
+  assert.equal(requests.length, 31);
 });

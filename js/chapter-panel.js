@@ -1,5 +1,5 @@
-import { closePanel } from "./dialogs.js?v=20";
-import { clearChildren, formatTime } from "./utils.js?v=20";
+import { closePanel } from "./dialogs.js?v=22";
+import { clearChildren, formatTime } from "./utils.js?v=22";
 
 export function createChapterPanel({ list, panel, trigger, audio, t, onRetry, onSeek, reportError }) {
   const document = list.ownerDocument;

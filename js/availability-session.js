@@ -1,5 +1,5 @@
-import { scanSources } from "./availability.js?v=20";
-import { buildSources } from "./source-selection.js?v=20";
+import { scanSources } from "./availability.js?v=22";
+import { buildSources } from "./source-selection.js?v=22";
 
 export class AvailabilitySession {
   constructor({ window, fetchImpl, isOnline, openCache, onChange, onError }) {
