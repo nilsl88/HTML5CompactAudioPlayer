@@ -1,9 +1,11 @@
-import { parseContentRange } from "./http-range.js?v=22";
-import "./offline-manifest.js?v=22";
-import { createAbortError } from "./utils.js?v=22";
+import { parseContentRange } from "./http-range.js?v=25";
+import "./offline-manifest.js?v=25";
+import "./bounded-response.js?v=25";
+import { createAbortError } from "./utils.js?v=25";
 
 const { audioMimeType, strongETag, strongLastModified, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
-  maxChunkBytes } = globalThis.CompactPlayerOfflineManifest;
+  maxChunkBytes, chunkStartHeader, chunkEndHeader, chunkDigest, chunkDigestHeader } = globalThis.CompactPlayerOfflineManifest;
+const { cancelResponseBody } = globalThis.CompactPlayerResponse;
 export const OFFLINE_CHUNK_SIZE = maxChunkBytes;
 const RANGE_IDLE_TIMEOUT_MS = 20_000;
 
@@ -52,6 +54,7 @@ function rangeValidator(manifest) {
 
 export function sameAudioRevision(previous, next) {
   if (!previous.responseUrl || previous.responseUrl !== next.responseUrl || previous.totalSize !== next.totalSize) return false;
+  if (audioMimeType(previous.mime) !== audioMimeType(next.mime)) return false;
   const previousValidator = rangeValidator(previous);
   const nextValidator = rangeValidator(next);
   return Boolean(nextValidator && previousValidator?.header === nextValidator.header && previousValidator.value === nextValidator.value);
@@ -131,7 +134,7 @@ export async function inspectAudioRange(fetchImpl, url, sourceMime, signal) {
     signal,
   });
   const range = parseContentRange(response.headers.get("content-range"));
-  try { await response.body?.cancel(); } catch {}
+  cancelResponseBody(response.body);
   const responseUrl = audioResponseUrl(response, url);
   if (response.status !== 206 || !range || range.start !== 0 || range.end !== 0) {
     throw new OfflineDownloadError("range", "The audio server does not support offline downloads.");
@@ -157,6 +160,7 @@ async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signa
     signal,
   });
   try {
+    checkCanceled(signal);
     const responseUrl = audioResponseUrl(response, manifest.sourceUrl);
     const range = parseContentRange(response.headers.get("content-range"));
     const responseVersion = validator ? response.headers.get(validator.header) : null;
@@ -168,7 +172,7 @@ async function fetchAudioRange(fetchImpl, manifest, start, end, validator, signa
     validateAudioMime(response, manifest.mime, manifest.mime);
     return response;
   } catch (error) {
-    await response.body?.cancel();
+    cancelResponseBody(response.body);
     throw error;
   }
 }
@@ -194,6 +198,10 @@ async function* readAudioRange(fetchImpl, manifest, start, end, validator, signa
   }
   try {
     const response = await readNetwork(() => fetchAudioRange(fetchImpl, manifest, start, end, validator, controller.signal));
+    if (controller.signal.aborted) {
+      cancelResponseBody(response.body);
+      throw controller.signal.reason;
+    }
     yield* splitAudioRange(response.body, end - start + 1, manifest.chunkSize, readNetwork);
   } finally {
     signal?.removeEventListener("abort", cancel);
@@ -218,8 +226,9 @@ export async function* downloadChunks(fetchImpl, manifest, signal, waitForPriori
       const headers = {
         "content-type": manifest.mime,
         "content-length": String(bytes.length),
-        "x-compact-player-start": String(chunkStart),
-        "x-compact-player-end": String(chunkStart + bytes.length - 1),
+        [chunkStartHeader]: String(chunkStart),
+        [chunkEndHeader]: String(chunkStart + bytes.length - 1),
+        [chunkDigestHeader]: await chunkDigest(bytes, signal),
       };
       yield { index, chunk: new Response(bytes, { headers }) };
       index++;

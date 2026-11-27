@@ -21,8 +21,8 @@ function parseRange(value, totalSize) {
 
 async function readStoredAudioChunk(response, expected, signal) {
   const bytes = new Uint8Array(expected);
-  const { readExactChunk } = globalThis.CompactPlayerOfflineManifest;
-  return await readExactChunk(response.body, expected, signal, bytes) ? bytes : null;
+  const { readVerifiedChunk } = globalThis.CompactPlayerOfflineManifest;
+  return await readVerifiedChunk(response, expected, signal, bytes) ? bytes : null;
 }
 
 async function downloadedMediaResponse(request, manifest, readChunk, {
@@ -59,7 +59,26 @@ async function downloadedMediaResponse(request, manifest, readChunk, {
   }
   const streamAbort = new AbortController();
   const { signal } = streamAbort;
+  let abortRequest;
+  const finishStream = () => {
+    request.signal.removeEventListener("abort", abortRequest);
+    finish();
+  };
+  const cancelStream = (reason) => {
+    streamAbort.abort(reason);
+    void firstResponse?.body?.cancel().catch(() => { /* An unread chunk can already have errored. */ });
+    firstResponse = null;
+    finishStream();
+  };
   const stream = new ReadableStream({
+    start(controller) {
+      abortRequest = () => {
+        controller.error(request.signal.reason);
+        cancelStream(request.signal.reason);
+      };
+      if (request.signal.aborted) abortRequest();
+      else request.signal.addEventListener("abort", abortRequest, { once: true });
+    },
     async pull(controller) {
       try {
         const response = firstResponse || await readChunk(index, signal);
@@ -86,23 +105,78 @@ async function downloadedMediaResponse(request, manifest, readChunk, {
         controller.enqueue(data.subarray(from, to));
         if (++index > lastChunk) {
           controller.close();
-          finish();
+          finishStream();
         }
       } catch (error) {
-        finish();
+        if (!signal.aborted) finishStream();
         throw error;
       }
     },
-    cancel() {
-      streamAbort.abort();
-      void firstResponse?.body?.cancel().catch(() => { /* An unread chunk can already have errored. */ });
-      firstResponse = null;
-      finish();
-    },
+    cancel: cancelStream,
   }, { highWaterMark: 0 });
   if (range.partial) {
     headers["content-length"] = String(range.end - range.start + 1);
     headers["content-range"] = `bytes ${range.start}-${range.end}/${manifest.totalSize}`;
   }
   return new Response(stream, { status: range.partial ? 206 : 200, headers });
+}
+
+function createOfflineAudioRoutes({ scope, readActive, openCache, withAudioCacheDeadline, bodyTimeoutMs, reportDamage }) {
+  const { matchesChunkHeaders, offlineChunkUrl } = globalThis.CompactPlayerOfflineManifest;
+  const { cancelResponseBody } = globalThis.CompactPlayerResponse;
+
+  function readChunk(cache, manifest, index, parent) {
+    return withAudioCacheDeadline(async (signal) => {
+      const response = await cache.match(offlineChunkUrl(scope, manifest.downloadId, index));
+      if (!signal.aborted && matchesChunkHeaders(response, manifest, index)) return response;
+      cancelResponseBody(response?.body);
+      return null;
+    }, parent);
+  }
+
+  function cachedMediaResponse(request, manifest, cache, finish = () => {}) {
+    return downloadedMediaResponse(request, manifest, (index, parent) => readChunk(cache, manifest, index, parent), {
+      readBody: (response, expected, parent) => withAudioCacheDeadline(
+        (signal) => readStoredAudioChunk(response, expected, signal), parent, bodyTimeoutMs),
+      reportInvalidChunk: (index) => finish(reportDamage(cache, manifest, index)),
+      finish,
+    });
+  }
+
+  async function cachedAudioRequest(request, { manifest, cache }, signal, finish = () => {}) {
+    if (request.method === "HEAD") {
+      const first = await readChunk(cache, manifest, 0, signal);
+      cancelResponseBody(first?.body);
+      if (!first) {
+        if (!signal?.aborted) finish(reportDamage(cache, manifest, 0));
+        return null;
+      }
+    }
+    const media = await cachedMediaResponse(request, manifest, cache, finish);
+    if (!signal?.aborted) return media;
+    cancelResponseBody(media?.body);
+    return null;
+  }
+
+  async function savedAudioResponse(request, url, finish) {
+    try {
+      const download = await withAudioCacheDeadline(async (signal) => {
+        const manifest = await readActive(signal);
+        if (signal.aborted || !manifest || url.searchParams.get("download") !== manifest.downloadId) return null;
+        const cache = await openCache(manifest.cacheName);
+        return { manifest, cache };
+      }, request.signal);
+      if (download) {
+        const media = await cachedAudioRequest(request, download, request.signal, finish);
+        if (media) return media;
+      }
+      return new Response(null, { status: 404 });
+    } catch (error) {
+      if (request.signal.aborted) throw error;
+      console.warn("[CompactAudioPlayer] Could not read saved audio.", error);
+      return new Response(null, { status: 503 });
+    }
+  }
+
+  return { cachedMediaResponse, cachedAudioRequest, savedAudioResponse };
 }

@@ -1,4 +1,6 @@
 const CONTAINER_TYPES = new Set(["moov", "trak", "mdia", "minf", "stbl", "stsd", "edts", "dinf", "udta", "tref", "ilst", "meta"]);
+const MAX_METADATA_BOXES = 65_536;
+const typeDecoder = new TextDecoder("ascii");
 
 function uint32(view, offset) { return view.getUint32(offset, false); }
 
@@ -10,15 +12,15 @@ export function uint64(view, offset) {
 }
 
 function atomType(bytes, offset) {
-  return new TextDecoder("ascii").decode(bytes.subarray(offset, offset + 4));
+  return typeDecoder.decode(bytes.subarray(offset, offset + 4));
 }
 
-export function parseBoxes(buffer, absoluteStart = 0, { skipPrefix = 0 } = {}) {
-  const bytes = new Uint8Array(buffer);
-  const view = new DataView(buffer);
-  const atoms = [];
+export function* parseBoxes(data, absoluteStart = 0, { skipPrefix = 0, budget = { remaining: MAX_METADATA_BOXES } } = {}) {
+  const bytes = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = skipPrefix;
   while (offset + 8 <= bytes.byteLength) {
+    if (budget.remaining-- <= 0) throw new Error("MP4 metadata exceeded the box limit.");
     const start = offset;
     let size = uint32(view, offset);
     const type = atomType(bytes, offset + 4);
@@ -29,31 +31,30 @@ export function parseBoxes(buffer, absoluteStart = 0, { skipPrefix = 0 } = {}) {
       headerSize = 16;
     } else if (size === 0) size = bytes.byteLength - offset;
     if (!Number.isSafeInteger(size) || size < headerSize) break;
-    if (offset + size > bytes.byteLength) {
-      atoms.push({ type, start: absoluteStart + start, size, headerSize, payloadStart: start + headerSize, payloadEnd: bytes.byteLength, buffer, truncated: true });
-      break;
-    }
-    atoms.push({ type, start: absoluteStart + start, size, headerSize, payloadStart: start + headerSize, payloadEnd: start + size, buffer });
+    const truncated = offset + size > bytes.byteLength;
+    yield { type, start: absoluteStart + start, size, headerSize, truncated, buffer: bytes.buffer,
+      payloadStart: bytes.byteOffset + start + headerSize, payloadEnd: bytes.byteOffset + Math.min(start + size, bytes.byteLength) };
+    if (truncated) break;
     offset += size;
   }
-  return atoms;
 }
 
-export function payload(atom) { return atom.buffer.slice(atom.payloadStart, atom.payloadEnd); }
+export function payload(atom) { return new Uint8Array(atom.buffer, atom.payloadStart, atom.payloadEnd - atom.payloadStart); }
 
 export function findAtoms(buffer, type, options) {
   const found = [];
+  const budget = { remaining: MAX_METADATA_BOXES };
   const visit = (atoms, depth = 0) => {
     if (depth > 12) return;
     for (const atom of atoms) {
       if (atom.type === type) found.push(atom);
       if (CONTAINER_TYPES.has(atom.type)) {
         const prefix = atom.type === "meta" ? 4 : 0;
-        visit(parseBoxes(payload(atom), atom.start + atom.headerSize, { skipPrefix: prefix }), depth + 1);
+        visit(parseBoxes(payload(atom), atom.start + atom.headerSize, { skipPrefix: prefix, budget }), depth + 1);
       }
     }
   };
-  visit(parseBoxes(buffer, options?.absoluteStart || 0));
+  visit(parseBoxes(buffer, options?.absoluteStart || 0, { budget }));
   return found;
 }
 

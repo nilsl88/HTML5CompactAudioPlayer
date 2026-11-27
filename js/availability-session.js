@@ -1,5 +1,5 @@
-import { scanSources } from "./availability.js?v=22";
-import { buildSources } from "./source-selection.js?v=22";
+import { scanSources } from "./availability.js?v=25";
+import { buildSources } from "./source-selection.js?v=25";
 
 export class AvailabilitySession {
   constructor({ window, fetchImpl, isOnline, openCache, onChange, onError }) {
@@ -9,7 +9,7 @@ export class AvailabilitySession {
     this.openCache = openCache;
     this.onChange = onChange;
     this.onError = onError;
-    this.scanned = new Set();
+    this.pendingProbes = new Map();
     this.played = new Set();
     this.selectLanguage("");
   }
@@ -31,7 +31,7 @@ export class AvailabilitySession {
 
   setBook({ cache, sources, played }) {
     this.selectLanguage("");
-    this.scanned.clear();
+    this.pendingProbes.clear();
     this.cache = cache;
     this.sources = sources;
     this.played = played;
@@ -75,8 +75,11 @@ export class AvailabilitySession {
   }
 
   request({ immediate = false, refresh = false } = {}) {
-    if (refresh) this.scanned.delete(this.language);
-    if (!this.language || !this.isOnline() || this.scanned.has(this.language) || this.controller) return;
+    if (refresh) {
+      this.pendingProbes.delete(this.language);
+      this.cancel();
+    }
+    if (!this.language || !this.isOnline() || this.pendingProbes.get(this.language)?.size === 0 || this.controller) return;
     this.urgent ||= immediate;
     if (this.waiting) return;
     if (this.urgent) {
@@ -101,9 +104,10 @@ export class AvailabilitySession {
     const controller = new AbortController();
     this.controller = controller;
     const language = this.language;
-    const sources = this.sources.get(language).filter((source) => !this.played.has(source.url));
+    const pending = this.pendingProbes.get(language);
+    const sources = this.sources.get(language).filter((source) => !this.played.has(source.url) && (!pending || pending.has(source.id)));
     try {
-      await scanSources(sources, {
+      const results = await scanSources(sources, {
         signal: controller.signal, fetchImpl: this.fetchImpl,
         onResult: (result, index) => {
           this.cache.recordProbe(language, result.id, result.availability, result.url);
@@ -113,7 +117,10 @@ export class AvailabilitySession {
           this.onChange();
         },
       });
-      if (!controller.signal.aborted) this.scanned.add(this.language);
+      if (!controller.signal.aborted) {
+        const unresolved = results.filter((source) => source.availability === "unknown" && !this.played.has(source.url));
+        this.pendingProbes.set(language, new Set(unresolved.map((source) => source.id)));
+      }
     } catch (error) {
       if (!controller.signal.aborted) this.onError(error);
     } finally {

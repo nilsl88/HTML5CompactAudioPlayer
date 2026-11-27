@@ -1,14 +1,15 @@
-import { parseContentRange } from "./http-range.js?v=22";
-import { findTopLevelAtom } from "./mp4-atoms.js?v=22";
-import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js?v=22";
-import { withOfflineDeadline } from "./offline-transfer.js?v=22";
-import "./offline-manifest.js?v=22";
+import { parseContentRange } from "./http-range.js?v=25";
+import { findTopLevelAtom } from "./mp4-atoms.js?v=25";
+import { createAbortError, fetchWithRetry, metadataRequestCache } from "./utils.js?v=25";
+import { withOfflineDeadline } from "./offline-transfer.js?v=25";
+import "./offline-manifest.js?v=25";
 
 const { checkResponseVersion, strongETag, strongLastModified } = globalThis.CompactPlayerOfflineManifest;
 
 export const MP4_METADATA_CHUNK_BYTES = 256 * 1024;
 export const MP4_METADATA_LIMIT_BYTES = 16 * 1024 * 1024;
 const MP4_METADATA_CACHE_MS = 30000;
+const MP4_METADATA_CACHE_ENTRIES = 2;
 export const MP4_METADATA_MAX_REQUESTS = 128;
 const metadataRequestsByFetch = new WeakMap();
 
@@ -147,6 +148,28 @@ function metadataRequestMap(fetchImpl) {
   return requests;
 }
 
+function retainMetadata(requests, key, entry) {
+  if (requests.get(key) !== entry) return () => {};
+  const discard = () => {
+    clearTimeout(entry.expiration);
+    if (requests.get(key) === entry) requests.delete(key);
+  };
+  entry.expiration = setTimeout(discard, MP4_METADATA_CACHE_MS);
+  entry.expiration?.unref?.();
+  requests.delete(key);
+  requests.set(key, entry);
+
+  let oldest;
+  let retained = 0;
+  for (const completed of requests.values()) {
+    if (completed.expiration === undefined) continue;
+    oldest ??= completed;
+    retained += 1;
+  }
+  if (retained > MP4_METADATA_CACHE_ENTRIES) oldest.discard();
+  return discard;
+}
+
 function consumeMetadataRequest(entry, requests, key, signal) {
   entry.consumers += 1;
   return new Promise((resolve, reject) => {
@@ -184,9 +207,8 @@ export function loadMp4Metadata(url, options = {}) {
     entry.promise = readMp4Metadata(url, { ...options, fetchImpl, signal: controller.signal }).then(
       (value) => {
         entry.settled = true;
-        value.discard = () => { if (requests.get(key) === entry) requests.delete(key); };
-        const timer = setTimeout(() => { if (requests.get(key) === entry) requests.delete(key); }, MP4_METADATA_CACHE_MS);
-        timer?.unref?.();
+        entry.discard = retainMetadata(requests, key, entry);
+        value.discard = entry.discard;
         return value;
       },
       (error) => {

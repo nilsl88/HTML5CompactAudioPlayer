@@ -1,9 +1,14 @@
 const focusByDialog = new WeakMap();
 const panelTransitions = new WeakMap();
 
+function canFocus(element) {
+  return element && !element.disabled && !element.hidden && !element.matches?.(":disabled")
+    && !element.closest?.("[hidden], [inert], [aria-hidden='true']");
+}
+
 function focusableElements(container) {
   return [...container.querySelectorAll("button:not(:disabled), select:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex='-1'])")]
-    .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    .filter((element) => canFocus(element) && element.tabIndex !== -1);
 }
 
 function fallbackKeydown(event) {
@@ -38,7 +43,8 @@ export function openDialog(dialog, focusTarget) {
   const active = dialog.ownerDocument.activeElement;
   dialog.ownerDocument.defaultView.requestAnimationFrame(() => {
     if (focusByDialog.get(dialog) === focusState && dialog.ownerDocument.activeElement === active) {
-      (focusTarget || focusableElements(dialog)[0] || dialog).focus?.();
+      const target = canFocus(focusTarget) ? focusTarget : focusableElements(dialog)[0] || dialog;
+      target.focus?.();
     }
   });
 }
@@ -78,7 +84,8 @@ export function openPanel(panel, trigger, firstFocus) {
   const previous = document.activeElement;
   document.defaultView.requestAnimationFrame(() => {
     if (panelTransitions.get(panel) === transition && !panel.hidden && document.activeElement === previous) {
-      (firstFocus || focusableElements(panel)[0])?.focus?.();
+      const target = canFocus(firstFocus) ? firstFocus : focusableElements(panel)[0];
+      target?.focus?.();
     }
   });
 }

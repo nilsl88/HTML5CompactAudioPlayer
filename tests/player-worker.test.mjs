@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PlayerWorker } from "../js/player-worker.js?v=22";
+import { PlayerWorker } from "../js/player-worker.js?v=25";
+import { OfflineWorkerRoutes } from "../js/offline-worker-routes.js?v=25";
 
 const baseUrl = "https://example.test/listen/";
 const sourceUrl = baseUrl + "media/book/recording.m4b";
@@ -13,13 +14,24 @@ const legacyHeaders = {
 };
 const capabilityType = "compact-player-worker-capabilities";
 
+function createWorkerWithPlayback({ fetchImpl, ...options }) {
+  const worker = new PlayerWorker(options);
+  const playback = new OfflineWorkerRoutes({
+    baseUrl: options.baseUrl, fetchImpl,
+    isOnline: () => options.navigatorObject.onLine !== false,
+    connect: () => worker.connect(),
+    readControl: () => worker.readControl(),
+  });
+  return { worker, playback };
+}
+
 test("a v17 controller uses the verified offline URL until a compatible worker takes over", async () => {
   const workers = new EventTarget();
   workers.controller = { scriptURL: baseUrl + "sw.js" };
   const navigatorObject = { serviceWorker: workers, onLine: false };
   const requests = [];
   const scriptName = `sw-${"a".repeat(64)}.js`;
-  const worker = new PlayerWorker({
+  const { worker, playback } = createWorkerWithPlayback({
     baseUrl, navigatorObject, scriptName, releaseSequence: 10,
     async fetchImpl(url, options) {
       requests.push(url);
@@ -35,15 +47,15 @@ test("a v17 controller uses the verified offline URL until a compatible worker t
   workers.ready = Promise.resolve({ active: workers.controller });
   await worker.register();
   assert.deepEqual(registrations, [baseUrl + scriptName]);
-  await worker.prepare(download);
+  await playback.prepare(download);
   assert.deepEqual(requests, [route, sourceUrl]);
-  assert.deepEqual(worker.savedAudio(download), { kind: "saved", url: sourceUrl });
-  assert.equal(worker.savedAudio({ ...download, downloadId: "new-edition" }), null);
-  assert.equal(worker.allowNetworkSource(), false);
+  assert.deepEqual(playback.savedAudio(download), { kind: "saved", url: sourceUrl });
+  assert.equal(playback.savedAudio({ ...download, downloadId: "new-edition" }), null);
+  assert.equal(playback.allowNetworkSource(), false);
 
   navigatorObject.onLine = true;
-  assert.equal(worker.savedAudio(download), null);
-  assert.equal(worker.allowNetworkSource(), true);
+  assert.equal(playback.savedAudio(download), null);
+  assert.equal(playback.allowNetworkSource(), true);
   navigatorObject.onLine = false;
   workers.controller = {
     scriptURL: baseUrl + `sw-${"b".repeat(64)}.js`,
@@ -54,10 +66,10 @@ test("a v17 controller uses the verified offline URL until a compatible worker t
     },
   };
   workers.dispatchEvent(new Event("controllerchange"));
-  assert.equal(worker.savedAudio(download), null);
-  await worker.prepare(download);
-  assert.deepEqual(worker.savedAudio(download), { kind: "saved", url: route });
-  assert.equal(worker.allowNetworkSource(), true);
+  assert.equal(playback.savedAudio(download), null);
+  await playback.prepare(download);
+  assert.deepEqual(playback.savedAudio(download), { kind: "saved", url: route });
+  assert.equal(playback.allowNetworkSource(), true);
   assert.deepEqual(requests, [route, sourceUrl]);
   await worker.register();
   assert.deepEqual(registrations, [baseUrl + scriptName], "the older page cannot downgrade a newer installation");
@@ -69,20 +81,20 @@ test("an unversioned compatible controller proves its audio route with a saved r
   const route = baseUrl + "__compact_player_offline__/audio.json?download=one";
   const requests = [];
   let valid = true;
-  const worker = new PlayerWorker({ baseUrl, navigatorObject, async fetchImpl(url) {
+  const { playback } = createWorkerWithPlayback({ baseUrl, navigatorObject, async fetchImpl(url) {
     requests.push(url);
     return new Response(null, { headers: valid ? legacyHeaders : { "content-type": "text/html" } });
   } });
-  await worker.prepare(download);
-  assert.deepEqual(worker.savedAudio(download), { kind: "saved", url: route });
+  await playback.prepare(download);
+  assert.deepEqual(playback.savedAudio(download), { kind: "saved", url: route });
   assert.deepEqual(requests, [route]);
 
   valid = false;
   const replacement = { ...download, downloadId: "other" };
-  await worker.prepare(replacement);
-  assert.equal(worker.savedAudio(replacement), null);
-  assert.equal(worker.allowNetworkSource(), false);
-  await worker.prepare(null);
+  await playback.prepare(replacement);
+  assert.equal(playback.savedAudio(replacement), null);
+  assert.equal(playback.allowNetworkSource(), false);
+  await playback.prepare(null);
 });
 
 test("a failed legacy audio probe retries once and expires without changing controller or connectivity", async (t) => {
@@ -91,18 +103,18 @@ test("a failed legacy audio probe retries once and expires without changing cont
   const navigatorObject = { serviceWorker: { controller }, onLine: false };
   const routes = [];
   let available = false;
-  const worker = new PlayerWorker({ baseUrl, navigatorObject, async fetchImpl(url) {
+  const { playback } = createWorkerWithPlayback({ baseUrl, navigatorObject, async fetchImpl(url) {
     routes.push(url);
     return available && url !== sourceUrl
       ? new Response(null, { headers: legacyHeaders })
       : new Response(null, { status: 503 });
   } });
   const route = baseUrl + "__compact_player_offline__/audio.json?download=one";
-  const first = worker.prepare(download);
-  assert.equal(worker.prepare(download), first);
+  const first = playback.prepare(download);
+  assert.equal(playback.prepare(download), first);
   await first;
   assert.deepEqual(routes, [route, sourceUrl]);
-  assert.equal(worker.savedAudio(download), null);
+  assert.equal(playback.savedAudio(download), null);
 
   available = true;
   t.mock.timers.tick(999);
@@ -111,25 +123,25 @@ test("a failed legacy audio probe retries once and expires without changing cont
   t.mock.timers.tick(1);
   await new Promise(setImmediate);
   assert.deepEqual(routes, [route, sourceUrl, route]);
-  assert.deepEqual(worker.savedAudio(download), { kind: "saved", url: route });
+  assert.deepEqual(playback.savedAudio(download), { kind: "saved", url: route });
   t.mock.timers.tick(5000);
-  await worker.prepare(download);
+  await playback.prepare(download);
   assert.equal(routes.length, 3, "a positive probe stays cached");
 
   const replacement = { ...download, downloadId: "other" };
   available = false;
-  await worker.prepare(replacement);
+  await playback.prepare(replacement);
   t.mock.timers.tick(1000);
   await new Promise(setImmediate);
   assert.equal(routes.length, 7);
   available = true;
   t.mock.timers.tick(4999);
-  await worker.prepare(replacement);
+  await playback.prepare(replacement);
   assert.equal(routes.length, 7, "a repeated failure is cached during the backoff");
   t.mock.timers.tick(1);
-  await worker.prepare(replacement);
+  await playback.prepare(replacement);
   assert.equal(routes.length, 8);
-  assert.match(worker.savedAudio(replacement)?.url, /download=other$/);
+  assert.match(playback.savedAudio(replacement)?.url, /download=other$/);
 });
 
 test("the bridge worker for the same release keeps offline access without a new registration", async () => {
@@ -142,10 +154,10 @@ test("the bridge worker for the same release keeps offline access without a new 
     },
   };
   const navigatorObject = { onLine: false, serviceWorker: { controller, register: assert.fail } };
-  const worker = new PlayerWorker({ baseUrl, navigatorObject, scriptName: `sw-${releaseId}.js`, releaseSequence: 10, fetchImpl: assert.fail });
+  const { worker, playback } = createWorkerWithPlayback({ baseUrl, navigatorObject, scriptName: `sw-${releaseId}.js`, releaseSequence: 10, fetchImpl: assert.fail });
   await worker.register();
-  await worker.prepare(download);
-  assert.match(worker.savedAudio(download)?.url, /audio\.json\?download=one$/);
+  await playback.prepare(download);
+  assert.match(playback.savedAudio(download)?.url, /audio\.json\?download=one$/);
 });
 
 test("a capability timeout is retried and restores offline writes", async (t) => {
@@ -156,11 +168,11 @@ test("a capability timeout is retried and restores offline writes", async (t) =>
     scriptURL: baseUrl + "sw.js",
     postMessage({ type }, [reply]) {
       calls++;
-      if (calls > 1) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1 });
+      if (calls > 1) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 2 });
       reply.close();
     },
   };
-  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers }, fetchImpl: assert.fail });
+  const worker = new PlayerWorker({ baseUrl, navigatorObject: { serviceWorker: workers } });
   let recovered = 0;
   worker.listen(assert.fail, () => { recovered++; });
   const first = worker.supportsOfflineWrites();
@@ -195,7 +207,7 @@ test("opening offline controls can recover after repeated capability timeouts", 
     scriptURL: baseUrl + "sw.js",
     postMessage({ type }, [reply]) {
       attempts++;
-      if (attempts >= 3) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1 });
+      if (attempts >= 3) reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 2 });
       reply.close();
     },
   };
@@ -224,7 +236,7 @@ test("a delayed reply from an older worker resumes registration of the newer rel
     scriptURL: baseUrl + `sw-${oldId}.js`,
     postMessage({ type }, [reply]) {
       if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
-        offlineJournal: 1, sequence: 1, releaseId: oldId });
+        offlineJournal: 2, sequence: 1, releaseId: oldId });
       reply.close();
     },
   };
@@ -254,7 +266,7 @@ test("a delayed newer controller does not downgrade to the current page", async 
     scriptURL: baseUrl + `sw-${newId}.js`,
     postMessage({ type }, [reply]) {
       if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
-        offlineJournal: 1, sequence: 2, releaseId: newId });
+        offlineJournal: 2, sequence: 2, releaseId: newId });
       reply.close();
     },
   };
@@ -289,7 +301,7 @@ test("a controller change resumes a deferred update against the replacement cont
   workers.controller = {
     scriptURL: baseUrl + "sw.js",
     postMessage({ type }, [reply]) {
-      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1, sequence: 1, releaseId: oldId });
+      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 2, sequence: 1, releaseId: oldId });
       reply.close();
     },
   };
@@ -311,7 +323,7 @@ test("a failed deferred registration can be retried from Options", async (t) => 
     scriptURL: baseUrl + `sw-${oldId}.js`,
     postMessage({ type }, [reply]) {
       if (++attempts > 1) reply.postMessage({ type, scope: baseUrl, audio: true,
-        offlineJournal: 1, sequence: 1, releaseId: oldId });
+        offlineJournal: 2, sequence: 1, releaseId: oldId });
       reply.close();
     },
   };
@@ -363,7 +375,7 @@ test("a hashed controller without a release sequence is rechecked before an upda
   workers.controller = {
     scriptURL: baseUrl + `sw-${newId}.js`,
     postMessage({ type }, [reply]) {
-      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 1, sequence, releaseId: newId });
+      reply.postMessage({ type, scope: baseUrl, audio: true, offlineJournal: 2, sequence, releaseId: newId });
       reply.close();
     },
   };

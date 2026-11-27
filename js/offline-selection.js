@@ -1,7 +1,7 @@
-import { parseBookConfig } from "./config.js?v=22";
-import { buildSources } from "./source-selection.js?v=22";
-import { normalizeLanguageTag } from "./utils.js?v=22";
-import "./offline-manifest.js?v=22";
+import { parseBookConfig } from "./config.js?v=25";
+import { buildSources } from "./source-selection.js?v=25";
+import { normalizeLanguageTag } from "./utils.js?v=25";
+import "./offline-manifest.js?v=25";
 
 const { validManifest } = globalThis.CompactPlayerOfflineManifest;
 
@@ -14,13 +14,15 @@ export function matchesDownloadedSource(manifest, code, source) {
   return matchesDownloadLanguage(manifest, code) && manifest.sourceId === source.id && manifest.sourceUrl === source.url;
 }
 
+export function sameOfflineBook(manifest, book) {
+  return Boolean(manifest && book) && manifest.episodeId === book.episodeId
+    && (!manifest.configBookId || !book.configBookId || manifest.configBookId === book.configBookId)
+    && String(manifest.cacheVersion) === String(book.cacheVersion);
+}
+
 export function sameOfflineSelection(manifest, selection) {
-  return Boolean(manifest && selection) && manifest.episodeId === selection.episodeId
-    && (!manifest.configBookId || !selection.configBookId || manifest.configBookId === selection.configBookId)
-    && matchesDownloadLanguage(manifest, selection.languageCode)
-    && manifest.sourceId === selection.sourceId
-    && manifest.sourceUrl === selection.sourceUrl
-    && String(manifest.cacheVersion) === String(selection.cacheVersion);
+  return sameOfflineBook(manifest, selection) && matchesDownloadedSource(manifest, selection.languageCode,
+    { id: selection.sourceId, url: selection.sourceUrl });
 }
 
 export function manifestMatchesSelection(manifest, selection) {

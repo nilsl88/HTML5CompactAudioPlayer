@@ -1,5 +1,5 @@
-import { loadChapters } from "./chapters.js?v=22";
-import { resolveLanguageAsset } from "./config.js?v=22";
+import { loadChapters } from "./chapters.js?v=25";
+import { resolveLanguageAsset } from "./config.js?v=25";
 
 export class ChapterSession {
   constructor({ fetchImpl, openCache, isOnline = () => globalThis.navigator?.onLine !== false, onStart, onLoaded, onFailure }) {
@@ -57,7 +57,7 @@ export class ChapterSession {
 
   async reconnect() {
     const generation = this.generation;
-    if (this.status === "loading") await this.pending;
+    if (this.pending) await this.pending;
     if (generation === this.generation && this.isOnline() && (this.status === "failed" || this.retryVtt)) {
       return this.load({ force: true, notifyFailure: false });
     }

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Compact Audio Player</title>
-  <link rel="stylesheet" href="./player.css?v=22">
+  <link rel="stylesheet" href="./player.css?v=25">
 </head>
 <body class="is-loading">
   <a class="skip-link" href="#player">Skip to player</a>
@@ -76,7 +76,7 @@
           <section id="offlineRow" class="offline-setting" aria-labelledby="offlineLabel" hidden>
             <div class="offline-heading">
               <span id="offlineLabel">Offline</span>
-              <span id="offlineStatus" class="setting-help"></span>
+              <span id="offlineStatus" class="setting-help" tabindex="-1"></span>
             </div>
             <progress id="offlineProgress" max="100" value="0" aria-labelledby="offlineLabel offlineStatus" hidden></progress>
             <div class="offline-actions">
@@ -119,7 +119,7 @@
     <footer class="modal-footer split"><button id="resetCancel" class="secondary-button" type="button">Cancel</button><button id="resetOk" class="primary-button" type="button">Reset</button></footer>
   </dialog>
 
-  <script src="./js/startup-error.js?v=22"></script>
-  <script type="module" src="./player.js?v=22" id="playerEntry"></script>
+  <script src="./js/startup-error.js?v=25"></script>
+  <script type="module" src="./player.js?v=25" id="playerEntry"></script>
 </body>
 </html>

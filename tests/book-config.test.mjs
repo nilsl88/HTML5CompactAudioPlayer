@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { BookConfigStore, queryBookId } from "../js/book-config.js?v=22";
-import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=22";
+import { BookConfigStore, queryBookId } from "../js/book-config.js?v=25";
+import { normalizeLibrary, resolveCover, resolveLanguageAsset } from "../js/config.js?v=25";
 
 const baseUrl = "https://example.test/";
 const configuration = (id = "one") => ({
@@ -245,6 +245,38 @@ test("in-flight selection and title requests share work with independent cancell
   assert.equal(configs.requests.size, 0);
 });
 
+test("the final cancellation stops the shared fetch and an immediate retry starts fresh", async () => {
+  const pending = deferred();
+  const requests = [];
+  const configs = store((_url, { signal }) => {
+    requests.push(signal);
+    return requests.length === 1 ? pending.promise : json(configuration());
+  });
+  const selection = new AbortController();
+  const title = new AbortController();
+  const selected = configs.load("one", { signal: selection.signal });
+  const titleRead = configs.load("one", { signal: title.signal, titleOnly: true });
+  try {
+    assert.equal(requests.length, 1);
+    selection.abort();
+    await assert.rejects(selected, { name: "AbortError" });
+    assert.equal(requests[0].aborted, false);
+    title.abort();
+    assert.equal(requests[0].aborted, true);
+    assert.equal(configs.requests.size, 0);
+
+    const retry = configs.load("one");
+    await assert.rejects(titleRead, { name: "AbortError" });
+    pending.resolve(json(configuration("stale")));
+    assert.equal((await retry).book.id, "one");
+    assert.equal((await configs.load("one")).book.id, "one");
+    assert.equal(requests.length, 2);
+  } finally {
+    configs.close();
+    pending.resolve(json(configuration("stale")));
+  }
+});
+
 test("already cancelled consumers do not start requests or receive cached results", async () => {
   let calls = 0;
   const configs = store(async () => { calls++; return json(configuration()); });
@@ -316,7 +348,7 @@ test("a stale cancelled book load cannot overwrite a newer selection", async (t)
 });
 
 test("an oversized streamed catalog is rejected before the whole response is read", async () => {
-  const { fetchLibraryCatalog } = await import("../js/book-config.js?v=22");
+  const { fetchLibraryCatalog } = await import("../js/book-config.js?v=25");
   let reads = 0;
   let cancelled = false;
   const fetch = () => new Response(new ReadableStream({

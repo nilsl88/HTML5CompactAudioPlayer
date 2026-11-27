@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BookSession } from "../js/book-session.js?v=22";
+import { setImmediate as settle } from "node:timers/promises";
+import { BookSession } from "../js/book-session.js?v=25";
 
 test("a new book invalidates the earlier load without clearing the new controller", () => {
   const session = new BookSession();
@@ -47,4 +48,47 @@ test("a late book response is discarded after a newer selection", async () => {
   session.begin();
   resolve({ book: { id: "old" } });
   assert.equal(await result, null);
+});
+
+test("changing books releases an obsolete revalidation and keeps its result out of Play", async () => {
+  const book = (id, title) => ({ id, title, defaultLanguage: "en",
+    languages: { en: { sources: { mp3: { 64: `${id}.mp3` } } } } });
+  let started;
+  let finish;
+  const checking = new Promise((resolve) => { started = resolve; });
+  const waiting = new Promise((resolve) => { finish = resolve; });
+  const loaded = [];
+  let reads = 0;
+  const session = new BookSession({
+    baseUrl: "https://example.test/", isOnline: () => true,
+    searchParams: () => new URLSearchParams("book=first"), lastBookId: () => "",
+    async fetchImpl(url) {
+      if (url.endsWith("library.json")) return Response.json({ books: [{ id: "first" }, { id: "second" }] });
+      if (url.endsWith("/second/book.json")) return Response.json(book("second", "Second book"));
+      assert.match(url, /\/first\/book\.json$/);
+      if (++reads === 1) return Response.json(book("first", "Downloaded first book"),
+        { headers: { "x-compact-player-offline-version": "1" } });
+      started();
+      return waiting;
+    },
+    view: { onLoaded: ({ id }) => loaded.push(id), onError: assert.fail },
+  });
+  try {
+    await session.start();
+    let recovered = false;
+    const recovery = session.recover().then(() => { recovered = true; });
+    await checking;
+    await session.select("second");
+    await settle();
+    assert.equal(recovered, true);
+    finish(Response.json(book("first", "Late first book")));
+    await recovery;
+    await settle();
+    session.applyRefresh(false);
+    assert.deepEqual(loaded, ["first", "second"]);
+    assert.equal(session.current.id, "second");
+  } finally {
+    session.invalidate();
+    finish(Response.json(book("first", "Late first book")));
+  }
 });

@@ -1,12 +1,16 @@
 // The page imports this file and the classic service worker loads it with importScripts.
 globalThis.CompactPlayerOfflineManifest = (() => {
   const schemaVersion = 1;
+  const journalVersion = 2;
   const versionHeader = "x-compact-player-offline-version";
   const bookHeader = "x-compact-player-offline-book";
   const damageVersionHeader = "x-compact-player-damage-id";
   const networkStatusHeader = "x-compact-player-offline-network-status";
   const metaCache = "compact-player-offline-meta-v1";
   const maxChunkBytes = 8 * 1024 * 1024;
+  const chunkStartHeader = "x-compact-player-start";
+  const chunkEndHeader = "x-compact-player-end";
+  const chunkDigestHeader = "x-compact-player-sha256";
   const controlDbName = "compact-player-offline-control-v1";
   const controlStore = "records";
   const controlTimeoutMs = 3000;
@@ -58,15 +62,28 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     if (!Number.isSafeInteger(value.totalSize) || value.totalSize <= 0 || !Number.isSafeInteger(value.chunkSize) || value.chunkSize <= 0) return false;
     if (value.chunkSize > maxChunkBytes) return false;
     if (!Number.isSafeInteger(value.totalChunks) || value.totalChunks !== Math.ceil(value.totalSize / value.chunkSize)) return false;
-    if (!Array.isArray(value.completed) || new Set(value.completed).size !== value.completed.length
-      || value.completed.some((index) => !Number.isInteger(index) || index < 0 || index >= value.totalChunks)) return false;
+    const validIndexes = (indexes) => Array.isArray(indexes) && new Set(indexes).size === indexes.length
+      && indexes.every((index) => Number.isInteger(index) && index >= 0 && index < value.totalChunks);
+    if (!validIndexes(value.completed) || (value.checksummedChunks !== undefined && !validIndexes(value.checksummedChunks))) return false;
+    if (value.chunkRevision !== undefined && (!Number.isSafeInteger(value.chunkRevision) || value.chunkRevision < 1)) return false;
     if (!["downloading", "ready"].includes(value.status) || (requiredStatus && value.status !== requiredStatus)) return false;
     if (value.status === "ready" && value.completed.length !== value.totalChunks) return false;
+    if (value.configRevision !== undefined && (typeof value.configRevision !== "string"
+      || !/^[a-zA-Z0-9.-]{1,100}$/.test(value.configRevision))) return false;
     return true;
   }
 
   function offlineMetaUrl(baseUrl, type) {
     return new URL(`__compact_player_offline__/${type}.json`, baseUrl).href;
+  }
+
+  function requiredConfigUrl(manifest) {
+    return Array.isArray(manifest?.assets) && manifest.assets.find((asset) => asset?.required)?.url;
+  }
+
+  function offlineConfigCacheUrl(baseUrl, manifest) {
+    if (!manifest.configRevision) return requiredConfigUrl(manifest);
+    return offlineMetaUrl(baseUrl, `config/${manifest.configRevision}`);
   }
 
   function activeCacheName(baseUrl, slot) {
@@ -210,6 +227,22 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     return Math.min(manifest.chunkSize, manifest.totalSize - index * manifest.chunkSize);
   }
 
+  function hasRequiredChunkChecksum(response, manifest, index) {
+    return !manifest.checksummedChunks?.includes(index) || /^[a-f0-9]{64}$/.test(response.headers.get(chunkDigestHeader) ?? "");
+  }
+
+  function matchesChunkHeaders(response, manifest, index) {
+    if (response?.status !== 200 || !response.body) return false;
+    const length = chunkByteLength(manifest, index);
+    const start = manifest.chunkSize * index;
+    const matches = (header, expected) => {
+      const actual = response.headers.get(header);
+      return actual === null || actual === String(expected);
+    };
+    return matches("content-length", length) && matches(chunkStartHeader, start) && matches(chunkEndHeader, start + length - 1)
+      && hasRequiredChunkChecksum(response, manifest, index);
+  }
+
   function cancelChunkRead(reader) {
     void reader.cancel().catch(() => { /* A failed stream can reject cancellation. */ });
   }
@@ -248,12 +281,28 @@ globalThis.CompactPlayerOfflineManifest = (() => {
     }
   }
 
+  async function chunkDigest(bytes, signal) {
+    if (signal?.aborted) throw signal.reason;
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    if (signal?.aborted) throw signal.reason;
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function readVerifiedChunk(response, expected, signal, bytes) {
+    const digest = response.headers.get(chunkDigestHeader);
+    if (digest !== null) bytes ??= new Uint8Array(expected);
+    if (!await readExactChunk(response.body, expected, signal, bytes)) return false;
+    return digest === null || digest === await chunkDigest(bytes, signal);
+  }
+
   return Object.freeze({
-    schemaVersion, audioMimeType, strongETag, strongLastModified, validManifest, chunkByteLength,
-    maxChunkBytes, chunkReadTimeoutMs: 3000, readExactChunk,
+    schemaVersion, journalVersion, audioMimeType, strongETag, strongLastModified, validManifest, chunkByteLength,
+    maxChunkBytes, chunkReadTimeoutMs: 3000, readExactChunk, matchesChunkHeaders, chunkStartHeader, chunkEndHeader,
+    chunkDigest, chunkDigestHeader, readVerifiedChunk, hasRequiredChunkChecksum,
     metaCache, activeCacheName, activeCandidatePrefix, offlineControl, readActiveState,
     downloadHeader: "x-compact-player-download",
     versionHeader, versionHeaderValue, bookHeader, bookHeaderValue, networkStatusHeader, checkResponseVersion,
-    offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, damagedChunkUrl, confirmedChunkUrl, damageVersionHeader,
+    offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, requiredConfigUrl, offlineConfigCacheUrl,
+    damagedChunkUrl, confirmedChunkUrl, damageVersionHeader,
   });
 })();

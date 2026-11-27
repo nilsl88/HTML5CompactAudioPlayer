@@ -1,5 +1,5 @@
-import { closePanel } from "./dialogs.js?v=22";
-import { clearChildren, formatTime } from "./utils.js?v=22";
+import { closePanel } from "./dialogs.js?v=25";
+import { clearChildren, formatTime } from "./utils.js?v=25";
 
 export function createChapterPanel({ list, panel, trigger, audio, t, onRetry, onSeek, reportError }) {
   const document = list.ownerDocument;
@@ -52,11 +52,14 @@ export function createChapterPanel({ list, panel, trigger, audio, t, onRetry, on
     retry.className = "text-button chapter-retry-button";
     retry.textContent = t("retryChapters");
     retry.addEventListener("click", async () => {
+      const ownedFocus = document.activeElement === retry;
       retry.disabled = true;
       retry.textContent = t("loadingChapters");
       await onRetry();
-      if (panel.hidden) return;
-      const focusTarget = list.querySelector(".chapter-retry-button, .chapter-button");
+      if (!ownedFocus || panel.hidden) return;
+      const current = document.activeElement;
+      if (current && current !== retry && current !== document.body) return;
+      const focusTarget = list.querySelector(".chapter-retry-button, .chapter-button") || panel.querySelector("button:not(:disabled)");
       focusTarget?.focus();
     });
     container.append(message, retry);

@@ -1,4 +1,4 @@
-import { clearChildren } from "./utils.js?v=22";
+import { clearChildren } from "./utils.js?v=25";
 
 export function createCustomSelects(document, window) {
   const customSelectStates = new Map();
@@ -233,9 +233,14 @@ export function createCustomSelects(document, window) {
   }
 
   function syncSelectionControls() {
-    for (const select of customSelectStates.keys()) {
-      syncCustomSelect(select);
-      if (select.disabled) closeCustomSelect(customSelectStates.get(select));
+    for (const state of customSelectStates.values()) {
+      const disabled = Boolean(state.select.disabled);
+      if (state.button.disabled === disabled) continue;
+      state.button.disabled = disabled;
+      for (const [index, button] of state.options.entries()) {
+        button.disabled = disabled || Boolean(state.select.options[index]?.disabled);
+      }
+      if (disabled) closeCustomSelect(state);
     }
   }
 
