@@ -1,11 +1,12 @@
-import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js?v=22";
-import { setText } from "./utils.js?v=22";
+import { manifestMatchesSelection, sameOfflineSelection } from "./offline-selection.js?v=25";
+import { setText } from "./utils.js?v=25";
 
 export function createOfflinePanel(window, { offline, t, getLocale, getSelection, isOnline,
   waitForPriority, onRepair, reportError, showToast }) {
   const ids = ["offlineRow", "offlineLabel", "offlineStatus", "offlineProgress", "offlineDownloadBtn",
     "offlineRepairBtn", "offlineCancelBtn", "offlineRemoveBtn"];
   const els = Object.fromEntries(ids.map((id) => [id, window.document.getElementById(id)]));
+  const actions = [els.offlineDownloadBtn, els.offlineRepairBtn, els.offlineCancelBtn, els.offlineRemoveBtn];
   let focusCancel = false;
 
   function formatBytes(value) {
@@ -28,12 +29,17 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
 
   function render(state = offline.snapshot()) {
     if (!els.offlineRow) return;
+    const previousFocus = window.document.activeElement;
+    const focusedAction = actions.find((button) => button === previousFocus);
     els.offlineRow.hidden = !state.supported;
-    if (!state.supported) return;
+    if (!state.supported) {
+      if (focusedAction) window.document.getElementById("optionsBtn")?.focus();
+      return;
+    }
     setText(els.offlineLabel, t("offlineLabel"));
     const selection = getSelection();
     const activeMatches = selection && manifestMatchesSelection(state.active, selection);
-    const { busy } = state;
+    const busy = state.busy || state.writeLockBusy;
     const repairMessage = state.repairable && t(state.repairable.status === "needs-audio" ? "offlineMissingAudio" : "offlineNeedsConfig",
       { book: state.repairable.episodeTitle });
     const percent = Math.round(state.progress * 100);
@@ -43,7 +49,10 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     const showRemove = state.canWrite && Boolean(state.active || state.repairable) && !busy;
 
     els.offlineProgress.hidden = true;
-    if (state.phase === "preparing" || state.phase === "publishing-repair") {
+    if (state.writeLockBusy) {
+      status = t("offlineStorageBusy");
+      showDownload = false;
+    } else if (state.phase === "preparing" || state.phase === "publishing-repair") {
       status = t("offlinePreparing");
       showDownload = false;
     } else if (["downloading", "finalizing"].includes(state.phase) && state.staging) {
@@ -86,9 +95,17 @@ export function createOfflinePanel(window, { offline, t, getLocale, getSelection
     els.offlineDownloadBtn.disabled = busy || (!selection && !state.staging) || (!isOnline() && !state.canFinishOffline);
     els.offlineCancelBtn.hidden = !state.canWrite || !state.canCancel;
     els.offlineRemoveBtn.hidden = !showRemove;
-    if (focusCancel && busy && state.canCancel) {
+    if (focusCancel && state.busy && state.canCancel) {
       focusCancel = false;
-      window.requestAnimationFrame(() => els.offlineCancelBtn.focus());
+      const focusBeforeFrame = window.document.activeElement;
+      window.requestAnimationFrame(() => {
+        if (window.document.activeElement === focusBeforeFrame && !els.offlineCancelBtn.hidden && !els.offlineCancelBtn.disabled) {
+          els.offlineCancelBtn.focus();
+        }
+      });
+    } else if (focusedAction && (focusedAction.hidden || focusedAction.disabled)) {
+      const nextAction = actions.find((button) => !button.hidden && !button.disabled);
+      (nextAction || els.offlineStatus).focus();
     }
   }
 

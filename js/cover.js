@@ -1,31 +1,33 @@
-import { resolveCover } from "./config.js?v=22";
-import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=22";
-import { fetchWithRetry } from "./utils.js?v=22";
-import "./offline-manifest.js?v=22";
+import { resolveCover } from "./config.js?v=25";
+import { loadEmbeddedMp4Cover } from "./mp4-chapters.js?v=25";
+import { fetchWithRetry } from "./utils.js?v=25";
+import "./offline-manifest.js?v=25";
+import "./bounded-response.js?v=25";
 
 const COVER_TIMEOUT_MS = 8000;
+const { coverMaxBytes, readResponseBytes } = globalThis.CompactPlayerResponse;
+const { checkResponseVersion, versionHeader, bookHeader } = globalThis.CompactPlayerOfflineManifest;
 
-export function createCoverView(image, button, { fetchImpl, isOnline = () => true, getBookId, getFileCoverUrl, canUseCachedCover, canUseNativeCover, onShown, onFailure }) {
+export function createCoverView(image, button, { fetchImpl, isOnline = () => true, getBookId, getFileCoverUrl, canUseCachedCover, canUseNativeCover, onShown, onCleared, onFailure }) {
   let coverGeneration = 0;
   let coverController = null;
   let coverObjectUrl = "";
-  let imageTimeout;
+  let imageTimeout = null;
   let currentBook = null;
   let currentLanguage = "";
   let sourceUrl = "";
   let usingEmbedded = false;
   let coverNeedsRetry = false;
-  let pendingOfflineCover = false;
   let reconnectSourceUrl = null;
 
   function clearImage() {
+    const hadCover = !button.hidden;
     coverGeneration += 1;
     coverNeedsRetry = false;
-    pendingOfflineCover = false;
     reconnectSourceUrl = null;
     coverController?.abort();
     coverController = null;
-    clearTimeout(imageTimeout);
+    stopImageTimeout();
     if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
     coverObjectUrl = "";
     button.hidden = true;
@@ -33,13 +35,19 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     image.onerror = null;
     image.removeAttribute("src");
     image.alt = "";
+    if (hadCover) onCleared?.();
+  }
+
+  function stopImageTimeout() {
+    clearTimeout(imageTimeout);
+    imageTimeout = null;
   }
 
   function showCoverImage(src, generation, onFailure) {
-    clearTimeout(imageTimeout);
+    stopImageTimeout();
     const fail = () => {
       if (generation !== coverGeneration) return;
-      clearTimeout(imageTimeout);
+      stopImageTimeout();
       image.onload = null;
       image.onerror = null;
       image.removeAttribute("src");
@@ -49,8 +57,7 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     imageTimeout?.unref?.();
     image.onload = () => {
       if (generation !== coverGeneration) return;
-      clearTimeout(imageTimeout);
-      pendingOfflineCover = false;
+      stopImageTimeout();
       reconnectSourceUrl = null;
       button.hidden = false;
       onShown();
@@ -79,21 +86,23 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
   }
 
   async function loadFileCoverFallback(source, book, generation, onError) {
+    const identity = { episodeId: getBookId?.() || book.id, configBookId: book.id };
     const controller = new AbortController();
     coverController = controller;
     try {
       const blob = await fetchWithRetry(source, {
         fetchImpl, mode: "no-cors", cache: "no-cache", credentials: "same-origin",
         signal: controller.signal, timeoutMs: COVER_TIMEOUT_MS, retries: 1,
-      }, async (response) => {
+      }, async (response, readSignal) => {
         if (response.type === "opaque") return null;
         if (!response.ok) throw new Error("The cover image could not be loaded.");
-        const { checkResponseVersion, versionHeader } = globalThis.CompactPlayerOfflineManifest;
-        checkResponseVersion(response, book.cacheVersion);
+        checkResponseVersion(response, book.cacheVersion, response.headers.get(bookHeader) != null ? identity : null);
         if (response.headers.get(versionHeader) != null && !await canUseCachedCover?.(book)) {
           throw new Error("The downloaded cover belongs to a different book.");
         }
-        return response.blob();
+        const bytes = await readResponseBytes(response.body, coverMaxBytes, readSignal);
+        if (!bytes) throw new Error("Cover image exceeds 16 MiB.");
+        return new Blob([bytes], { type: response.headers.get("content-type") || "" });
       });
       if (blob === null) {
         if (!await canUseNativeCover?.(book)) throw new Error("The cover image could not be checked against the downloaded book.");
@@ -116,7 +125,6 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
       coverFailed(generation);
       return;
     }
-    pendingOfflineCover ||= !isOnline();
     const controller = new AbortController();
     coverController = controller;
     try {
@@ -160,7 +168,6 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     if (mode === "none") return;
     const configuredCover = resolveCover(book);
     if ((mode === "file" || mode === "auto") && configuredCover) {
-      pendingOfflineCover = !isOnline();
       const url = fileCoverUrl(configuredCover, book);
       const fail = (error) => {
         if (mode === "auto") void applyEmbeddedCover(generation);
@@ -184,7 +191,7 @@ export function createCoverView(image, button, { fetchImpl, isOnline = () => tru
     if (coverNeedsRetry) {
       sourceUrl = nextSourceUrl;
       loadCover(currentBook);
-    } else if (pendingOfflineCover) {
+    } else if (coverController || imageTimeout !== null) {
       reconnectSourceUrl = nextSourceUrl;
     }
   }

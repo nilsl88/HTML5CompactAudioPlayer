@@ -1,7 +1,7 @@
-import { normalizeLibrary, parseBookConfig, parseJson, readBookConfigText, readBoundedText } from "./config.js?v=22";
-export { validateOfflineBookConfig } from "./offline-selection.js?v=22";
-import { createAbortError, fetchTextWithRetry, fetchWithRetry } from "./utils.js?v=22";
-import "./offline-manifest.js?v=22";
+import { normalizeLibrary, parseBookConfig, parseJson, readBookConfigText } from "./config.js?v=25";
+export { validateOfflineBookConfig } from "./offline-selection.js?v=25";
+import { createAbortError, fetchTextWithRetry, fetchWithRetry, readBoundedText } from "./utils.js?v=25";
+import "./offline-manifest.js?v=25";
 
 const { versionHeader, networkStatusHeader } = globalThis.CompactPlayerOfflineManifest;
 const MAX_CACHED_CONFIGS = 24;
@@ -14,10 +14,10 @@ export function readLibraryText(response, signal) {
   return readBoundedText(response, signal, 2 * 1024 ** 2, () => new Error("Library catalog exceeds 2 MiB."));
 }
 
-export function fetchLibraryCatalog(url, fetchImpl) {
-  return fetchWithRetry(url, { fetchImpl, cache: "no-store", credentials: "same-origin" }, async (response, signal) => {
+export function fetchLibraryCatalog(url, fetchImpl, signal) {
+  return fetchWithRetry(url, { fetchImpl, signal, cache: "no-store", credentials: "same-origin" }, async (response, readSignal) => {
     if (!response.ok) return null;
-    const library = normalizeLibrary(parseJson(await readLibraryText(response, signal), "media/library.json"));
+    const library = normalizeLibrary(parseJson(await readLibraryText(response, readSignal), "media/library.json"));
     return { library, fromDownload: isDownloadedResponse(response) };
   });
 }
@@ -31,16 +31,24 @@ export function queryBookId(searchParams, library) {
   return isBookId(id, library) ? id : "";
 }
 
-function waitForConfig(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(createAbortError());
+function waitForConfig(promise, signal, release) {
+  if (!signal) return release ? promise.finally(release) : promise;
+  if (signal.aborted) {
+    release?.();
+    return Promise.reject(createAbortError());
+  }
   return new Promise((resolve, reject) => {
-    const abort = () => { signal.removeEventListener("abort", abort); reject(createAbortError()); };
+    let settled = false;
+    const finish = (settle, result) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      release?.();
+      settle(result);
+    };
+    const abort = () => finish(reject, createAbortError());
     signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
-      (error) => { signal.removeEventListener("abort", abort); reject(error); },
-    );
+    promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
   });
 }
 
@@ -55,6 +63,13 @@ export class BookConfigStore {
     this.selectedKey = null;
     this.requests = new Map();
     this.titlesRequest = null;
+    this.closed = false;
+  }
+
+  close() {
+    this.closed = true;
+    for (const { controller } of this.requests.values()) controller.abort();
+    this.requests.clear();
   }
 
   setLibrary(library, { fromDownload = false } = {}) {
@@ -89,14 +104,13 @@ export class BookConfigStore {
   }
 
   async load(id, { signal, revalidate = false, titleOnly = false } = {}) {
-    while (!signal?.aborted) {
+    while (!this.closed && !signal?.aborted) {
       const recordedUrl = this.downloadedConfig?.id === id ? this.downloadedConfig.url : null;
       if (!recordedUrl && !isBookId(id, this.library)) throw new Error("Invalid book identifier.");
       const key = this.configKey(id);
       try {
-        const lookup = this.sharedRequest(id, key, recordedUrl, revalidate);
-        const result = await waitForConfig(lookup, signal);
-        if (result && !signal?.aborted && key === this.configKey(id)) {
+        const result = await this.sharedRequest(id, key, recordedUrl, revalidate, signal);
+        if (result && !this.closed && !signal?.aborted && key === this.configKey(id)) {
           if (!titleOnly) this.selectedKey = key;
           this.rememberConfig(key, result);
           return result;
@@ -108,12 +122,22 @@ export class BookConfigStore {
     throw createAbortError();
   }
 
-  sharedRequest(id, key, recordedUrl, revalidate) {
+  sharedRequest(id, key, recordedUrl, revalidate, signal) {
     const cached = this.cache.get(key);
     if (cached && !(revalidate && cached.fromDownload)) return Promise.resolve(cached);
-    if (this.requests.has(key)) return this.requests.get(key).promise;
+    const request = this.requests.get(key) ?? this.startRequest(id, key, recordedUrl, cached);
+    request.consumers++;
+    return waitForConfig(request.promise, signal, () => {
+      request.consumers--;
+      if (request.consumers !== 0 || this.requests.get(key) !== request) return;
+      this.requests.delete(key);
+      request.controller.abort();
+    });
+  }
+
+  startRequest(id, key, recordedUrl, cached) {
     const controller = new AbortController();
-    const request = { id, controller };
+    const request = { id, controller, consumers: 0 };
     this.requests.set(key, request);
     const cache = cached ? "no-cache" : "default";
     request.promise = waitForConfig(this.fetchConfig(id, recordedUrl, controller.signal, cache), controller.signal).then((result) => {
@@ -135,7 +159,7 @@ export class BookConfigStore {
     }).finally(() => {
       if (this.requests.get(key) === request) this.requests.delete(key);
     });
-    return request.promise;
+    return request;
   }
 
   rememberConfig(key, result) {
@@ -175,7 +199,7 @@ export class BookConfigStore {
           response = await fetchTextWithRetry(configUrl, { ...this.fetchOptions, signal, cache }, readBookConfigText);
           if (signal?.aborted) throw createAbortError();
         } catch (error) {
-          // Fetch timeouts use AbortError; consumer signals never cancel this shared fetch.
+          // A request timeout can fall back to episode.json. Canceling the shared read ends both attempts.
           if (!signal?.aborted && hasFallback && ["TypeError", "NetworkError", "TimeoutError", "AbortError"].includes(error?.name)) continue;
           throw error;
         }
@@ -197,17 +221,18 @@ export class BookConfigStore {
   }
 
   loadTitles(onError = (id, error) => console.warn(`Could not load book title (${id}).`, error), onTitle) {
+    if (this.closed) return Promise.resolve();
     if (this.titlesRequest) return this.titlesRequest;
     const library = this.library;
     const records = library.books.filter((record) => !this.titles.has(this.configKey(record.id)));
     if (!records.length) return Promise.resolve();
     let cursor = 0;
     const worker = async () => {
-      while (library === this.library && cursor < records.length) {
+      while (!this.closed && library === this.library && cursor < records.length) {
         const record = records[cursor]; cursor += 1;
         try { await this.load(record.id, { titleOnly: true }); }
-        catch (error) { onError(record.id, error); continue; }
-        if (library === this.library) onTitle?.(record);
+        catch (error) { if (!this.closed) onError(record.id, error); continue; }
+        if (!this.closed && library === this.library) onTitle?.(record);
       }
     };
     const request = Promise.all(Array.from({ length: Math.min(2, records.length) }, () => worker())).then(() => {

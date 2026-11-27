@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { webcrypto } from "node:crypto";
-import { isPlayerServiceWorker } from "../js/utils.js?v=22";
+import { isPlayerServiceWorker } from "../js/utils.js?v=25";
 
 const run = promisify(execFile);
 const sourceWorker = new URL("../sw.js", import.meta.url);
@@ -84,12 +84,24 @@ function dispatchFetch(handlers, request) {
   return { response, completion };
 }
 
+function predecessorEntries(scope, marker, id, { missing } = {}) {
+  const base = `./releases/${id}/`;
+  const modules = ["player.js", "js/config.js"];
+  const integrity = Object.fromEntries(modules.map((path) => [base + path, "sha256-example"]));
+  const html = `<script type="importmap">${JSON.stringify({ integrity })}</script><title>older player</title>`;
+  const entries = new Map([[marker, new Response(id)], [scope + `release-${id}.html`, new Response(html)]]);
+  for (const path of [...modules, "player.css"]) {
+    if (path !== missing) entries.set(new URL(base + path, scope).href, new Response("asset"));
+  }
+  return entries;
+}
+
 test("both old and versioned player workers are recognized only in their own installation", () => {
   const base = "https://example.test/player/";
-  for (const scriptURL of [base + "sw.js", base + "sw.js?v=22"]) {
+  for (const scriptURL of [base + "sw.js", base + "sw.js?v=25"]) {
     assert.equal(isPlayerServiceWorker({ scriptURL }, base), true);
   }
-  for (const scriptURL of ["https://other.test/player/sw.js?v=22", "https://example.test/other/sw.js?v=22", "invalid"]) {
+  for (const scriptURL of ["https://other.test/player/sw.js?v=25", "https://example.test/other/sw.js?v=25", "invalid"]) {
     assert.equal(isPlayerServiceWorker({ scriptURL }, base), false);
   }
   assert.equal(isPlayerServiceWorker(null, base), false);
@@ -390,6 +402,27 @@ test("a release worker verifies network modules when opening or reading the inst
   }
 });
 
+test("canceling a release asset request discards its delayed cache lookup", async (t) => {
+  const { directory, id, workerPath } = await generateRelease(t);
+  const { context, scope } = createWorker({ workerUrl: pathToFileURL(join(directory, workerPath)) });
+  let entered;
+  let release;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const cacheOpen = new Promise((resolve) => { release = resolve; });
+  context.caches.open = () => { entered(); return cacheOpen; };
+  let matches = 0;
+  context.fetch = assert.fail;
+  const controller = new AbortController();
+  const request = new Request(scope + `releases/${id}/js/config.js`, { signal: controller.signal });
+  const result = context.networkFirst(request);
+  await started;
+  controller.abort();
+  release({ match: () => { matches++; return new Response("unused"); } });
+  await assert.rejects(result, { name: "AbortError" });
+  await new Promise(setImmediate);
+  assert.equal(matches, 0);
+});
+
 test("verified network bytes repair a cache miss only in an installed release", async (t) => {
   const { directory, id, workerPath } = await generateRelease(t);
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -684,6 +717,26 @@ test("a stalled shell or book cache fallback preserves the original network resu
   }
 });
 
+test("a live navigation cancels the late body of an unused cached page", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { context, scope } = createWorker();
+  let finishNetwork;
+  context.fetch = () => new Promise((resolve) => { finishNetwork = resolve; });
+  let finishCache;
+  context.caches.open = async () => ({ match: () => new Promise((resolve) => { finishCache = resolve; }) });
+  const request = new Request(scope);
+  Object.defineProperty(request, "mode", { value: "navigate" });
+  const result = context.networkFirst(request);
+  t.mock.timers.tick(3000);
+  await new Promise(setImmediate);
+  finishNetwork(new Response(page(version)));
+  assert.equal(await (await result).text(), page(version));
+  let canceled = false;
+  finishCache(new Response(new ReadableStream({ cancel() { canceled = true; } })));
+  await new Promise(setImmediate);
+  assert.equal(canceled, true);
+});
+
 test("a stalled cover request falls back to the saved cover", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { context, scope } = createWorker();
@@ -698,6 +751,40 @@ test("a stalled cover request falls back to the saved cover", async (t) => {
   assert.equal(await (await response).text(), "saved cover");
 });
 
+test("the cover route keeps saved artwork when the server returns an HTML success page", async () => {
+  const { context, scope } = createWorker();
+  const source = scope + "media/book/cover.jpg";
+  const url = new URL(scope + "__compact_player_offline__/cover.json");
+  url.search = new URLSearchParams({ url: source, version: "3", book: "one", config: "one" });
+  context.fetch = () => new Response("<html>Cover unavailable</html>", { headers: { "content-type": "text/html; charset=utf-8" } });
+  context.activeManifest = async () => ({ episodeId: "one", configBookId: "one", cacheVersion: 3, cacheName: "saved" });
+  await (await context.caches.open("saved")).put(source, new Response("saved cover", { headers: { "content-type": "image/jpeg" } }));
+  const response = await context.networkFirstCover(new Request(url), url);
+  assert.equal(await response.text(), "saved cover");
+  assert.equal(response.headers.get("content-type"), "image/jpeg");
+});
+
+test("canceling a cover request stops its pending saved cover fallback", async () => {
+  const { context, scope } = createWorker();
+  const url = new URL(scope + "__compact_player_offline__/cover.json");
+  url.search = new URLSearchParams({ url: scope + "media/book/cover.jpg", version: "3", book: "one", config: "one" });
+  context.fetch = () => new Response(null, { status: 503 });
+  context.activeManifest = async () => ({ episodeId: "one", configBookId: "one", cacheVersion: 3, cacheName: "saved" });
+  let opened;
+  let release;
+  const readStarted = new Promise((resolve) => { opened = resolve; });
+  const cacheOpen = new Promise((resolve) => { release = resolve; });
+  let matches = 0;
+  context.caches.open = () => { opened(); return cacheOpen; };
+  const controller = new AbortController();
+  const response = context.networkFirstCover(new Request(url, { signal: controller.signal }), url);
+  await readStarted;
+  controller.abort();
+  release({ match: () => { matches++; return new Response("saved cover"); } });
+  await assert.rejects(response, { name: "AbortError" });
+  assert.equal(matches, 0);
+});
+
 test("the extracted release handler serves the installed source shell", async () => {
   const { context, handlers, scope } = createWorker();
   await dispatch(handlers, "install");
@@ -706,21 +793,30 @@ test("the extracted release handler serves the installed source shell", async ()
   assert.equal(await (await context.cachedShell(pageRequest)).text(), page(version));
 });
 
-test("a saved book configuration loads while the network request is still pending", async (t) => {
+test("a saved book configuration cancels the pending network request on every signal implementation", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { context, scope } = createWorker();
-  const url = scope + "media/book/book.json";
-  context.activeManifest = async () => ({ episodeId: "book", cacheVersion: 1, cacheName: "saved" });
-  await (await context.caches.open("saved")).put(url, new Response("saved config"));
-  let signal;
-  context.fetch = (_request, options) => {
-    signal = options.signal;
-    return new Promise(() => {});
-  };
-  const response = context.networkFirst(new Request(url));
-  t.mock.timers.tick(3000);
-  assert.equal(await (await response).text(), "saved config");
-  assert.equal(signal.aborted, true);
+  for (const AbortSignalImpl of [AbortSignal, {}]) {
+    const { context, scope } = createWorker();
+    context.AbortSignal = AbortSignalImpl;
+    const url = scope + "media/book/book.json";
+    context.activeManifest = async () => ({ episodeId: "book", cacheVersion: 1, cacheName: "saved" });
+    await (await context.caches.open("saved")).put(url, new Response("saved config"));
+    let signal;
+    context.fetch = (_request, options) => {
+      signal = options.signal;
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    };
+    const response = context.networkFirst(new Request(url));
+    t.mock.timers.tick(3000);
+    assert.equal(await (await response).text(), "saved config");
+    assert.equal(signal.aborted, true);
+
+    const controller = new AbortController();
+    const canceled = context.networkFirst(new Request(url, { signal: controller.signal }));
+    controller.abort();
+    await assert.rejects(canceled, { name: "AbortError" });
+    assert.equal(signal.aborted, true);
+  }
 });
 
 test("offline navigation uses the verified predecessor when the current release page is missing", async (t) => {
@@ -730,9 +826,7 @@ test("offline navigation uses the verified predecessor when the current release 
   const prefix = vm.runInContext("VERIFIED_RELEASE_CACHE_PREFIX", context);
   const marker = vm.runInContext("RELEASE_READY_URL", context);
   const predecessor = "0".repeat(64);
-  stores.set(prefix + predecessor, new Map([
-    [marker, new Response(predecessor)], [scope + "release-" + predecessor + ".html", new Response("older player")],
-  ]));
+  stores.set(prefix + predecessor, predecessorEntries(scope, marker, predecessor));
   const unverified = "1".repeat(64);
   stores.set(prefix + unverified, new Map([
     [scope + "release-" + unverified + ".html", new Response("incomplete release")],
@@ -740,7 +834,65 @@ test("offline navigation uses the verified predecessor when the current release 
   context.fetch = async () => { throw new TypeError("Offline"); };
   const request = new Request(scope + "?book=saved");
   Object.defineProperty(request, "mode", { value: "navigate" });
-  assert.equal(await (await context.networkFirst(request)).text(), "older player");
+  assert.match(await (await context.networkFirst(request)).text(), new RegExp(predecessor));
+});
+
+test("offline navigation falls back to the previous release when a current module has been evicted", async (t) => {
+  const { directory, id, workerPath } = await generateRelease(t);
+  const workerUrl = pathToFileURL(join(directory, workerPath));
+  const fetchAsset = async (request) => new Response(await readFile(new URL(new URL(request.url).pathname.slice("/player/".length), workerUrl)));
+  const { context, handlers, scope, stores } = createWorker({ workerUrl, fetchAsset });
+  await dispatch(handlers, "install");
+  const cacheName = vm.runInContext("SHELL_CACHE", context);
+  const prefix = vm.runInContext("VERIFIED_RELEASE_CACHE_PREFIX", context);
+  const marker = vm.runInContext("RELEASE_READY_URL", context);
+  const previous = "0".repeat(64);
+  stores.set(prefix + previous, predecessorEntries(scope, marker, previous));
+  context.fetch = async () => { throw new TypeError("Offline"); };
+  const pageRequest = new Request(scope + "?book=saved");
+  Object.defineProperty(pageRequest, "mode", { value: "navigate" });
+  assert.match(await (await context.networkFirst(pageRequest)).text(), new RegExp(id));
+
+  assert.equal(stores.get(cacheName).delete(scope + `releases/${id}/js/config.js`), true);
+  assert.match(await (await context.networkFirst(pageRequest)).text(), new RegExp(previous));
+});
+
+test("activation retains an intact predecessor when a newer cached release has lost a module", async (t) => {
+  const { directory, id, workerPath } = await generateRelease(t);
+  const workerUrl = pathToFileURL(join(directory, workerPath));
+  const fetchAsset = async (request) => new Response(await readFile(new URL(new URL(request.url).pathname.slice("/player/".length), workerUrl)));
+  const { context, handlers, scope, stores } = createWorker({ workerUrl, fetchAsset });
+  const intact = "0".repeat(64);
+  const damaged = "1".repeat(64);
+  const prefix = vm.runInContext("VERIFIED_RELEASE_CACHE_PREFIX", context);
+  const marker = vm.runInContext("RELEASE_READY_URL", context);
+  stores.set(prefix + intact, predecessorEntries(scope, marker, intact));
+  stores.set(prefix + damaged, predecessorEntries(scope, marker, damaged, { missing: "js/config.js" }));
+  await dispatch(handlers, "install");
+  await dispatch(handlers, "activate");
+  assert.equal(stores.has(prefix + intact), true);
+  assert.equal(stores.has(prefix + damaged), false);
+
+  const cacheName = vm.runInContext("SHELL_CACHE", context);
+  stores.get(cacheName).delete(scope + `releases/${id}/js/config.js`);
+  context.fetch = async () => { throw new TypeError("Offline"); };
+  const pageRequest = new Request(scope + "?book=saved");
+  Object.defineProperty(pageRequest, "mode", { value: "navigate" });
+  assert.match(await (await context.networkFirst(pageRequest)).text(), new RegExp(intact));
+});
+
+test("offline navigation keeps the installed page when enumerating its files fails", async (t) => {
+  const { directory, id, workerPath } = await generateRelease(t);
+  const workerUrl = pathToFileURL(join(directory, workerPath));
+  const fetchAsset = async (request) => new Response(await readFile(new URL(new URL(request.url).pathname.slice("/player/".length), workerUrl)));
+  const { context, handlers, scope } = createWorker({ workerUrl, fetchAsset });
+  await dispatch(handlers, "install");
+  context.fetch = async () => { throw new TypeError("Offline"); };
+  const { open } = context.caches;
+  context.caches.open = async (name) => ({ ...await open(name), async keys() { throw new Error("Cannot enumerate cache"); } });
+  const pageRequest = new Request(scope);
+  Object.defineProperty(pageRequest, "mode", { value: "navigate" });
+  assert.match(await (await context.networkFirst(pageRequest)).text(), new RegExp(id));
 });
 
 test("an unfinished cover body falls back to the saved image after headers have arrived", async (t) => {
@@ -758,6 +910,24 @@ test("an unfinished cover body falls back to the saved image after headers have 
   t.mock.timers.tick(3000);
   assert.equal(await (await response).text(), "saved cover");
   assert.equal(canceled, true);
+});
+
+test("using a saved configuration or cover cancels the unused HTTP error body", async () => {
+  for (const file of ["book.json", "cover.jpg"]) {
+    const { context, scope } = createWorker();
+    const source = scope + "media/book/" + file;
+    const coverUrl = new URL(scope + "__compact_player_offline__/cover.json");
+    coverUrl.search = new URLSearchParams({ url: source, version: "3", book: "one", config: "one" });
+    let canceled = false;
+    const body = new ReadableStream({ cancel() { canceled = true; } }, { highWaterMark: 0 });
+    context.fetch = async () => new Response(body, { status: 503 });
+    context.activeManifest = async () => ({ episodeId: "one", configBookId: "one", cacheVersion: 3, cacheName: "saved" });
+    await (await context.caches.open("saved")).put(source, new Response("saved asset"));
+    const response = file === "book.json" ? await context.networkFirst(new Request(source))
+      : await context.networkFirstCover(new Request(coverUrl), coverUrl);
+    assert.equal(await response.text(), "saved asset");
+    assert.equal(canceled, true, file);
+  }
 });
 
 test("a saved book configuration loads when network headers arrive but the body stalls", async (t) => {

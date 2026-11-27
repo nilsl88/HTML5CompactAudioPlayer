@@ -2,18 +2,55 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { setImmediate as settle } from "node:timers/promises";
-import { probeUrl } from "../js/availability.js?v=22";
+import { probeUrl } from "../js/availability.js?v=25";
 import { deferred, openPlayerPage } from "./player-page.mjs";
-import { resolveUiLocale, translateAt, uiLanguageOptions, UI_STRINGS } from "../i18n.js?v=22";
+import { resolveUiLocale, translateAt, uiLanguageOptions, UI_STRINGS } from "../i18n.js?v=25";
 
 function response(status) {
   return { status, ok: status >= 200 && status < 300, body: { cancel: async () => {} } };
 }
 
+test("an HTML success response does not confirm that the audio source exists", async () => {
+  for (const rangeType of ["text/html; charset=utf-8", "audio/mpeg"]) {
+    const requests = [];
+    const fetchImpl = async (_url, { method, headers }) => {
+      requests.push([method, headers?.Range]);
+      return method === "HEAD"
+        ? new Response(null, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } })
+        : new Response(null, { status: 206, headers: { "content-type": rangeType } });
+    };
+    assert.equal(await probeUrl("https://example.test/audio.mp3", { fetchImpl }),
+      rangeType === "audio/mpeg" ? "available" : "unknown");
+    assert.deepEqual(requests, [["HEAD", undefined], ["GET", "bytes=0-0"]]);
+  }
+});
+
+test("a saved offline response does not confirm network availability", async () => {
+  const requests = [];
+  const fetchImpl = async (_url, { method }) => {
+    requests.push(method);
+    return new Response(null, { status: 200, headers: {
+      "content-type": "audio/mpeg", "x-compact-player-offline-version": "%221%22",
+    } });
+  };
+  assert.equal(await probeUrl("https://example.test/audio.mp3", { fetchImpl }), "unknown");
+  assert.deepEqual(requests, ["HEAD", "GET"]);
+});
+
 test("availability uses Range when HEAD is unsupported", async () => {
   const methods = [];
   const fetchImpl = async (_url, options) => { methods.push(options.method); return options.method === "HEAD" ? response(405) : response(206); };
   assert.equal(await probeUrl("https://example.test/audio", { fetchImpl }), "available");
+  assert.deepEqual(methods, ["HEAD", "GET"]);
+});
+
+test("a no-content HEAD response leaves availability to the Range probe", async () => {
+  const methods = [];
+  const fetchImpl = async (_url, { method }) => {
+    methods.push(method);
+    return new Response(null, { status: method === "HEAD" ? 204 : 206, headers: { "content-type": "audio/mpeg" } });
+  };
+  assert.equal(await probeUrl("https://example.test/audio.mp3", { fetchImpl }), "available");
   assert.deepEqual(methods, ["HEAD", "GET"]);
 });
 
@@ -37,6 +74,34 @@ test("one inconclusive probe cannot make a source missing", async () => {
 
 test("two definitive missing responses mark a source missing", async () => {
   assert.equal(await probeUrl("https://example.test/audio", { fetchImpl: async () => response(404) }), "missing");
+});
+
+test("reopening Options retries only sources left unresolved by an earlier scan", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const book = { id: "book", defaultLanguage: "en", languages: { en: {
+    sources: { opus: { 96: "temporarily-unavailable.webm", 64: "known.webm" } },
+  } } };
+  let healthy = false;
+  const requests = [];
+  const { elements, storage } = await openPlayerPage(book, (url, { method }) => {
+    const file = new URL(url).pathname.split("/").pop();
+    requests.push([file, method]);
+    return response(healthy || file === "known.webm" ? 200 : 503);
+  });
+  const options = elements.get("optionsBtn");
+  const toggle = () => options.dispatchEvent(new Event("click"));
+  toggle();
+  await settle();
+  assert.deepEqual(requests.filter(([, method]) => method === "HEAD"),
+    [["temporarily-unavailable.webm", "HEAD"], ["known.webm", "HEAD"]]);
+
+  toggle();
+  healthy = true;
+  toggle();
+  await settle();
+  assert.deepEqual(requests.filter(([, method]) => method === "HEAD"),
+    [["temporarily-unavailable.webm", "HEAD"], ["known.webm", "HEAD"], ["temporarily-unavailable.webm", "HEAD"]]);
+  assert.equal(storage.readAvailabilityCache(book.id, 1).byLanguage.en["opus-96"], "available");
 });
 
 test("a late missing probe preserves the source that played on the next selection", async (t) => {

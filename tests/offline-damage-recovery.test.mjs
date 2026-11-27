@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
-import { OfflineDamageRecovery } from "../js/offline-damage-recovery.js?v=22";
+import { OfflineDamageRecovery } from "../js/offline-damage-recovery.js?v=25";
 
 test("reports arriving during an inspection trigger a fresh inspection", async () => {
   let finish;

@@ -1,12 +1,19 @@
-import { createAbortError, fetchWithRetry } from "./utils.js?v=22";
+import { createAbortError, fetchWithRetry } from "./utils.js?v=25";
+import "./bounded-response.js?v=25";
+import "./offline-manifest.js?v=25";
+
+const { versionHeader } = globalThis.CompactPlayerOfflineManifest;
+const { isHtmlResponse } = globalThis.CompactPlayerResponse;
 
 async function probeStatus(fetchImpl, url, options, signal, timeoutMs) {
   try {
     const state = await fetchWithRetry(url, {
       ...options, fetchImpl, signal, timeoutMs, retries: 1, cache: "no-store", credentials: "same-origin",
     }, (response) => {
-      // Only the status is needed, including when the server ignores Range.
       void response.body?.cancel()?.catch(() => { /* A canceled fetch may have closed the stream. */ });
+      if (response.headers?.get?.(versionHeader) != null) return "unknown";
+      // Some static hosts return an HTML page at missing media URLs with a success status.
+      if (response.ok && isHtmlResponse(response)) return "unknown";
       return stateFromStatus(response.status);
     });
     if (signal?.aborted) throw createAbortError();
@@ -18,7 +25,7 @@ async function probeStatus(fetchImpl, url, options, signal, timeoutMs) {
 }
 
 function stateFromStatus(status) {
-  if ((status >= 200 && status < 300) || status === 401 || status === 403) return "available";
+  if ([200, 206, 401, 403].includes(status)) return "available";
   if (status === 404 || status === 410) return "missing";
   return "unknown";
 }

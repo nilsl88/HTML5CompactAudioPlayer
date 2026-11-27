@@ -2,12 +2,42 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=22";
-import { PlayerStorage } from "../js/storage.js?v=22";
-import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=22";
-import { RangeReader, MP4_METADATA_MAX_REQUESTS } from "../js/mp4-metadata.js?v=22";
-import { createCoverView } from "../js/cover.js?v=22";
-import { ChapterSession } from "../js/chapter-session.js?v=22";
+import { CHAPTER_REQUEST_TIMEOUT_MS, loadChapterFile, loadChapters } from "../js/chapters.js?v=25";
+import { PlayerStorage } from "../js/storage.js?v=25";
+import { decodeMp4ChapterTitle, loadEmbeddedMp4Chapters, loadEmbeddedMp4Cover } from "../js/mp4-chapters.js?v=25";
+import { findAtoms, payload } from "../js/mp4-atoms.js?v=25";
+import { RangeReader, MP4_METADATA_MAX_REQUESTS } from "../js/mp4-metadata.js?v=25";
+import { createCoverView } from "../js/cover.js?v=25";
+import { ChapterSession } from "../js/chapter-session.js?v=25";
+
+test("reconnect retries WebVTT after an in-flight request falls back to visible embedded cues", async () => {
+  const previous = deferred();
+  const vtt = "https://example.test/chapters.vtt";
+  const cues = [{ start: 0, end: 10, title: "Embedded" }];
+  const accepted = [];
+  let requests = 0;
+  const session = new ChapterSession({
+    fetchImpl(url) {
+      assert.equal(url, vtt);
+      if (++requests === 1) return previous.promise;
+      return new Response("WEBVTT\n\n00:00.000 --> 00:10.000\nFrom WebVTT");
+    },
+    openCache: () => ({ read: () => ({ kind: "embedded", cues }), beginWrite() {}, write() {} }),
+    onStart() {},
+    onLoaded: (result) => accepted.push(result.cues[0].title),
+    onFailure: assert.fail,
+  });
+  session.reset({ id: "book", languages: { en: { baseUrl: "https://example.test/", chapterSource: "auto", chapters: vtt } } }, "en",
+    { url: "https://example.test/audio.m4b", mime: "audio/mp4" });
+  const first = session.load();
+  await settle();
+  assert.deepEqual(accepted, ["Embedded"]);
+  const reconnected = session.reconnect();
+  previous.resolve(new Response(null, { status: 404 }));
+  await Promise.all([first, reconnected]);
+  assert.equal(requests, 2);
+  assert.equal(session.cues[0].title, "From WebVTT");
+});
 
 function concatBytes(...values) {
   const result = new Uint8Array(values.reduce((total, value) => total + value.length, 0));
@@ -963,6 +993,33 @@ test("already cancelled chapters and covers leave MP4 range requests to active r
   assert.equal(fetchImpl.mock.callCount(), 1);
 });
 
+test("canceling a QuickTime sample read leaves the shared metadata available to cover loading", async () => {
+  const url = "https://example.test/chapter-samples.m4b";
+  const firstSample = 300_000;
+  const source = quickTimeChapterFile(2, uint32Fields(0, 3, 2), undefined, firstSample - 8);
+  const moovStart = firstSample + 6;
+  const cover = coverMetadata(Uint8Array.of(0xff, 0xd8, 0xff, 0xe0), 13);
+  const file = concatBytes(source.subarray(0, moovStart),
+    atom("moov", concatBytes(source.subarray(moovStart + 8), cover.file.subarray(8))));
+  const network = rangedFetch(file, file.length);
+  const sample = deferred();
+  const requests = [];
+  const fetchImpl = (requested, options) => {
+    requests.push(options.headers.Range);
+    if (!options.headers.Range.startsWith(`bytes=${firstSample}-`)) return network(requested, options);
+    sample.resolve();
+    return new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true }));
+  };
+  const controller = new AbortController();
+  const canceled = assert.rejects(loadEmbeddedMp4Chapters(url, { fetchImpl, signal: controller.signal }), { name: "AbortError" });
+  await sample.promise;
+  controller.abort();
+  await canceled;
+  const requestCount = requests.length;
+  assert.equal((await loadEmbeddedMp4Cover(url, { fetchImpl })).mime, "image/jpeg");
+  assert.equal(requests.length, requestCount);
+});
+
 test("shares one MP4 metadata range between chapters and cover", async () => {
   const cover = coverMetadata(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), 13);
   const file = atom("moov", concatBytes(neroMetadata().subarray(8), cover.file.subarray(8)));
@@ -976,6 +1033,41 @@ test("shares one MP4 metadata range between chapters and cover", async () => {
   assert.equal(chapters.length, 2);
   assert.equal(artwork.mime, "image/jpeg");
   assert.equal(requests, 1);
+});
+
+test("nested MP4 boxes reference the shared metadata buffer", () => {
+  const metadata = atom("moov", atom("udta", atom("chap", Uint8Array.of(1, 2, 3, 4))));
+  const [chapter] = findAtoms(metadata.buffer, "chap", { absoluteStart: 1_000_000 });
+  assert.equal(chapter.start, 1_000_016);
+  assert.equal(chapter.buffer, metadata.buffer);
+  const bytes = payload(chapter);
+  assert.equal(bytes.buffer, metadata.buffer);
+  assert.deepEqual([...bytes], [1, 2, 3, 4]);
+});
+
+test("MP4 metadata traversal stops at its box count limit", () => {
+  const empty = atom("free", new Uint8Array(0));
+  const boxes = new Uint8Array(empty.length * 65_537);
+  for (let offset = 0; offset < boxes.length; offset += empty.length) boxes.set(empty, offset);
+  const metadata = atom("moov", atom("udta", boxes));
+  assert.throws(() => findAtoms(metadata.buffer, "chap"), /metadata exceeded the box limit/i);
+});
+
+test("MP4 metadata keeps recent chapter and cover reads while releasing older books", async (t) => {
+  const cover = coverMetadata(Uint8Array.of(0xff, 0xd8, 0xff, 0xe0), 13);
+  const file = atom("moov", concatBytes(neroMetadata().subarray(8), cover.file.subarray(8)));
+  const fetchImpl = t.mock.fn(rangedFetch(file));
+  const books = ["first", "second", "third"].map((name) => `https://example.test/${name}.m4b`);
+  for (const book of books) {
+    assert.equal((await loadEmbeddedMp4Chapters(book, { fetchImpl })).length, 2);
+  }
+
+  for (const book of books.slice(1)) {
+    assert.equal((await loadEmbeddedMp4Cover(book, { fetchImpl })).mime, "image/jpeg");
+  }
+  assert.equal(fetchImpl.mock.callCount(), 3);
+  assert.equal((await loadEmbeddedMp4Cover(books[0], { fetchImpl })).mime, "image/jpeg");
+  assert.equal(fetchImpl.mock.callCount(), 4);
 });
 
 test("replacing an MP4 at the same URL refreshes chapters and artwork together for its cache version", async (t) => {

@@ -1,39 +1,37 @@
-import "./offline-manifest.js?v=22";
-import { readBookConfigText } from "./config.js?v=22";
-import { readLibraryText } from "./book-config.js?v=22";
-import { createAbortError, fetchWithRetry } from "./utils.js?v=22";
-import { OfflineBookStore, canResumeTransfer, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js?v=22";
-import { withOfflineLock } from "./offline-lock.js?v=22";
-import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange, withOfflineDeadline as prepareWithTimeout } from "./offline-transfer.js?v=22";
-import { PlayerWorker, PlayerWorkerSetupTimeout } from "./player-worker.js?v=22";
-import { OfflineDamageRecovery } from "./offline-damage-recovery.js?v=22";
-export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js?v=22";
+import "./offline-manifest.js?v=25";
+import "./bounded-response.js?v=25";
+import { readBookConfigText } from "./config.js?v=25";
+import { readLibraryText } from "./book-config.js?v=25";
+import { createAbortError, fetchWithRetry } from "./utils.js?v=25";
+import { OfflineBookStore, hasAllChunks, isQuotaError, sameOfflineSelection } from "./offline-book-store.js?v=25";
+import { OfflineDownloadSpace, canResumeTransfer, completedBytes } from "./offline-download-space.js?v=25";
+import { withOfflineLock } from "./offline-lock.js?v=25";
+import { OfflineDownloadError, checkCanceled, downloadChunks, inspectAudioRange, withOfflineDeadline as prepareWithTimeout } from "./offline-transfer.js?v=25";
+import { PlayerWorker, PlayerWorkerSetupTimeout } from "./player-worker.js?v=25";
+import { OfflineDamageRecovery } from "./offline-damage-recovery.js?v=25";
+import { OfflineInventory, sameDownload } from "./offline-inventory.js?v=25";
+import { createOfflinePlayback } from "./offline-playback.js?v=25";
+import { OfflineTabSync } from "./offline-tab-sync.js?v=25";
+import { OfflineWorkerRoutes } from "./offline-worker-routes.js?v=25";
+export { OFFLINE_CHUNK_SIZE, OfflineDownloadError, chunkBounds, parseContentRange } from "./offline-transfer.js?v=25";
+export { completedBytes };
 
 const PREPARATION_TIMEOUT_MS = 20_000;
 const OPTIONAL_ASSET_TIMEOUT_MS = 3000;
-const STORAGE_ESTIMATE_TIMEOUT_MS = 750;
 const STAGING_WRITE_TIMEOUT_MS = 20_000;
 const PUBLISHED_STARTUP_TIMEOUT_MS = 3000;
-const PUBLISHED_SYNC_TIMEOUT_MS = 3000;
-const INVENTORY_SCAN_TIMEOUT_MS = 20_000;
-const INVENTORY_LOCK_TIMEOUT_MS = 3000;
-const INVENTORY_CHECK_TIMEOUT_MS = 3000;
+const RECORD_CHECK_TIMEOUT_MS = 3000;
 const RESET_CLEANUP_TIMEOUT_MS = 3000;
 const BOOK_CLEANUP_TIMEOUT_MS = 3000;
-const MEBIBYTE = 1024 * 1024;
-const PUBLISHED_DOWNLOAD_CHANGED = "published-download-changed";
 
 const {
   schemaVersion: OFFLINE_SCHEMA_VERSION, metaCache: OFFLINE_META_CACHE, downloadHeader: OFFLINE_DOWNLOAD_HEADER,
-  validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl, chunkByteLength,
+  validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl,
 } = globalThis.CompactPlayerOfflineManifest;
 export { OFFLINE_SCHEMA_VERSION, OFFLINE_META_CACHE, OFFLINE_DOWNLOAD_HEADER, validManifest, offlineMetaUrl, offlineManifestUrl, offlineChunkUrl };
-export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js?v=22";
+export { OFFLINE_BOOK_CACHE_PREFIX, sameOfflineSelection, manifestMatchesSelection } from "./offline-book-store.js?v=25";
 
-export function completedBytes(manifest) {
-  if (!validManifest(manifest)) return 0;
-  return manifest.completed.reduce((total, index) => total + chunkByteLength(manifest, index), 0);
-}
+const { coverMaxBytes, isHtmlResponse, cancelResponseBody, readResponseBytes, responseWithDecodedBody } = globalThis.CompactPlayerResponse;
 
 function offlineConflict() {
   throw new OfflineDownloadError("conflict", "Another tab is updating or has changed the offline book.");
@@ -61,17 +59,29 @@ export class OfflineManager {
   } = {}) {
     const installation = new URL("./", baseUrl || globalThis.location?.href || "http://localhost/");
     this.baseUrl = installation.href;
+    this.coordinationName = `compact-player-offline:${this.baseUrl}`;
     this.onChange = onChange;
     this.fetchImpl = fetchImpl;
     this.navigator = navigatorObject;
     this.worker = new PlayerWorker({
-      baseUrl: this.baseUrl, navigatorObject, fetchImpl, scriptName: workerScriptName, releaseSequence: workerReleaseSequence,
+      baseUrl: this.baseUrl, navigatorObject, scriptName: workerScriptName, releaseSequence: workerReleaseSequence,
+    });
+    this.routes = new OfflineWorkerRoutes({
+      baseUrl: this.baseUrl, fetchImpl,
+      isOnline: () => this.navigator?.onLine !== false,
+      connect: () => this.worker.connect(),
+      readControl: () => this.worker.readControl(),
+      onChange: () => this.emit(),
     });
     this.workerSetupTimedOut = false;
     this.workerRegistrationFailed = false;
     this.workerRegistrationRetry = null;
     this.getCacheStorage = getCacheStorage;
     this.store = new OfflineBookStore(this.baseUrl, null);
+    this.storageSpace = new OfflineDownloadSpace({
+      getStorage: () => this.navigator.storage,
+      canReclaimBytes: (...args) => this.store.canReclaimBytes(...args),
+    });
     this.supported = false;
     try {
       this.store.cacheStorage = this.getCacheStorage();
@@ -82,25 +92,63 @@ export class OfflineManager {
     this.active = null;
     this.repairable = null;
     this.staging = null;
+    this.resetId = "";
     this.stagingCheck = null;
     this.phase = "idle";
     this.abortController = null;
     this.currentPromise = null;
+    this.tabSync = new OfflineTabSync({
+      name: this.coordinationName, navigatorObject,
+      canRead: () => Boolean(this.cacheStorage),
+      waitForPublished: () => this.publishedReady,
+      isLocallyBusy: () => Boolean(this.currentPromise || this.cleanupJobs),
+      readPublished: (full, signal) => this.readPublishedBook(full, signal),
+      getDraft: () => this.staging,
+      inspectDraft: async (draft, signal) => {
+        if (!hasAllChunks(draft)) return null;
+        return this.store.completionFor(draft, draft, signal);
+      },
+      onSync: (records, staged) => {
+        this.updateDownloadState(records);
+        if (staged) this.stagingCheck = staged.completion;
+        this.restoreRestingPhase();
+      },
+    });
+    this.inventory = new OfflineInventory({
+      store: this.store,
+      canInspect: () => this.supported && !this.currentPromise,
+      canWrite: () => this.worker.supportsOfflineWrites(),
+      withLock: (...args) => this.withLock(...args),
+      onVerified: (records, abandoned) => {
+        if (abandoned.length) this.cleanupJobs.push((signal) => this.store.deletePublicationCaches(abandoned, signal));
+        this.updateDownloadState({ saved: records.saved, staging: records.staging, resetId: records.resetId, deferDamageCleanup: true });
+      },
+      onReconciled: (result) => this.applyReconciledDownloads(result),
+      onFailure: (error) => { if (isAccessDenied(error)) this.supported = false; },
+    });
     this.damage = new OfflineDamageRecovery({
       canRun: () => this.supported && !this.currentPromise,
-      inspect: () => this.inspectAndReconcileDownloads(true),
+      inspect: () => this.inventory.scan(true),
       sync: () => this.syncPublishedDownload(),
     });
     this.pendingDamageRetirements = new Set();
     this.publishedRevision = 0;
     this.publishedReady = Promise.resolve();
+    this.playback = createOfflinePlayback({
+      routes: this.routes,
+      getActive: () => this.active,
+      isSupported: () => this.supported,
+      hasController: () => this.worker.readControl().controlled,
+      waitForPublished: () => this.publishedReady,
+    });
   }
 
   get cacheStorage() { return this.store.cacheStorage; }
 
   get busy() { return ["preparing", "downloading", "finalizing", "publishing-repair"].includes(this.phase); }
   get canCancel() {
-    return this.busy ? this.phase === "preparing" || this.phase === "downloading" : Boolean(this.staging);
+    return this.busy ? this.phase === "preparing" || this.phase === "downloading"
+      : Boolean(this.staging && !this.tabSync.lockBusy && !this.tabSync.lockUnavailable);
   }
 
   get progress() {
@@ -113,12 +161,13 @@ export class OfflineManager {
       ? this.stagingCheck.status : "downloading";
     return {
       supported: this.supported,
-      canWrite: this.worker.canWriteOfflineJournal,
+      canWrite: this.worker.canWriteOfflineJournal && !this.tabSync.lockUnavailable,
       active: this.active,
       repairable: this.repairable,
       staging: this.staging,
       phase: this.phase,
       busy: this.busy,
+      writeLockBusy: Boolean(this.staging && this.tabSync.lockBusy && !this.busy && !this.cleanupJobs),
       canCancel: this.canCancel,
       stagingStatus,
       canFinishOffline: stagingStatus === "ready",
@@ -154,6 +203,10 @@ export class OfflineManager {
     this.emit();
   }
 
+  restoreRestingPhase() {
+    this.setPhase(this.staging ? "paused" : this.active ? "ready" : "idle");
+  }
+
   async init() {
     if (!this.supported) { this.emit(); return this.snapshot(); }
     this.worker.listen(({ downloadId, index }) => {
@@ -163,9 +216,19 @@ export class OfflineManager {
       this.store.reportDamagedChunk(downloadId, index);
       this.damage.report();
     }, () => {
-      void this.worker.supportsOfflineWrites().then(() => this.recoverFromWorkerTimeout()).then(() => this.emit()).catch((error) => {
+      void this.worker.supportsOfflineWrites().then(async (writable) => {
+        await this.recoverFromWorkerTimeout();
+        this.emit();
+        if (writable) {
+          await this.damage.check;
+          this.damage.resume();
+        }
+      }).catch((error) => {
         console.warn("[CompactAudioPlayer] Could not recover offline controls after the worker took control.", error);
       });
+    }, () => {
+      void this.playback.connectionChanged();
+      this.emit();
     });
     const registration = this.worker.register().catch((error) => {
       console.warn("[CompactAudioPlayer] Could not register the offline player.", error);
@@ -182,7 +245,7 @@ export class OfflineManager {
     await registration;
     await this.publishedReady;
     if (this.supported) await this.refresh();
-    await this.worker.prepare(this.active);
+    await this.routes.prepare(this.active);
     this.emit();
     return this.snapshot();
   }
@@ -195,7 +258,7 @@ export class OfflineManager {
     this.supported = true;
     this.emit();
     await this.refresh();
-    await this.worker.prepare(this.active);
+    await this.routes.prepare(this.active);
   }
 
   async preparePublishedAtStartup(registration) {
@@ -205,9 +268,13 @@ export class OfflineManager {
     const prepare = async () => {
       if (!this.worker.controller) await registration;
       if (signal.aborted || (!this.supported && !this.worker.controller)) return;
-      let read = await this.readPublishedBook(false, signal);
-      if (!read && !signal.aborted) read = await this.readPublishedBook(false, signal);
-      if (read && !signal.aborted) await this.worker.prepare(this.active);
+      for (let attempt = 0; attempt < 2 && !signal.aborted; attempt++) {
+        const read = await this.readPublishedBook(false, signal);
+        if (!read || !await read.isCurrent() || signal.aborted) continue;
+        this.updateDownloadState(read.records);
+        await this.routes.prepare(this.active);
+        return;
+      }
     };
     try {
       const deadline = new Promise((resolve) => {
@@ -220,66 +287,11 @@ export class OfflineManager {
     }
   }
 
-  listenForPublishedChanges(BroadcastChannel) {
-    if (this.changeChannel || !this.cacheStorage || typeof BroadcastChannel !== "function") return;
-    try {
-      this.changeChannel = new BroadcastChannel(`compact-player-offline:${this.baseUrl}`);
-      this.changeChannel.addEventListener("message", ({ data }) => {
-        if (data === PUBLISHED_DOWNLOAD_CHANGED) void this.syncPublishedDownload(true, { changed: true });
-      });
-    } catch (error) {
-      console.warn("[CompactAudioPlayer] Could not listen for offline changes in other tabs.", error);
-    }
-  }
+  listenForPublishedChanges(BroadcastChannel) { this.tabSync.listen(BroadcastChannel); }
 
-  announcePublishedChange() {
-    try { this.changeChannel?.postMessage(PUBLISHED_DOWNLOAD_CHANGED); }
-    catch (error) { console.warn("[CompactAudioPlayer] Could not tell other tabs about the offline change.", error); }
-  }
+  announcePublishedChange() { this.tabSync.announce(); }
 
-  syncPublishedDownload(syncStaging = true, { changed = false } = {}) {
-    if (!this.cacheStorage) return Promise.resolve();
-    const running = this.publishedSync;
-    if (running) {
-      if (changed || (syncStaging && !running.syncStaging)) running.next = Boolean(running.next || syncStaging);
-      return running.promise;
-    }
-    const job = { syncStaging, next: null };
-    job.promise = Promise.resolve().then(async () => {
-      try {
-        do {
-          await this.syncPublishedPass(job.syncStaging);
-          job.syncStaging = job.next;
-          job.next = null;
-        } while (job.syncStaging !== null);
-      } finally {
-        this.publishedSync = null;
-      }
-    });
-    this.publishedSync = job;
-    return job.promise;
-  }
-
-  async syncPublishedPass(syncStaging) {
-    const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the published download timed out.");
-    try {
-      await prepareWithTimeout(async (signal) => {
-        await this.publishedReady;
-        checkCanceled(signal);
-        if (this.currentPromise) {
-          this.publishedSyncPending = true;
-          return;
-        }
-        let read = await this.readPublishedBook(syncStaging, signal);
-        if (!read && !signal.aborted && !this.currentPromise) read = await this.readPublishedBook(syncStaging, signal);
-        if (read && !signal.aborted) {
-          this.setPhase(this.staging ? "paused" : this.active ? "ready" : "idle");
-        }
-      }, undefined, PUBLISHED_SYNC_TIMEOUT_MS, timeout);
-    } catch (error) {
-      console.warn("[CompactAudioPlayer] Could not sync the published offline book.", error);
-    }
-  }
+  syncPublishedDownload(syncStaging, options) { return this.tabSync.request(syncStaging, options); }
 
   metaCache() { return this.store.metaCache(); }
   readRecord(type, includeUnpublished, signal) { return this.store.readRecord(type, includeUnpublished, signal); }
@@ -295,7 +307,7 @@ export class OfflineManager {
     if (!await this.worker.supportsOfflineWrites()) throw unsupported();
     const jobs = [];
     try {
-      return await withOfflineLock(this.navigator, `compact-player-offline:${this.baseUrl}`, async () => {
+      return await withOfflineLock(this.navigator, this.coordinationName, async () => {
         if (!await this.worker.supportsOfflineWrites() || !this.worker.canWriteOfflineJournal) throw unsupported();
         this.cleanupJobs = jobs;
         try { return await action(); }
@@ -303,6 +315,7 @@ export class OfflineManager {
       }, whenBusy, waitMs);
     } finally {
       for (const job of jobs) void this.cleanup(job);
+      this.tabSync.operationSettled();
     }
   }
 
@@ -330,28 +343,38 @@ export class OfflineManager {
       }
       this.pendingDamageRetirements.clear();
     }
+    if (resetId !== undefined) this.resetId = resetId || "";
     if (resetId) this.store.setDamageEpoch(resetId);
-    if (saved !== undefined) void this.worker.prepare(this.active);
+    if (saved !== undefined) void this.routes.prepare(this.active);
   }
 
   recordIds() {
-    return { activeId: this.active?.downloadId, repairableId: this.repairable?.downloadId, stagingId: this.staging?.downloadId };
+    return { resetId: this.resetId, activeId: this.active?.downloadId,
+      repairableId: this.repairable?.downloadId, stagingId: this.staging?.downloadId };
+  }
+
+  async readDownloadVersion(signal, expected = this.recordIds()) {
+    const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the offline reset record timed out.");
+    const { resetId } = await prepareWithTimeout((readSignal) => this.store.readActiveState(readSignal),
+      signal, RECORD_CHECK_TIMEOUT_MS, timeout);
+    return { ...expected, resetId: resetId || "" };
   }
 
   updateIfCurrent(expected, action, signal) {
     return this.withLock(async () => {
       const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the saved download records timed out.");
       const { saved, staging, resetId } = await prepareWithTimeout(async (readSignal) => {
-        const current = await this.inventoryRecords(readSignal, false);
+        const current = await this.inventory.readRecords(readSignal, false);
         checkCanceled(readSignal);
         if (current.saved?.status === "ready" && current.saved.downloadId === expected.repairableId) {
           current.saved = await this.store.checkReadyConfig(current.saved, readSignal);
         }
         return current;
-      }, signal, INVENTORY_CHECK_TIMEOUT_MS, timeout);
+      }, signal, RECORD_CHECK_TIMEOUT_MS, timeout);
       checkCanceled(signal);
-      this.updateDownloadState({ saved, staging });
-      if (this.active?.downloadId !== expected.activeId || this.repairable?.downloadId !== expected.repairableId
+      this.updateDownloadState({ saved, staging, resetId: resetId || "" });
+      if (this.resetId !== (expected.resetId || "") || this.active?.downloadId !== expected.activeId
+        || this.repairable?.downloadId !== expected.repairableId
         || this.staging?.downloadId !== expected.stagingId) {
         this.emit();
         return offlineConflict();
@@ -362,42 +385,43 @@ export class OfflineManager {
 
   async readPublishedBook(syncStaging = false, signal) {
     const revision = ++this.publishedRevision;
+    const failed = (error) => {
+      if (!signal?.aborted) console.warn("[CompactAudioPlayer] Could not read the published offline book.", error);
+      return null;
+    };
     try {
       const snapshot = await this.store.readControlSnapshot(signal);
       const state = await this.store.readActiveState(signal, false, snapshot);
       const saved = await this.store.readRecord("active", true, signal, state);
-      if (signal?.aborted) return false;
+      if (signal?.aborted) return null;
       const checked = saved?.status === "ready" ? await this.store.checkReadyConfig(saved, signal) : saved;
-      if (signal?.aborted) return false;
+      if (signal?.aborted) return null;
       const staging = syncStaging ? (await this.store.readStagingState(false, signal, state, snapshot)).manifest : null;
-      if (signal?.aborted || revision !== this.publishedRevision) return false;
-      if (snapshot) {
-        const current = await this.store.readControlSnapshot(signal);
-        if (signal?.aborted || revision !== this.publishedRevision) return false;
-        if (JSON.stringify(current) !== JSON.stringify(snapshot)) return false;
-      }
-      if (syncStaging && this.currentPromise) {
-        this.publishedSyncPending = true;
-        return false;
-      }
-      this.updateDownloadState({
-        saved: checked, resetId: state.resetId,
-        staging: syncStaging ? (staging?.downloadId !== saved?.downloadId ? staging : null) : undefined,
-      });
-      return true;
+      if (signal?.aborted || revision !== this.publishedRevision) return null;
+      const isCurrent = async () => {
+        const current = snapshot && await this.store.readControlSnapshot(signal).catch(failed);
+        return !signal?.aborted && revision === this.publishedRevision && JSON.stringify(current) === JSON.stringify(snapshot);
+      };
+      const records = { saved: checked, resetId: state.resetId,
+        staging: syncStaging ? (staging?.downloadId !== saved?.downloadId ? staging : null) : undefined };
+      return { records, isCurrent };
     } catch (error) {
-      if (!signal?.aborted) console.warn("[CompactAudioPlayer] Could not read the published offline book.", error);
+      return failed(error);
     }
   }
 
   async refresh() {
     if (!this.supported || this.currentPromise) return this.snapshot();
     try {
-      const outcome = await this.inspectAndReconcileDownloads();
+      const outcome = await this.inventory.scan();
       if (outcome !== "applied" && outcome !== "timed-out") await this.syncPublishedDownload();
     } catch (error) {
+      if (error?.code === "unsupported") {
+        await this.syncPublishedDownload();
+        return this.snapshot();
+      }
       console.warn("[CompactAudioPlayer] Could not access the offline lock. Reading the published book.", error);
-      this.supported = false;
+      if (isAccessDenied(error) || error?.name === "NotSupportedError") this.supported = false;
       await this.syncPublishedDownload(false);
       this.emit();
     } finally {
@@ -406,156 +430,68 @@ export class OfflineManager {
     return this.snapshot();
   }
 
-  async inventoryRecords(signal, includeUnpublishedStaging = true) {
-    const state = await this.store.readActiveState(signal);
-    const [saved, stagingState] = await Promise.all([
-      this.store.readRecord("active", true, signal, state),
-      this.store.readStagingState(includeUnpublishedStaging, signal, state),
-    ]);
-    const partial = stagingState.manifest;
-    return { saved, staging: partial?.downloadId === saved?.downloadId ? null : partial,
-      stagingAuthoritative: stagingState.authoritative, revision: state.revision, resetId: state.resetId,
-      journalCaches: [state.journalCacheName, state.previousJournalCacheName] };
-  }
-
-  async inspectAndReconcileDownloads(waitForLock = false) {
-    if (!this.supported || this.currentPromise) return "busy";
-    if (!await this.worker.supportsOfflineWrites()) return "busy";
-    if (waitForLock) {
-      const available = await this.withLock(() => true, () => false);
-      if (!available) return "lock-timeout";
-    }
-    let records;
-    let inventory;
-    try {
-      const timeout = new OfflineDownloadError("storage-read-timeout", "Scanning the offline caches timed out.");
-      ({ records, inventory } = await prepareWithTimeout(async (signal) => {
-        const records = await this.inventoryRecords(signal);
-        checkCanceled(signal);
-        const inventory = await this.store.inspectDownloads(records, signal);
-        return { records, inventory };
-      }, undefined, INVENTORY_SCAN_TIMEOUT_MS, timeout));
-    } catch (error) {
-      if (error?.code === "storage-read-timeout" || error?.name === "TimeoutError") {
-        console.warn("[CompactAudioPlayer] Offline cache scan timed out.", error);
-        return "timed-out";
-      }
-      return this.inventoryFailed(error);
-    }
-    try {
-      return await this.withLock(() => this.applyInventory(records, inventory), waitForLock ? undefined : () => "busy",
-        waitForLock ? INVENTORY_LOCK_TIMEOUT_MS : undefined);
-    } catch (error) {
-      if (waitForLock && error?.name === "TimeoutError") return "lock-timeout";
-      throw error;
-    }
-  }
-
-  async applyInventory(records, inventory) {
-    if (!this.supported || this.currentPromise) return "busy";
-    try {
-      const timeout = new OfflineDownloadError("storage-timeout", "Checking the saved download records timed out.");
-      const stillCurrent = await prepareWithTimeout(async (signal) => {
-        const current = await this.inventoryRecords(signal);
-        checkCanceled(signal);
-        return JSON.stringify(current) === JSON.stringify(records) && this.store.inspectionIsCurrent(inventory, signal);
-      }, undefined, INVENTORY_CHECK_TIMEOUT_MS, timeout);
-      if (!stillCurrent) return "stale";
-      if (this.currentPromise) return "busy";
-      // The write lock and rechecked journal identify abandoned candidates. Candidate names are never reused.
-      const abandoned = inventory.journalCandidates.filter((name) => !records.journalCaches.includes(name));
-      if (abandoned.length) this.cleanupJobs.push((signal) => this.store.deletePublicationCaches(abandoned, signal));
-      this.updateDownloadState({ saved: records.saved, staging: records.staging, deferDamageCleanup: true });
-      await this.store.applyInspection(inventory);
-      await this.reconcileDownloads(records, inventory);
-      return "applied";
-    } catch (error) {
-      return this.inventoryFailed(error);
-    }
-  }
-
-  inventoryFailed(error) {
-    console.warn("[CompactAudioPlayer] Could not reconcile offline downloads. Reading the published book.", error);
-    if (isAccessDenied(error)) this.supported = false;
-    return "failed";
-  }
-
-  async reconcileDownloads({ resetId }, { bookNames, active, staging, damaged, completion, damageRevision }) {
+  async applyReconciledDownloads({ saved, staging, resetId, completion, damageRevision, publication, bookNames, changed }) {
     this.stagingCheck = completion;
-    const candidate = completion?.status === "ready" ? completion : active;
-    const recoveredStaging = staging && staging.downloadId !== candidate?.downloadId
-      && staging.downloadId !== this.staging?.downloadId ? staging : undefined;
-    this.updateDownloadState({ staging, deferDamageCleanup: true });
-    if (candidate && candidate.downloadId !== this.active?.downloadId) {
-      return this.publish(candidate, bookNames, undefined, { recoveredStaging, damageRevision });
+    if (publication) {
+      this.updateDownloadState({ staging, deferDamageCleanup: true });
+      return this.publish(publication.candidate, bookNames, undefined,
+        { recoveredStaging: publication.recoveredStaging, damageRevision });
     }
-    const previous = this.active || this.repairable;
-    const published = active || damaged;
-    const retired = previous && !published && staging?.downloadId !== previous.downloadId
-      ? { status: "removed", downloadId: previous.downloadId } : published;
-    if (recoveredStaging) await this.store.commitActive(retired, { recoveredStaging });
-    else await this.store.reconcileRecord("active", previous, retired);
-    this.updateDownloadState({ saved: published ?? null, staging, resetId, damageRevision });
-    if (previous?.status !== published?.status || previous?.downloadId !== published?.downloadId) this.announcePublishedChange();
+    this.updateDownloadState({ saved, staging, resetId, damageRevision });
+    if (changed) this.announcePublishedChange();
     this.queueBookCleanup(bookNames, resetId);
-    this.setPhase(this.staging ? "paused" : "idle");
+    this.restoreRestingPhase();
   }
 
-  async inspectSource(selection, signal) {
+  async inspectSource(selection, signal, records = this.recordIds()) {
+    return (await this.planDownload(selection, signal, records)).check;
+  }
+
+  async planDownload(selection, signal, records) {
     checkCanceled(signal);
     if (!this.supported) throw new OfflineDownloadError("unsupported", "Offline downloads are not supported.");
     if (this.navigator.onLine === false) throw new OfflineDownloadError("offline", "Connect to the internet before downloading.");
     const sourceUrl = new URL(selection.sourceUrl);
     if (sourceUrl.origin !== new URL(this.baseUrl).origin) throw new OfflineDownloadError("cross-origin", "Offline downloads require audio from this site.");
-    const { mime, ...representation } = await prepareWithTimeout(
+    const expected = await this.readDownloadVersion(signal, records);
+    const representation = await prepareWithTimeout(
       (boundedSignal) => inspectAudioRange(this.fetchImpl, sourceUrl.href, selection.mime, boundedSignal), signal,
     );
-    return { ...representation, mime, ...this.recordIds(), ...await this.downloadSpace(selection, representation, signal) };
+    const draft = this.staging;
+    const inspection = draft?.completed.length && canResumeTransfer(draft, selection, representation)
+      ? await this.inspectResumeDraft(draft, signal) : null;
+    const space = await this.storageSpace.inspect(selection, representation, inspection?.manifest ?? draft, signal);
+    return { check: { ...representation, ...expected, ...space }, draft, inspection };
   }
 
-  async estimateAvailableBytes(signal) {
-    try {
-      const estimate = await prepareWithTimeout(
-        () => this.navigator.storage?.estimate?.(), signal, STORAGE_ESTIMATE_TIMEOUT_MS,
-      );
-      if (Number.isFinite(estimate?.quota) && Number.isFinite(estimate?.usage)) return Math.max(0, estimate.quota - estimate.usage);
-    } catch {
-      checkCanceled(signal);
+  async inspectResumeDraft(draft, signal) {
+    const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the interrupted download timed out.");
+    const inspection = await prepareWithTimeout((readSignal) => this.store.inspectBookManifest(draft.cacheName, draft,
+      { restoreMissing: false, verifyCompleted: true, signal: readSignal }), signal, PREPARATION_TIMEOUT_MS, timeout);
+    if (!sameDownload(inspection.manifest, draft) || inspection.manifest.status !== "downloading") {
+      throw new OfflineDownloadError("manifest", "Invalid interrupted download manifest.");
     }
-    return null;
+    return inspection;
   }
 
-  async downloadSpace(selection, representation, signal) {
-    const stagingMatches = canResumeTransfer(this.staging, selection, representation);
-    const remainingBytes = representation.totalSize - (stagingMatches ? completedBytes(this.staging) : 0);
-    const availableBytes = await this.estimateAvailableBytes(signal);
-    const reserve = Math.max(16 * MEBIBYTE, Math.ceil(representation.totalSize * .05));
-    return {
-      remainingBytes,
-      availableBytes,
-      requiredBytes: remainingBytes + reserve,
-      canResume: Boolean(stagingMatches),
-    };
-  }
-
-  async requestPersistence() {
-    try {
-      if (!this.navigator.storage?.persist) return null;
-      return await this.navigator.storage.persist();
-    } catch { return false; }
-  }
-
-  async checkSpaceBeforeWrite(selection, check, signal) {
-    const space = await this.downloadSpace(selection, check, signal);
-    const current = { ...check, ...space, reclaimStaging: false };
-    if (current.availableBytes == null || current.availableBytes >= current.requiredBytes) return current;
-    const deficit = current.requiredBytes - current.availableBytes;
-    const staged = this.staging;
-    const replacing = !current.canResume && staged && staged.cacheName !== (this.active || this.repairable)?.cacheName;
-    const fits = replacing && completedBytes(staged) >= deficit && await this.store.canReclaimBytes(staged, deficit, signal);
+  async prepareResume(selection, check, plan, signal) {
+    const draft = this.staging;
+    if (!draft?.completed.length || !canResumeTransfer(draft, selection, check)) return;
+    let inspection = plan?.inspection;
+    const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the interrupted download timed out.");
+    const current = inspection && JSON.stringify(plan.draft) === JSON.stringify(draft)
+      && await prepareWithTimeout((readSignal) => this.store.inspectionIsCurrent({ inspections: [inspection] }, readSignal),
+        signal, RECORD_CHECK_TIMEOUT_MS, timeout);
+    // Cache Storage can lose a chunk without changing either manifest.
+    const cached = current && await prepareWithTimeout((readSignal) => this.store.hasCachedChunks(inspection.manifest, readSignal),
+      signal, PREPARATION_TIMEOUT_MS, timeout);
+    if (!cached) inspection = await this.inspectResumeDraft(draft, signal);
+    await this.store.applyInspection({ inspections: [inspection] }, signal);
     checkCanceled(signal);
-    if (!fits) throw new OfflineDownloadError("quota", "Insufficient browser storage.");
-    return { ...current, reclaimStaging: true };
+    if (JSON.stringify(inspection.manifest) !== JSON.stringify(draft)) {
+      await this.writeRecord("staging", inspection.manifest, signal);
+      this.updateDownloadState({ staging: inspection.manifest });
+    }
   }
 
   async putManifest(files, manifest, signal) {
@@ -581,10 +517,21 @@ export class OfflineManager {
     return { files, manifest, configPrepared: Boolean(previous) };
   }
 
-  async cacheSupportingAssets(files, assets, configUrl, signal) {
-    for (const asset of assets || []) {
+  async cacheSupportingAssets(files, assets, configUrl, availableForAssets, signal) {
+    if (!Array.isArray(assets)) return;
+    const base = new URL(this.baseUrl);
+    const libraryUrl = new URL("media/library.json", base).href;
+    const internalPath = new URL(".", offlineManifestUrl(this.baseUrl)).pathname;
+    for (const asset of assets) {
       const url = String(asset?.url || "");
-      if (!url || url === configUrl || new URL(url).origin !== new URL(this.baseUrl).origin) continue;
+      if (!url || url === configUrl) continue;
+      try {
+        const assetUrl = new URL(url);
+        if (assetUrl.origin !== base.origin || assetUrl.pathname.startsWith(internalPath)) continue;
+      }
+      catch { continue; }
+      const limit = asset.required ? coverMaxBytes : Math.min(coverMaxBytes, availableForAssets);
+      if (!limit) continue;
       const save = (assetSignal) => fetchWithRetry(url, {
         fetchImpl: this.fetchImpl, retries: 1, timeoutMs: PREPARATION_TIMEOUT_MS,
         headers: { [OFFLINE_DOWNLOAD_HEADER]: "1" },
@@ -593,16 +540,21 @@ export class OfflineManager {
         signal: assetSignal,
       }, async (response) => {
         if (assetSignal.aborted) {
-          void response.body?.cancel().catch(() => { /* The fetch may already have canceled the body. */ });
+          cancelResponseBody(response.body);
           checkCanceled(assetSignal);
         }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        if (url === new URL("media/library.json", this.baseUrl).href) {
-          const text = await readLibraryText(response, assetSignal);
-          await files.writeAsset(url, new Response(text, { status: response.status, headers: response.headers }));
+        if (!asset.required && url !== libraryUrl && isHtmlResponse(response)) {
+          cancelResponseBody(response.body);
           return;
         }
-        await files.writeAsset(url, response);
+        const bytes = url === libraryUrl
+          ? new TextEncoder().encode(await readLibraryText(response, assetSignal))
+          : await readResponseBytes(response.body, limit, assetSignal);
+        if (!bytes?.byteLength || bytes.byteLength > limit) return;
+        checkCanceled(assetSignal);
+        if (!asset.required) availableForAssets -= bytes.byteLength;
+        await files.writeAsset(url, responseWithDecodedBody(response, bytes));
       });
       try {
         if (asset.required) await save(signal);
@@ -624,12 +576,9 @@ export class OfflineManager {
     this.currentPromise = Promise.resolve().then(() => action(signal)).finally(() => {
       this.abortController = null;
       this.currentPromise = null;
-      if (this.busy) this.setPhase(this.staging ? "paused" : "idle");
+      if (this.busy) this.restoreRestingPhase();
       this.damage.resume();
-      if (this.publishedSyncPending) {
-        this.publishedSyncPending = false;
-        void this.syncPublishedDownload();
-      }
+      this.tabSync.operationSettled();
     });
     this.setPhase("preparing");
     return this.currentPromise;
@@ -647,20 +596,34 @@ export class OfflineManager {
   }
 
   start(selection, preflight, { waitForPriority = async () => {}, confirmDownload = () => true, onPersistence } = {}) {
+    const recordIds = this.recordIds();
     return this.runOperation(async (signal) => {
-      const expected = preflight || this.recordIds();
+      let expected = preflight || recordIds;
+      let heldForTransfer = false;
+      const announceTransfer = () => {
+        heldForTransfer = true;
+        if (this.staging) this.announcePublishedChange();
+      };
       try {
         if (hasAllChunks(this.staging) && sameOfflineSelection(this.staging, selection)) {
-          const ready = await this.updateIfCurrent(expected,
-            () => this.finishStaging(selection, expected, confirmDownload, signal), signal);
+          if (!preflight) expected = await this.readDownloadVersion(signal, recordIds);
+          const ready = await this.updateIfCurrent(expected, () => {
+            announceTransfer();
+            return this.finishStaging(selection, expected, confirmDownload, signal);
+          }, signal);
           if (ready !== undefined) return ready;
         }
-        const check = preflight || await this.inspectSource(selection, signal);
+        const plan = preflight ? null : await this.planDownload(selection, signal, recordIds);
+        const check = preflight || plan.check;
+        expected = check;
         checkCanceled(signal);
         if (!confirmDownload(check, selection)) return null;
-        const persistence = preflight ? null : this.requestPersistence();
+        const persistence = preflight ? null : this.storageSpace.requestPersistence();
         const ready = await this.updateIfCurrent(check, async (resetId) => {
-          const current = await this.checkSpaceBeforeWrite(selection, check, signal);
+          announceTransfer();
+          await this.prepareResume(selection, check, plan, signal);
+          const current = await this.storageSpace.checkBeforeWrite(selection, check,
+            { staging: this.staging, saved: this.active || this.repairable }, signal);
           checkCanceled(signal);
           return this.runDownload(selection, current, signal, waitForPriority, resetId);
         }, signal);
@@ -675,10 +638,12 @@ export class OfflineManager {
           && sameOfflineSelection(this.staging, selection)) {
           await this.updateIfCurrent(expected, async () => {
             await this.removeStagingLocked();
-            this.setPhase("idle");
+            this.restoreRestingPhase();
           });
         }
         throw error;
+      } finally {
+        if (heldForTransfer) this.announcePublishedChange();
       }
     });
   }
@@ -693,8 +658,11 @@ export class OfflineManager {
     const check = { ...expected, totalSize: stored.totalSize, remainingBytes: 0, requiredBytes: 0, canResume: true };
     if (!confirmDownload(check, selection)) return null;
     if (stored.status === "needs-config") {
-      await this.restoreConfig(stored, signal);
-      stored = await this.checkStaging(this.staging, selection, signal);
+      const repaired = await this.restoreConfig(stored, signal);
+      const draft = { ...repaired, status: "downloading" };
+      await this.writeRecord("staging", draft, signal);
+      this.updateDownloadState({ staging: draft });
+      stored = await this.checkStaging(draft, selection, signal);
       if (stored?.status !== "ready") throw new OfflineDownloadError("incomplete", "The saved book is incomplete.");
       checkCanceled(signal);
     }
@@ -709,8 +677,11 @@ export class OfflineManager {
     const text = await prepareWithTimeout(async (requestSignal) => {
       const result = await this.fetchImpl(url, { cache: "no-store", credentials: "same-origin",
         headers: { [OFFLINE_DOWNLOAD_HEADER]: "1" }, signal: requestSignal });
-      checkCanceled(requestSignal);
-      if (!result.ok) throw new OfflineDownloadError("config", "Could not retrieve the saved book configuration.");
+      if (requestSignal.aborted || !result.ok) {
+        cancelResponseBody(result.body);
+        checkCanceled(requestSignal);
+        throw new OfflineDownloadError("config", "Could not retrieve the saved book configuration.");
+      }
       return readBookConfigText(result, requestSignal);
     }, signal);
     checkCanceled(signal);
@@ -719,22 +690,16 @@ export class OfflineManager {
 
   async restoreConfig(candidate, signal) {
     const config = await this.fetchValidatedConfig(candidate, this.store.configUrl(candidate), signal);
-    try {
-      await writeStagingData((writeSignal) => this.store.saveConfig(candidate, config, writeSignal), signal);
-      return config.id;
-    } catch (error) {
-      if (this.staging?.cacheName === candidate.cacheName && (signal.aborted || error?.code === "storage-timeout")) {
-        await this.removeStagingLocked();
-      }
-      throw error;
-    }
+    const stored = await writeStagingData((writeSignal) => this.store.saveConfig(candidate, config, writeSignal), signal);
+    return stored.configBookId ? stored : { ...stored, configBookId: config.id };
   }
 
   async prepareRequiredConfig(manifest, selection, signal) {
     const url = this.store.checkConfigUrl(manifest, this.store.configUrl(selection));
     if (!url) return manifest;
     const expected = { ...manifest, configBookId: manifest.configBookId || selection.configBookId };
-    const id = await this.store.cachedConfigId(expected, url, signal) || await this.restoreConfig(expected, signal);
+    const id = await this.store.cachedConfigId(expected, url, signal);
+    if (!id) return this.restoreConfig(manifest.configBookId ? manifest : expected, signal);
     // Older downloads can record a catalog alias without the book configuration's ID.
     return manifest.configBookId ? manifest : { ...manifest, configBookId: id };
   }
@@ -746,12 +711,12 @@ export class OfflineManager {
       const timeout = new OfflineDownloadError("storage-read-timeout", "Checking the saved book cache timed out.");
       if (candidate?.status !== "needs-config" || this.active
         || !await prepareWithTimeout((readSignal) => this.store.hasBookCache(candidate, readSignal),
-          signal, INVENTORY_CHECK_TIMEOUT_MS, timeout)) {
+          signal, RECORD_CHECK_TIMEOUT_MS, timeout)) {
         throw new OfflineDownloadError("conflict", "The saved download has changed.");
       }
       checkCanceled(signal);
-      await this.restoreConfig(candidate, signal);
-      const ready = await this.store.readBookManifest(candidate.cacheName, candidate, { signal });
+      const repaired = await this.restoreConfig(candidate, signal);
+      const ready = await this.store.readBookManifest(candidate.cacheName, repaired, { signal });
       if (!validManifest(ready, "ready") || ready.downloadId !== candidate.downloadId) {
         throw new OfflineDownloadError("incomplete", "The saved audio is incomplete.");
       }
@@ -778,7 +743,7 @@ export class OfflineManager {
       resetId: committed.resetId, damageRevision });
     this.announcePublishedChange();
     this.queueBookCleanup(bookNames, committed.resetId);
-    this.setPhase(this.staging ? "paused" : "ready");
+    this.restoreRestingPhase();
   }
 
   queueBookCleanup(bookNames, resetId, retiredBook) {
@@ -796,11 +761,28 @@ export class OfflineManager {
     }
   }
 
+  async transferChunks(manifest, files, signal, waitForPriority) {
+    const completed = new Set(manifest.completed);
+    const checksummed = new Set(manifest.checksummedChunks);
+    this.setPhase("downloading");
+    for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
+      await writeStagingData(() => files.writeChunk(index, chunk), signal);
+      checkCanceled(signal);
+      completed.add(index);
+      checksummed.add(index);
+      manifest = { ...manifest, completed: [...completed].sort((a, b) => a - b),
+        checksummedChunks: [...checksummed].sort((a, b) => a - b), chunkRevision: (manifest.chunkRevision ?? 0) + 1 };
+      await this.putManifest(files, manifest, signal);
+      this.setPhase("downloading");
+    }
+    return manifest;
+  }
+
   async runDownload(selection, preflight, signal, waitForPriority, resetId) {
     this.setPhase("preparing");
     const reclaim = preflight.reclaimStaging ? this.staging : null;
     let manifest;
-    let reclaiming = false;
+    let preserveOnTimeout = false;
     try {
       let files;
       let configPrepared = false;
@@ -809,28 +791,30 @@ export class OfflineManager {
         files = await this.store.openStagingFiles(manifest, signal);
       } else ({ files, manifest, configPrepared } = await this.createStaging(selection, preflight, signal, resetId));
       if (reclaim) {
-        reclaiming = true;
+        preserveOnTimeout = true;
         await this.reclaimRetiredStaging(reclaim, resetId, signal);
-        reclaiming = false;
+        preserveOnTimeout = false;
       }
       if (!configPrepared) {
+        preserveOnTimeout = manifest.completed.length > 0;
         const configured = await this.prepareRequiredConfig(manifest, selection, signal);
+        preserveOnTimeout = false;
         if (configured !== manifest) await this.putManifest(files, configured, signal);
         manifest = configured;
       }
-      await this.cacheSupportingAssets(files, selection.assets, this.store.configUrl(manifest), signal);
-      const completed = new Set(manifest.completed);
-      this.setPhase("downloading");
-      for await (const { index, chunk } of downloadChunks(this.fetchImpl, manifest, signal, waitForPriority)) {
-        await writeStagingData(() => files.writeChunk(index, chunk), signal);
-        checkCanceled(signal);
-        completed.add(index);
-        manifest = { ...manifest, completed: [...completed].sort((a, b) => a - b) };
-        await this.putManifest(files, manifest, signal);
-        this.setPhase("downloading");
-      }
+      await this.cacheSupportingAssets(files, selection.assets, this.store.configUrl(manifest), preflight.availableForAssets, signal);
+      manifest = await this.transferChunks(manifest, files, signal, waitForPriority);
       manifest = await this.checkStaging(manifest, selection, signal);
       checkCanceled(signal);
+      if (manifest?.status === "downloading" && canResumeTransfer(manifest, selection, preflight)) {
+        this.updateDownloadState({ staging: manifest });
+        await this.storageSpace.checkBeforeWrite(selection, preflight, { staging: manifest,
+          saved: this.active || this.repairable }, signal);
+        checkCanceled(signal);
+        manifest = await this.transferChunks(manifest, files, signal, waitForPriority);
+        manifest = await this.checkStaging(manifest, selection, signal);
+        checkCanceled(signal);
+      }
       if (!manifest) {
         await this.removeStagingLocked();
         throw new OfflineDownloadError("manifest", "Invalid completed download manifest.");
@@ -844,15 +828,14 @@ export class OfflineManager {
       await this.publish(manifest, undefined, signal);
       return manifest;
     } catch (error) {
-      if ((signal.aborted || (error?.code === "storage-timeout" && !reclaiming)) && this.phase !== "finalizing") {
+      if ((signal.aborted || (error?.code === "storage-timeout" && !preserveOnTimeout)) && this.phase !== "finalizing") {
         if (manifest && this.staging?.downloadId === manifest.downloadId) await this.removeStagingLocked();
         if (signal.aborted) {
-          this.setPhase(this.staging ? "paused" : "idle");
+          this.restoreRestingPhase();
           throw createAbortError("Download canceled");
         }
       }
-      this.setPhase(this.staging ? "paused" : "idle");
-      if (this.staging && this.staging.downloadId === manifest?.downloadId) this.announcePublishedChange();
+      this.restoreRestingPhase();
       if (isQuotaError(error)) throw new OfflineDownloadError("quota", "The browser does not have enough storage for this download.");
       throw error;
     }
@@ -866,7 +849,7 @@ export class OfflineManager {
     } else if (this.staging) {
       await this.updateIfCurrent(this.recordIds(), async () => {
         await this.removeStagingLocked();
-        this.setPhase("idle");
+        this.restoreRestingPhase();
       });
     }
     if (!this.staging && this.repairable?.status === "needs-audio") await this.refresh();
@@ -900,7 +883,7 @@ export class OfflineManager {
       this.updateDownloadState({ saved: null, staging: this.staging });
       this.announcePublishedChange();
       this.queueBookCleanup([saved.cacheName], committed.resetId, saved);
-      this.setPhase(this.staging ? "paused" : "idle");
+      this.restoreRestingPhase();
     });
   }
 
@@ -921,7 +904,7 @@ export class OfflineManager {
       this.updateDownloadState({ saved: null, staging: null, resetId });
       this.stagingCheck = null;
       this.announcePublishedChange();
-      this.setPhase("idle");
+      this.restoreRestingPhase();
       return { resetId, previous };
     }, offlineConflict);
     try {

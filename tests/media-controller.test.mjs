@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MediaController } from "../js/media-controller.js?v=22";
+import { MediaController } from "../js/media-controller.js?v=25";
 
 class FakeAudio extends EventTarget {
   src = "";
@@ -27,6 +27,29 @@ const sources = [
   { id: "aac-128", codec: "aac", bitrate: 128, url: "audio.m4a", availability: "unknown" },
   { id: "mp3-128", codec: "mp3", bitrate: 128, url: "audio.mp3", availability: "unknown" },
 ];
+
+test("Pause cancels pending playback while the offline worker blocks loading", async (t) => {
+  const audio = new FakeAudio();
+  const played = t.mock.fn();
+  audio.playImpl = played;
+  let online = false;
+  const media = new MediaController(audio, { allowNetworkSource: () => online }, { isOnline: () => online });
+  t.after(() => media.destroy());
+  await media.setSelection(sources, sources[0].id, 30);
+  await media.togglePlayback();
+  assert.equal(media.state, "stalled");
+  assert.equal(audio.src, "");
+  assert.equal(media.canPause, true);
+
+  await media.togglePlayback();
+  assert.equal(media.state, "paused");
+  online = true;
+  await media.handleReconnect();
+  assert.equal(played.mock.callCount(), 0);
+  assert.equal(media.position(), 30);
+  await media.requestPlay();
+  assert.equal(played.mock.callCount(), 1);
+});
 
 test("a last-source failure after Pause waits for Play before reporting exhaustion", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -197,6 +220,33 @@ test("losing the network uses a matching saved source on media error and timeout
   await retry.handleReconnect();
   assert.deepEqual(attempts, ["saved-audio", "opus.webm"]);
   retry.destroy();
+});
+
+test("Pause defers the reconnect attempt and codec fallback keeps the network failure evidence", async (t) => {
+  const audio = new FakeAudio();
+  let online = false;
+  const attempts = [];
+  const media = new MediaController(audio, {
+    savedSource: (source) => source === sources[0] ? { url: "saved-audio" } : null,
+  }, { isOnline: () => online });
+  t.after(() => media.destroy());
+  audio.playImpl = async (url) => {
+    attempts.push(url);
+    if (url === "saved-audio") throw new DOMException("Read failed", "NetworkError");
+    if (url === sources[0].url) throw new DOMException("Cannot decode", "NotSupportedError");
+  };
+  await media.setSelection(sources, sources[0].id, 31, true);
+  assert.equal(media.state, "stalled");
+  await media.togglePlayback();
+  online = true;
+  await media.handleReconnect();
+  assert.deepEqual(attempts, ["saved-audio"]);
+  assert.equal(media.state, "paused");
+
+  await media.requestPlay();
+  assert.deepEqual(attempts, ["saved-audio", sources[0].url, "saved-audio", sources[2].url]);
+  assert.equal(media.currentSource(), sources[2]);
+  assert.equal(media.position(), 31);
 });
 
 test("a new Play retries the saved copy after the fallback queue is exhausted", async (t) => {
@@ -748,4 +798,33 @@ test("a rejected seek leaves progress at the actual position until the element a
   assert.equal(media.position(), 20);
   assert.deepEqual(progress, [20]);
   media.destroy();
+});
+
+test("a saved position rejected at loadedmetadata is retried at canplay", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const audio = new FakeAudio();
+  audio.duration = 500;
+  let accepted = false;
+  let actual = 0;
+  Object.defineProperty(audio, "currentTime", {
+    get: () => actual,
+    set(position) {
+      if (!accepted) throw new DOMException("Temporarily unseekable", "InvalidStateError");
+      actual = position;
+    },
+  });
+  const progress = [];
+  const media = new MediaController(audio, { onProgress: (position) => progress.push(position) });
+  t.after(() => media.destroy());
+  await media.setSelection(sources, sources[0].id, 123, true);
+  audio.emit("loadedmetadata");
+  audio.emit("playing");
+  actual = 1;
+  audio.emit("timeupdate");
+  assert.deepEqual(progress, []);
+
+  accepted = true;
+  audio.emit("canplay");
+  assert.equal(audio.currentTime, 123);
+  assert.deepEqual(progress, [123]);
 });

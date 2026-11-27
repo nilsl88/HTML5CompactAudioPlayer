@@ -46,6 +46,43 @@ export function metadataRequestCache(cacheVersion, revalidate = false) {
   return revalidate || cacheVersion != null ? "no-cache" : "default";
 }
 
+export async function readBoundedText(response, signal, maxBytes, tooLarge) {
+  const body = response.body;
+  if (signal?.aborted) {
+    void body?.cancel().catch(() => { /* The fetch may already have canceled the stream. */ });
+    throw createAbortError();
+  }
+  if (!body) return "";
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  let ended = false;
+  const cancel = () => {
+    if (ended) return;
+    ended = true;
+    void reader.cancel().catch(() => { /* A failed stream can reject cancellation. */ });
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (signal?.aborted) throw createAbortError();
+      if (done) {
+        ended = true;
+        return text + decoder.decode();
+      }
+      bytes += value.byteLength;
+      if (bytes > maxBytes) throw tooLarge();
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    cancel();
+    reader.releaseLock();
+  }
+}
+
 export async function fetchWithRetry(url, options = {}, readResponse) {
   const {
     fetchImpl = globalThis.fetch,

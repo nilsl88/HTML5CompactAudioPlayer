@@ -1,6 +1,6 @@
-import { chooseDefaultSource } from "./source-selection.js?v=22";
-import { matchAudioLanguage } from "./config.js?v=22";
-import { matchesDownloadedSource } from "./offline-selection.js?v=22";
+import { chooseDefaultSource } from "./source-selection.js?v=25";
+import { matchAudioLanguage } from "./config.js?v=25";
+import { matchesDownloadedSource, sameOfflineBook } from "./offline-selection.js?v=25";
 
 function preferredSource(sources, id) {
   return sources.find((source) => source.url && source.id === id && source.availability !== "missing") || chooseDefaultSource(sources);
@@ -11,14 +11,15 @@ export class BookSelection {
     this.bookId = bookId;
     this.byLanguage = sources;
     this.saveSelection = saveSelection;
-    const offline = downloaded?.episodeId === bookId && String(downloaded.cacheVersion) === String(book.cacheVersion) ? downloaded : null;
+    const offline = sameOfflineBook(downloaded, { episodeId: bookId, configBookId: book.id, cacheVersion: book.cacheVersion })
+      ? downloaded : null;
     const codes = [...sources.keys()];
     const downloadedCodes = offline ? codes.filter((code) =>
       sources.get(code).some((source) => matchesDownloadedSource(offline, code, source))) : [];
-    this.languageCode = matchAudioLanguage([offline?.languageCode], downloadedCodes, book.defaultLanguage)
-      || matchAudioLanguage([offline?.languageCode, preferences.language, ...browserLanguages], codes, book.defaultLanguage)
+    this.languageCode = matchAudioLanguage([offline?.languageTag || offline?.languageCode], downloadedCodes, book.defaultLanguage)
+      || matchAudioLanguage([preferences.language, ...browserLanguages], codes, book.defaultLanguage)
       || book.defaultLanguage;
-    const savedAudio = offline && this.sources.find((source) => source.id === offline.sourceId && source.url === offline.sourceUrl);
+    const savedAudio = offline && this.sources.find((source) => matchesDownloadedSource(offline, this.languageCode, source));
     this.source = savedAudio || preferredSource(this.sources, preferences.quality);
     if (!this.source) throw new Error("No configured audio source can be selected for this browser.");
     this.preferredId = this.source.id;

@@ -1,4 +1,4 @@
-import { normalizeLanguageTag } from "./js/utils.js?v=22";
+import { normalizeLanguageTag } from "./js/utils.js?v=25";
 
 export const UI_STRINGS = {
   en: {
@@ -19,6 +19,7 @@ export const UI_STRINGS = {
     timeLeftMinutes: "{m} minutes left",
     timeLeftHoursMinutes: "{h} hours, {m} minutes left",
     seek: "Seek",
+    seekPosition: "{position} of {duration}",
     chapters: "Chapters",
     prevChapter: "Previous chapter",
     nextChapter: "Next chapter",
@@ -126,6 +127,7 @@ export const UI_STRINGS = {
     offlinePreparing: "Checking download…",
     offlineDownloading: "{percent}% downloaded • {size} of {total}",
     offlinePaused: "Download paused at {percent}%.",
+    offlineStorageBusy: "Offline storage is busy in another tab.",
     offlineReady: "Available offline • {size}",
     offlineSavedOther: "Downloaded: {book} • {language} • {quality} • {size}",
     offlineCancel: "Cancel download",
@@ -166,6 +168,7 @@ export const UI_STRINGS = {
     timeLeftMinutes: "{m} minutter tilbage",
     timeLeftHoursMinutes: "{h} timer, {m} minutter tilbage",
     seek: "Spol",
+    seekPosition: "{position} af {duration}",
     chapters: "Kapitler",
     prevChapter: "Forrige kapitel",
     nextChapter: "Næste kapitel",
@@ -273,6 +276,7 @@ export const UI_STRINGS = {
     offlinePreparing: "Kontrollerer download…",
     offlineDownloading: "{percent} % hentet • {size} af {total}",
     offlinePaused: "Download sat på pause ved {percent} %.",
+    offlineStorageBusy: "Offlinelageret bruges i en anden fane.",
     offlineReady: "Tilgængelig offline • {size}",
     offlineSavedOther: "Hentet: {book} • {language} • {quality} • {size}",
     offlineCancel: "Annuller download",
@@ -313,6 +317,7 @@ export const UI_STRINGS = {
     timeLeftMinutes: "{m} minutter igjen",
     timeLeftHoursMinutes: "{h} timer, {m} minutter igjen",
     seek: "Spol",
+    seekPosition: "{position} av {duration}",
     chapters: "Kapitler",
     prevChapter: "Forrige kapittel",
     nextChapter: "Neste kapittel",
@@ -420,6 +425,7 @@ export const UI_STRINGS = {
     offlinePreparing: "Kontrollerer nedlasting…",
     offlineDownloading: "{percent} % lastet ned • {size} av {total}",
     offlinePaused: "Nedlastingen er satt på pause ved {percent} %.",
+    offlineStorageBusy: "Frakoblet lagring er i bruk i en annen fane.",
     offlineReady: "Tilgjengelig uten nett • {size}",
     offlineSavedOther: "Lastet ned: {book} • {language} • {quality} • {size}",
     offlineCancel: "Avbryt nedlasting",
@@ -460,6 +466,7 @@ export const UI_STRINGS = {
     timeLeftMinutes: "{m} minuter kvar",
     timeLeftHoursMinutes: "{h} timmar, {m} minuter kvar",
     seek: "Spola",
+    seekPosition: "{position} av {duration}",
     chapters: "Kapitel",
     prevChapter: "Föregående kapitel",
     nextChapter: "Nästa kapitel",
@@ -567,6 +574,7 @@ export const UI_STRINGS = {
     offlinePreparing: "Kontrollerar nedladdning…",
     offlineDownloading: "{percent} % nedladdat • {size} av {total}",
     offlinePaused: "Nedladdningen pausades vid {percent} %.",
+    offlineStorageBusy: "Offlinelagringen används i en annan flik.",
     offlineReady: "Tillgänglig offline • {size}",
     offlineSavedOther: "Nedladdat: {book} • {language} • {quality} • {size}",
     offlineCancel: "Avbryt nedladdning",

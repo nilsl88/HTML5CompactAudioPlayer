@@ -1,6 +1,7 @@
-import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js?v=22";
-import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=22";
-export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=22";
+import { uint64, findAtoms, payload, parseBoxes } from "./mp4-atoms.js?v=25";
+import { loadMp4Metadata, RangeReader, MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=25";
+import { createAbortError } from "./utils.js?v=25";
+export { MP4_METADATA_CHUNK_BYTES, MP4_METADATA_LIMIT_BYTES } from "./mp4-metadata.js?v=25";
 export const MP4_COVER_LIMIT_BYTES = 10 * 1024 * 1024;
 const MAX_QUICKTIME_SAMPLES = 10_000;
 const MAX_SAMPLE_GAP_BYTES = 4096;
@@ -21,7 +22,7 @@ export function decodeMp4ChapterTitle(bytes) {
 }
 
 function parseNeroChapters(atom) {
-  const bytes = new Uint8Array(payload(atom));
+  const bytes = payload(atom);
   if (bytes.length < 9) return [];
   for (const countOffset of [8, 4]) {
     const count = bytes[countOffset];
@@ -47,7 +48,7 @@ function parseNeroChapters(atom) {
 function parseTrackId(trak) {
   const atom = findAtoms(payload(trak), "tkhd", { absoluteStart: trak.start + trak.headerSize })[0];
   if (!atom) return 0;
-  const bytes = new Uint8Array(payload(atom));
+  const bytes = payload(atom);
   const version = bytes[0];
   const offset = version === 1 ? 20 : 12;
   return bytes.length >= offset + 4 ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, false) : 0;
@@ -56,7 +57,7 @@ function parseTrackId(trak) {
 function chapterReferences(trak) {
   const atom = findAtoms(payload(trak), "chap", { absoluteStart: trak.start + trak.headerSize })[0];
   if (!atom) return [];
-  const bytes = new Uint8Array(payload(atom));
+  const bytes = payload(atom);
   if (atom.truncated || bytes.length % 4 !== 0) throw new Error("The QuickTime chapter track reference is incomplete.");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const values = [];
@@ -80,7 +81,7 @@ function parseChapterTrack(trak) {
   const mdhd = findAtoms(payload(trak), "mdhd", { absoluteStart: trak.start + trak.headerSize })[0];
   const stbl = findAtoms(payload(trak), "stbl", { absoluteStart: trak.start + trak.headerSize })[0];
   if (!mdhd || !stbl) throw invalidMapping();
-  const mdhdBytes = new Uint8Array(payload(mdhd));
+  const mdhdBytes = payload(mdhd);
   const mdhdView = new DataView(mdhdBytes.buffer, mdhdBytes.byteOffset, mdhdBytes.byteLength);
   const mdhdVersion = mdhdBytes[0];
   const timescaleOffset = mdhdVersion === 1 ? 20 : 12;
@@ -147,10 +148,11 @@ function embeddedCoverMime(bytes) {
 
 export async function loadEmbeddedMp4Cover(url, options = {}) {
   const { moovBuffer } = await loadMp4Metadata(url, options);
+  if (options.signal?.aborted) throw createAbortError();
   for (const cover of findAtoms(moovBuffer, "covr")) {
-    const dataAtoms = parseBoxes(payload(cover)).filter((atom) => atom.type === "data" && !atom.truncated);
-    for (const dataAtom of dataAtoms) {
-      const bytes = new Uint8Array(payload(dataAtom));
+    for (const dataAtom of parseBoxes(payload(cover))) {
+      if (dataAtom.type !== "data" || dataAtom.truncated) continue;
+      const bytes = payload(dataAtom);
       if (bytes.length <= 8 || bytes.length - 8 > MP4_COVER_LIMIT_BYTES) continue;
       const image = bytes.subarray(8);
       const mime = embeddedCoverMime(image);
@@ -163,6 +165,7 @@ export async function loadEmbeddedMp4Cover(url, options = {}) {
 export async function loadEmbeddedMp4Chapters(url, options = {}) {
   const deadline = Date.now() + (options.timeoutMs ?? 20000);
   const metadata = await loadMp4Metadata(url, options);
+  if (options.signal?.aborted) throw createAbortError();
   const { moovBuffer } = metadata;
   const nero = findAtoms(moovBuffer, "chpl");
   const neroChapters = nero.flatMap(parseNeroChapters);
@@ -203,7 +206,7 @@ export async function loadEmbeddedMp4Chapters(url, options = {}) {
     let bytes;
     try { bytes = await reader.read(start, end); }
     catch (error) {
-      metadata.discard();
+      if (!options.signal?.aborted) metadata.discard();
       throw error;
     }
     for (; i < next; i++) {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PlayerStorage } from "../js/storage.js?v=22";
-import { parseWebVtt } from "../js/vtt.js?v=22";
+import { PlayerStorage } from "../js/storage.js?v=25";
+import { parseWebVtt } from "../js/vtt.js?v=25";
 
 class MemoryStorage {
   map = new Map();
@@ -32,6 +32,18 @@ test("corrupt storage does not block startup", () => {
   const storage = new PlayerStorage(memory);
   assert.equal(storage.readBook("book").lastTime, 0);
   assert.deepEqual(storage.readBook("book").progressByLang, {});
+});
+
+test("malformed saved numbers do not mute playback or replace a listening position with zero", () => {
+  const memory = new MemoryStorage();
+  memory.setItem("compactPlayer:ui", JSON.stringify({ volume: null, playbackRate: [] }));
+  memory.setItem("compactPlayer:book", JSON.stringify({ progressByLang: { en: null, da: 0, sv: "42" }, lastTime: 80 }));
+  const storage = new PlayerStorage(memory);
+  assert.equal(storage.readUi().volume, 1);
+  assert.equal(storage.readUi().playbackRate, 1);
+  assert.equal(storage.getProgress("book", "en"), 80);
+  assert.equal(storage.getProgress("book", "da"), 0);
+  assert.equal(storage.getProgress("book", "sv"), 42);
 });
 
 test("book IDs that match settings keys preserve progress, appearance and catalog selection", () => {

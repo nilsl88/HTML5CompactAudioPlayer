@@ -47,6 +47,7 @@ function requestOfflineLock(navigatorObject, name, action, whenBusy, signal) {
     const options = signal && !whenBusy ? { signal } : { ifAvailable: Boolean(whenBusy) };
     return navigatorObject.locks.request(name, options, (lock) => lock ? action() : whenBusy());
   }
+  if (!globalThis.indexedDB) throw new DOMException("Offline locking is unavailable.", "NotSupportedError");
   return withDatabaseLock(name, action, whenBusy, signal);
 }
 

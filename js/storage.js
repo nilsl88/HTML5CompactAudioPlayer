@@ -1,7 +1,7 @@
-import { openAvailabilityCache, readAvailabilityCache, clearAvailability } from "./availability-cache.js?v=22";
-import { openChapterCache } from "./chapter-cache.js?v=22";
-import { asRecord, normalizeLanguageTag } from "./utils.js?v=22";
-import { skipInterval } from "./preferences.js?v=22";
+import { openAvailabilityCache, readAvailabilityCache, clearAvailability } from "./availability-cache.js?v=25";
+import { openChapterCache } from "./chapter-cache.js?v=25";
+import { asRecord, normalizeLanguageTag } from "./utils.js?v=25";
+import { skipInterval } from "./preferences.js?v=25";
 
 const SCHEMA_VERSION = 2;
 const UI_FIELDS = ["theme", "fontSize", "uiLanguage", "playbackRate", "volume", "skipSeconds"];
@@ -13,6 +13,7 @@ export const STORAGE_KEYS = {
 };
 
 function safeNumber(value, fallback, min, max) {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
 }

@@ -1,80 +1,53 @@
 function createShellRelease({
-  scopeUrl, withCacheDeadline, withShellNetworkDeadline, SHELL_VERSION, SHELL_RELEASE,
+  scopeUrl, readCache, withCacheDeadline, withShellNetworkDeadline, preferNetwork, SHELL_VERSION, SHELL_RELEASE,
   SHELL_CACHE_PREFIX, RELEASE_CACHE_PREFIX, VERIFIED_RELEASE_CACHE_PREFIX, SHELL_CACHE,
-  RELEASE_READY_URL, SHELL_NETWORK_WAIT_MS, SHELL_PAGE_MAX_BYTES, CACHE_FALLBACK_WAIT_MS,
+  RELEASE_READY_URL, SHELL_PAGE_MAX_BYTES, CACHE_FALLBACK_WAIT_MS,
   RELEASE_REBUILD_TIMEOUT_MS, SHELL_URLS, PLAYER_PAGES, RELEASE_ASSETS,
 }) {
+  const { cancelResponseBody, readResponseBytes, responseWithDecodedBody } = globalThis.CompactPlayerResponse;
   let releaseRebuild;
+  async function matchResponse(lookup, signal) {
+    const response = await lookup();
+    if (!signal?.aborted) return response;
+    cancelResponseBody(response?.body);
+    return null;
+  }
+
+  async function hasCachedFiles(cache, urls, signal) {
+    try {
+      const installed = new Set((await cache.keys()).map((entry) => entry.url));
+      return !signal?.aborted && [...urls].every((url) => installed.has(url));
+    } catch (error) {
+      if (!signal?.aborted) console.warn("[CompactAudioPlayer] Could not list the cached release files.", error);
+      return false;
+    }
+  }
+
+  async function cachedReleasePage(shell, signal) {
+    const ready = (await shell.match(RELEASE_READY_URL))?.ok;
+    if (signal?.aborted) return null;
+    const page = ready ? await matchResponse(() => shell.match(scopeUrl(SHELL_RELEASE.page)), signal) : null;
+    if (page?.ok && await hasCachedFiles(shell, RELEASE_ASSETS.keys(), signal)) return page;
+    const predecessor = signal?.aborted ? null : await previousCompleteRelease(await caches.keys(), signal);
+    if (signal?.aborted || predecessor) cancelResponseBody(page?.body);
+    if (signal?.aborted) return null;
+    return predecessor?.page ?? page;
+  }
+
   async function cachedShell(request, signal) {
     const shell = await caches.open(SHELL_CACHE);
     if (signal?.aborted) return null;
     if (request.mode === "navigate" && PLAYER_PAGES.has(new URL(request.url).pathname)) {
-      if (SHELL_RELEASE) {
-        const ready = (await shell.match(RELEASE_READY_URL))?.ok;
-        if (signal?.aborted) return null;
-        const page = ready && await shell.match(scopeUrl(SHELL_RELEASE.page));
-        if (page?.ok) return page;
-        const predecessor = await previousCompleteRelease(await caches.keys(), signal);
-        if (!predecessor || signal?.aborted) return null;
-        const id = predecessor.slice(VERIFIED_RELEASE_CACHE_PREFIX.length);
-        return caches.match(scopeUrl(`release-${id}.html`), { cacheName: predecessor });
-      }
-      const installed = await shell.match(scopeUrl(`index.html?v=${SHELL_VERSION.slice(1)}`));
+      if (SHELL_RELEASE) return cachedReleasePage(shell, signal);
+      const installed = await matchResponse(() => shell.match(scopeUrl(`index.html?v=${SHELL_VERSION.slice(1)}`)), signal);
       if (installed || signal?.aborted) return installed;
-      return shell.match(scopeUrl(`./?v=${SHELL_VERSION.slice(1)}`));
+      return matchResponse(() => shell.match(scopeUrl(`./?v=${SHELL_VERSION.slice(1)}`)), signal);
     }
-    return shell.match(request);
+    return matchResponse(() => shell.match(request), signal);
   }
 
   function invalidReleaseAsset(url) {
     return new Error(`Release asset does not match its manifest: ${url}`);
-  }
-
-  function cancelResponseBody(stream) {
-    void stream?.cancel().catch(() => { /* The response body may already have failed. */ });
-  }
-
-  async function readShellBytes(body, maxBytes, signal) {
-    if (signal?.aborted) {
-      cancelResponseBody(body);
-      throw signal.reason;
-    }
-    if (!body) return new Uint8Array(0);
-    const bytes = new Uint8Array(maxBytes);
-    const reader = body.getReader();
-    let offset = 0;
-    let ended = false;
-    const cancel = () => {
-      if (ended) return;
-      ended = true;
-      cancelResponseBody(reader);
-    };
-    signal?.addEventListener("abort", cancel, { once: true });
-    try {
-      while (!ended) {
-        const { done, value } = await reader.read();
-        if (signal?.aborted) throw signal.reason;
-        ended = done;
-        if (done) break;
-        if (value.byteLength > bytes.length - offset) return null;
-        bytes.set(value, offset);
-        offset += value.byteLength;
-      }
-      return bytes.subarray(0, offset);
-    } finally {
-      signal?.removeEventListener("abort", cancel);
-      cancel();
-      reader.releaseLock();
-    }
-  }
-
-  function decodedShellResponse(response, bytes) {
-    // Fetch exposes decoded bytes, even when the server sends a compressed response.
-    const headers = new Headers(response.headers);
-    headers.delete("content-encoding");
-    headers.delete("transfer-encoding");
-    headers.set("content-length", String(bytes.byteLength));
-    return new Response(bytes, { status: response.status, statusText: response.statusText, headers });
   }
 
   async function matchesReleaseBytes(bytes, asset) {
@@ -91,29 +64,21 @@ function createShellRelease({
         cancelResponseBody(response.body);
         throw invalidReleaseAsset(url);
       }
-      const bytes = await readShellBytes(response.body, asset.bytes, signal);
+      const bytes = await readResponseBytes(response.body, asset.bytes, signal);
       if (!await matchesReleaseBytes(bytes, asset)) throw invalidReleaseAsset(url);
-      return decodedShellResponse(response, bytes);
+      return responseWithDecodedBody(response, bytes);
     }, parent);
   }
 
-  async function readCache(operation) {
-    try {
-      return await withCacheDeadline(operation, CACHE_FALLBACK_WAIT_MS);
-    } catch (error) {
-      console.warn("[CompactAudioPlayer] Could not read Cache Storage.", error);
-      return null;
-    }
-  }
-
-  function currentReleaseCache(url) {
+  function currentReleaseCache(url, parent) {
     return readCache(async (signal) => {
       const shell = await caches.open(SHELL_CACHE);
       if (signal.aborted) return null;
       const ready = (await shell.match(RELEASE_READY_URL))?.ok === true;
       if (signal.aborted) return null;
-      return { shell, ready, response: ready && url ? await shell.match(url) : null };
-    });
+      const response = ready && url ? await matchResponse(() => shell.match(url), signal) : null;
+      return signal.aborted ? null : { shell, ready, response };
+    }, { parent });
   }
 
   async function populateRelease(shell, seed, signal) {
@@ -140,7 +105,11 @@ function createShellRelease({
   }
 
   async function releaseAsset(request, url, asset, keepAlive) {
-    const installed = await currentReleaseCache(url);
+    const installed = await currentReleaseCache(url, request.signal);
+    if (request.signal.aborted) {
+      cancelResponseBody(installed?.response?.body);
+      throw request.signal.reason;
+    }
     if (installed?.response) return installed.response;
     const verified = await fetchVerifiedReleaseAsset(url, asset, request.signal);
     if (installed?.ready) {
@@ -169,16 +138,18 @@ function createShellRelease({
   }
 
   async function isCompleteRelease(cacheName) {
-    return (await caches.match(RELEASE_READY_URL, { cacheName }))?.ok === true;
+    const marker = await caches.match(RELEASE_READY_URL, { cacheName });
+    cancelResponseBody(marker?.body);
+    return marker?.ok === true;
   }
 
   async function previousReleaseAsset(release, signal) {
     const cacheName = VERIFIED_RELEASE_CACHE_PREFIX + release.id;
     if (await isCompleteRelease(cacheName) && !signal.aborted) {
-      const response = await caches.match(release.url, { cacheName });
+      const response = await matchResponse(() => caches.match(release.url, { cacheName }), signal);
       if (response) return response;
     }
-    return signal.aborted ? null : caches.match(release.url, { cacheName: RELEASE_CACHE_PREFIX + release.id });
+    return signal.aborted ? null : matchResponse(() => caches.match(release.url, { cacheName: RELEASE_CACHE_PREFIX + release.id }), signal);
   }
 
   function validShellPage(html, allowNewer) {
@@ -211,9 +182,9 @@ function createShellRelease({
 
   async function readShellPage(response, allowNewer, signal) {
     if (!response?.ok) return null;
-    const bytes = await readShellBytes(response.body, SHELL_PAGE_MAX_BYTES, signal);
+    const bytes = await readResponseBytes(response.body, SHELL_PAGE_MAX_BYTES, signal);
     if (!bytes || !validShellPage(new TextDecoder().decode(bytes), allowNewer)) return null;
-    return { bytes, response: decodedShellResponse(response, bytes) };
+    return { bytes, response: responseWithDecodedBody(response, bytes) };
   }
 
   async function rebuildFromPage(bytes) {
@@ -244,17 +215,7 @@ function createShellRelease({
       }
       throw new Error("Player shell version does not match the worker");
     }, request.signal, controller);
-    let timer;
-    try {
-      const deadline = new Promise((resolve) => { timer = setTimeout(resolve, SHELL_NETWORK_WAIT_MS); });
-      const response = await Promise.race([network, deadline]);
-      if (response) return response;
-      // Keep the network in the race while Cache Storage opens, including on a cache miss.
-      const cached = await Promise.race([network.then(() => null), readCache((signal) => cachedShell(request, signal))]);
-      if (!cached?.ok) return network;
-      controller.abort();
-      return cached;
-    } finally { clearTimeout(timer); }
+    return preferNetwork(network, (signal) => cachedShell(request, signal), () => controller.abort());
   }
 
   async function installRelease() {
@@ -283,10 +244,38 @@ function createShellRelease({
     }
   }
 
+  function predecessorFiles(bytes, id) {
+    const html = new TextDecoder().decode(bytes);
+    const importMap = html.match(/<script type="importmap">([^<]+)<\/script>/)?.[1];
+    if (!importMap) return null;
+    const base = `./releases/${id}/`;
+    try {
+      const modules = Object.keys(JSON.parse(importMap).integrity ?? {});
+      if (!modules.includes(base + "player.js") || modules.some((path) => !path.startsWith(base))) return null;
+      return [...modules, base + "player.css"].map(scopeUrl);
+    } catch {
+      // The verified release page declares its modules in the generated import map.
+      return null;
+    }
+  }
+
   async function previousCompleteRelease(names, signal) {
     for (const name of names.slice().reverse()) {
       if (signal?.aborted) return null;
-      if (name !== SHELL_CACHE && isReleaseCache(name, VERIFIED_RELEASE_CACHE_PREFIX) && await isCompleteRelease(name)) return name;
+      if (name === SHELL_CACHE || !isReleaseCache(name, VERIFIED_RELEASE_CACHE_PREFIX) || !await isCompleteRelease(name)) continue;
+      if (signal?.aborted) return null;
+      const id = name.slice(VERIFIED_RELEASE_CACHE_PREFIX.length);
+      const url = scopeUrl(`release-${id}.html`);
+      const page = await matchResponse(() => caches.match(url, { cacheName: name }), signal);
+      if (!page?.ok) {
+        cancelResponseBody(page?.body);
+        continue;
+      }
+      const bytes = await readResponseBytes(page.body, SHELL_PAGE_MAX_BYTES, signal);
+      const files = bytes && predecessorFiles(bytes, id);
+      if (!files || signal?.aborted) continue;
+      const cache = await caches.open(name);
+      if (await hasCachedFiles(cache, files, signal)) return { name, page: responseWithDecodedBody(page, bytes) };
     }
     return null;
   }
@@ -294,7 +283,9 @@ function createShellRelease({
   async function cleanUpShellCaches(signal) {
     const names = await caches.keys();
     if (signal.aborted) return;
-    const previousRelease = SHELL_RELEASE && await previousCompleteRelease(names, signal);
+    const previous = SHELL_RELEASE && await previousCompleteRelease(names, signal);
+    cancelResponseBody(previous?.page.body);
+    const previousRelease = previous?.name;
     if (signal.aborted) return;
     // Older release caches have no marker. Keep them until we can retain a known complete predecessor instead.
     const obsolete = names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX) && name !== SHELL_CACHE
@@ -303,5 +294,6 @@ function createShellRelease({
     await Promise.all(obsolete.map((name) => caches.delete(name)));
   }
 
-    return { cancelResponseBody, cachedShell, invalidReleaseAsset, readShellBytes, decodedShellResponse, matchesReleaseBytes, fetchVerifiedReleaseAsset, readCache, currentReleaseCache, populateRelease, rebuildRelease, releaseAsset, releaseRequest, isReleaseCache, isCompleteRelease, previousReleaseAsset, validShellPage, readShellPage, rebuildFromPage, fetchShell, installRelease, installSourceShell, previousCompleteRelease, cleanUpShellCaches };
+  return { cachedShell, releaseAsset, releaseRequest, previousReleaseAsset, fetchShell,
+    installRelease, installSourceShell, cleanUpShellCaches };
 }

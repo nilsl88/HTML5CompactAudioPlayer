@@ -1,9 +1,8 @@
-import { isMp4Audio } from "./codecs.js?v=22";
-import { fetchWithRetry, metadataRequestCache } from "./utils.js?v=22";
-import { parseWebVtt } from "./vtt.js?v=22";
-import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js?v=22";
-import { readBoundedText } from "./config.js?v=22";
-import "./offline-manifest.js?v=22";
+import { isMp4Audio } from "./codecs.js?v=25";
+import { fetchWithRetry, metadataRequestCache, readBoundedText } from "./utils.js?v=25";
+import { parseWebVtt } from "./vtt.js?v=25";
+import { loadEmbeddedMp4Chapters } from "./mp4-chapters.js?v=25";
+import "./offline-manifest.js?v=25";
 
 const { checkResponseVersion } = globalThis.CompactPlayerOfflineManifest;
 

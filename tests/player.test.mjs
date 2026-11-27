@@ -1,19 +1,100 @@
 import test from "node:test";
 import { setImmediate as settle } from "node:timers/promises";
 import assert from "node:assert/strict";
-import { createCustomSelects } from "../js/custom-select.js?v=22";
-import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=22";
+import { createCustomSelects } from "../js/custom-select.js?v=25";
+import { createChapterPanel } from "../js/chapter-panel.js?v=25";
+import { openDialog, closeDialog, openPanel, closePanel } from "../js/dialogs.js?v=25";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { OfflineManager } from "../js/offline.js?v=22";
-import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=22";
-import { BookSelection } from "../js/book-selection.js?v=22";
-import { normalizeBook } from "../js/config.js?v=22";
-import { buildSources } from "../js/source-selection.js?v=22";
+import { OfflineManager } from "../js/offline.js?v=25";
+import { sameOfflineSelection, validateOfflineBookConfig } from "../js/offline-selection.js?v=25";
+import { BookSelection } from "../js/book-selection.js?v=25";
+import { normalizeBook } from "../js/config.js?v=25";
+import { buildSources } from "../js/source-selection.js?v=25";
 
 const book = {
   id: "sample", defaultLanguage: "en", title: { en: "Sample audiobook" },
   languages: { en: { sources: { aac: { 96: "sample.m4b" } } } },
 };
+
+test("reconnection queues another revalidation when the earlier response is still pending", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const downloaded = { ...book, languages: { en: { sources: { aac: { 96: "old.m4b" } } } } };
+  const fallback = () => Response.json(downloaded, { headers: { "x-compact-player-offline-version": "1" } });
+  const checking = deferred();
+  const finish = deferred();
+  let reads = 0;
+  const page = await openPlayerPage(downloaded, assert.fail, new Map(), {
+    async fetch(url) {
+      if (url.endsWith("/library.json")) return Response.json({ books: [{ id: book.id }], ui: { onboardingEnabled: false } });
+      if (url.endsWith("/book.json")) {
+        if (++reads === 1) return fallback();
+        if (reads === 2) {
+          checking.resolve();
+          return finish.promise;
+        }
+        return Response.json(book);
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
+  await page.ready;
+  const reconnect = () => {
+    page.navigator.onLine = false;
+    page.window.dispatchEvent(new Event("offline"));
+    page.navigator.onLine = true;
+    page.window.dispatchEvent(new Event("online"));
+  };
+  reconnect();
+  await checking.promise;
+  reconnect();
+  reconnect();
+  finish.resolve(fallback());
+  await settle();
+  assert.equal(reads, 3);
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.match(page.audio.src, /\/sample\.m4b$/);
+});
+
+test("reconnect during a manual book change revalidates the downloaded result before the next Play", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const makeBook = (id, title, file) => ({ id, title: { en: title }, defaultLanguage: "en",
+    languages: { en: { sources: { mp3: { 64: file } } } } });
+  const first = makeBook("first", "First", "first.mp3");
+  const pending = deferred();
+  const started = deferred();
+  const requests = [];
+  const page = await openPlayerPage(first, assert.fail, new Map(), {
+    async fetch(url, options) {
+      if (url.endsWith("/library.json")) return Response.json({ books: [{ id: "first" }, { id: "second" }], ui: { onboardingEnabled: false } });
+      if (url.endsWith("/first/book.json")) return Response.json(first);
+      if (url.endsWith("/second/book.json")) {
+        requests.push(options.cache);
+        started.resolve();
+        return requests.length === 1 ? pending.promise : Response.json(makeBook("second", "Online title", "new.mp3"));
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
+  await page.ready;
+  const picker = page.elements.get("bookSelect");
+  picker.value = "second";
+  picker.dispatchEvent(new Event("change"));
+  await started.promise;
+  page.navigator.onLine = false;
+  page.window.dispatchEvent(new Event("offline"));
+  page.navigator.onLine = true;
+  page.window.dispatchEvent(new Event("online"));
+  await settle();
+
+  pending.resolve(Response.json(makeBook("second", "Downloaded title", "old.mp3"),
+    { headers: { "x-compact-player-offline-version": "1" } }));
+  await settle();
+  assert.deepEqual(requests, ["default", "no-cache"]);
+  assert.equal(page.elements.get("bookTitle").textContent, "Downloaded title");
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  assert.equal(page.elements.get("bookTitle").textContent, "Online title");
+  assert.match(page.audio.src, /\/new\.mp3$/);
+});
 
 test("versioned audio paths and signed URLs reach the media element unchanged", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -33,6 +114,70 @@ test("versioned audio paths and signed URLs reach the media element unchanged", 
   }
 });
 
+test("the seek slider returns to the actual position when the audio rejects a seek", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  const page = await openPlayerPage(book, assert.fail);
+  await page.ready;
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  page.audio.duration = 600;
+  page.audio.dispatchEvent(new Event("loadedmetadata"));
+  page.audio.dispatchEvent(new Event("playing"));
+  page.audio.currentTime = 60;
+  page.audio.dispatchEvent(new Event("timeupdate"));
+  Object.defineProperty(page.audio, "currentTime", {
+    get: () => 60,
+    set: () => { throw new DOMException("Temporarily unseekable", "InvalidStateError"); },
+  });
+
+  const slider = page.elements.get("seek");
+  assert.equal(slider.value, "100");
+  slider.value = "500";
+  slider.dispatchEvent(new Event("input"));
+  assert.equal(page.elements.get("timeCur").textContent, "5:00");
+  slider.dispatchEvent(new Event("change"));
+  assert.equal(slider.value, "100");
+  assert.equal(page.elements.get("timeCur").textContent, "1:00");
+});
+
+test("the seek control announces the localized position during preview and after a language change", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = await openPlayerPage({ ...book, duration: 600 }, assert.fail);
+  await page.ready;
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  const slider = page.elements.get("seek");
+  assert.equal(slider.getAttribute("aria-valuetext"), "0:00 of 10:00");
+  slider.value = "200";
+  slider.dispatchEvent(new Event("input"));
+  assert.equal(slider.getAttribute("aria-valuetext"), "2:00 of 10:00");
+  const language = page.elements.get("uiLangSelect");
+  language.value = "da";
+  language.dispatchEvent(new Event("change"));
+  assert.equal(slider.getAttribute("aria-valuetext"), "2:00 af 10:00");
+});
+
+test("canceling a seek gesture restores the playing position without saving the preview", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = await openPlayerPage({ ...book, duration: 600 }, assert.fail);
+  await page.ready;
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  page.audio.duration = 600;
+  page.audio.dispatchEvent(new Event("loadedmetadata"));
+  page.audio.dispatchEvent(new Event("playing"));
+  page.audio.currentTime = 60;
+  page.audio.dispatchEvent(new Event("timeupdate"));
+
+  const slider = page.elements.get("seek");
+  slider.value = "500";
+  slider.dispatchEvent(new Event("input"));
+  assert.equal(slider.getAttribute("aria-valuetext"), "5:00 of 10:00");
+  slider.dispatchEvent(new Event("pointercancel"));
+  assert.equal(slider.value, "100");
+  assert.equal(slider.getAttribute("aria-valuetext"), "1:00 of 10:00");
+  assert.equal(page.audio.currentTime, 60);
+  assert.equal(page.storage.getProgress("sample", "en"), 60);
+});
+
 test("network errors use a saved source only for the selected book version", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const manifest = { schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved",
@@ -41,7 +186,7 @@ test("network errors use a saved source only for the selected book version", asy
     totalSize: 1, chunkSize: 1, totalChunks: 1, completed: [0] };
   t.mock.method(OfflineManager.prototype, "init", async function () {
     this.active = manifest;
-    await this.worker.prepare(manifest);
+    await this.routes.prepare(manifest);
   });
   for (const onlineAtPlay of [true, false]) {
     for (const [version, expectedSaved] of [[1, true], [2, false]]) {
@@ -67,6 +212,35 @@ test("network errors use a saved source only for the selected book version", asy
       if (!onlineAtPlay && expectedSaved) assert.ok(attempts[0].includes("__compact_player_offline__/audio.json"));
     }
   }
+});
+
+test("a failed saved source explains that playback is waiting for reconnect", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 100_000 });
+  const sourceUrl = "https://example.test/media/sample/sample.m4b";
+  const saved = { schemaVersion: 1, status: "ready", downloadId: "one", cacheName: "saved",
+    episodeId: "sample", languageCode: "en", sourceId: "aac-96", sourceUrl, cacheVersion: "1", mime: "audio/mp4",
+    totalSize: 1, chunkSize: 1, totalChunks: 1, completed: [0] };
+  t.mock.method(OfflineManager.prototype, "init", async function () {
+    this.active = saved;
+    await this.routes.prepare(saved);
+  });
+  const navigator = { onLine: true, language: "en", serviceWorker: {
+    controller: { scriptURL: "https://example.test/sw.js" },
+  } };
+  const page = await openPlayerPage(book, () => new Response(null, { headers: {
+    "content-length": "1", "content-type": "audio/mp4", "x-compact-player-offline-version": "%221%22",
+  } }), new Map(), { navigator });
+  await page.ready;
+  navigator.onLine = false;
+  page.audio.play = async () => { throw new DOMException("Saved audio unavailable", "NotSupportedError"); };
+  page.elements.get("playPauseBtn").dispatchEvent(new Event("click"));
+  await settle();
+  assert.match(page.audio.src, /__compact_player_offline__\/audio\.json/);
+  const waitingNotices = () => page.elements.get("toastHost").children.filter(
+    (toast) => /Playback will resume when the connection returns/.test(toast.textContent));
+  assert.equal(waitingNotices().length, 1);
+  t.mock.timers.tick(15_000);
+  assert.equal(waitingNotices().length, 1);
 });
 
 test("regional recordings keep separate identities and reopen saved and downloaded language choices", async (t) => {
@@ -110,6 +284,21 @@ test("regional recordings keep separate identities and reopen saved and download
   assert.equal(sameOfflineSelection({ ...legacy, languageTag: "en" }, selected), false);
 });
 
+test("a download only overrides book preferences when its edition and source match", () => {
+  const root = "https://example.test/";
+  const book = normalizeBook({ id: "edition", defaultLanguage: "en", languages: {
+    en: { sources: { mp3: { 64: "english.mp3" } } }, da: { sources: { mp3: { 64: "danish.mp3" } } },
+  } }, { bookBaseUrl: root, documentBaseUrl: root });
+  const sources = new Map(Object.values(book.languages).map((language) => [language.code, buildSources(language)]));
+  const download = { episodeId: "catalog", configBookId: "edition", languageCode: "da", languageTag: "da",
+    cacheVersion: 1, sourceId: "mp3-64", sourceUrl: `${root}danish.mp3` };
+  const select = (downloaded) => new BookSelection({ bookId: "catalog", book, sources, downloaded,
+    preferences: { language: "en" }, browserLanguages: ["en"], saveSelection: assert.fail });
+  assert.equal(select(download).languageCode, "da");
+  assert.equal(select({ ...download, configBookId: "different-edition" }).languageCode, "en");
+  assert.equal(select({ ...download, sourceUrl: `${root}retired.mp3` }).languageCode, "en");
+});
+
 test("dialog focus callbacks respect a closed dialog and subsequent user focus", () => {
   const frames = [];
   const original = { isConnected: true, focus() { document.activeElement = this; } };
@@ -134,10 +323,49 @@ test("dialog focus callbacks respect a closed dialog and subsequent user focus",
   assert.equal(document.activeElement, other);
 });
 
+test("dismissing Reset leaves Options open and returns focus to its Reset button", async () => {
+  const { document, elements, ready } = await openPlayerPage(book, assert.fail);
+  await ready;
+  const options = elements.get("optionsPanel");
+  const trigger = elements.get("resetBtn");
+  const dialog = elements.get("resetDialog");
+  const cancel = elements.get("resetCancel");
+  const accept = elements.get("resetOk");
+  options.hidden = false;
+  trigger.isConnected = true;
+  accept.hidden = false;
+  Object.assign(dialog, {
+    showModal() { this.open = true; },
+    close() { this.open = false; },
+  });
+  for (const control of [accept, cancel, trigger]) control.focus = () => { document.activeElement = control; };
+  for (const control of [accept, cancel]) control.closest = (selector) => selector === "dialog" ? dialog : null;
+  for (const id of ["player", "optionsPanel", "chaptersPanel", "sleepPanel"]) elements.get(id).contains = () => false;
+
+  for (const key of ["Escape", null]) {
+    trigger.focus();
+    trigger.dispatchEvent(new Event("click"));
+    assert.equal(document.activeElement, accept);
+    const event = new Event(key ? "keydown" : "click");
+    Object.defineProperty(event, "target", { value: key ? accept : cancel });
+    if (key) {
+      Object.defineProperty(event, "key", { value: key });
+      document.dispatchEvent(event);
+      dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+    } else {
+      cancel.dispatchEvent(new Event("click"));
+      document.dispatchEvent(event);
+    }
+    assert.equal(dialog.open, false);
+    assert.equal(options.hidden, false);
+    assert.equal(document.activeElement, trigger);
+  }
+});
+
 test("opening a panel sets initial focus unless the user has already moved it or closed it", () => {
   const trigger = new Element();
   const panel = new Element();
-  const first = new Element();
+  const first = Object.assign(new Element(), { hidden: false });
   const chapter = new Element();
   let draw;
   const document = { activeElement: trigger, defaultView: { requestAnimationFrame: (fn) => { draw = fn; } } };
@@ -152,6 +380,53 @@ test("opening a panel sets initial focus unless the user has already moved it or
     const expected = { open: first, "choose chapter": chapter, close: trigger };
     assert.equal(document.activeElement, expected[action]);
   }
+});
+
+test("opening Options offline moves focus past the disabled selectors and hidden controls", () => {
+  const trigger = new Element();
+  const panel = new Element();
+  const disabled = Object.assign(new Element(), { hidden: false, disabled: true });
+  const hiddenContainer = new Element();
+  const hidden = Object.assign(new Element(), { hidden: false, closest: () => hiddenContainer });
+  const enabled = Object.assign(new Element(), { hidden: false });
+  const document = { activeElement: trigger, defaultView: { requestAnimationFrame: (callback) => callback() } };
+  panel.ownerDocument = document;
+  panel.querySelectorAll = () => [disabled, hidden, enabled];
+  disabled.focus = assert.fail;
+  hidden.focus = assert.fail;
+  enabled.focus = () => { document.activeElement = enabled; };
+
+  openPanel(panel, trigger, disabled);
+  assert.equal(document.activeElement, enabled);
+});
+
+test("a late chapter retry preserves focus the listener moved to another control", async () => {
+  const request = deferred();
+  const track = new Element();
+  const document = { body: new Element(), createElement: () => new Element(), getElementById: () => track };
+  const list = Object.assign(new Element(), { ownerDocument: document });
+  const panel = Object.assign(new Element(), { hidden: false });
+  const chapter = new Element();
+  const close = new Element();
+  chapter.focus = () => { document.activeElement = chapter; };
+  list.querySelector = () => chapter;
+  const view = createChapterPanel({ list, panel, t: (key) => key, onRetry: () => request.promise });
+  view.renderChapterFailure();
+  const retry = list.children[0].children[1];
+  document.activeElement = retry;
+  retry.dispatchEvent(new Event("click"));
+  document.activeElement = close;
+  request.resolve();
+  await settle();
+  assert.equal(document.activeElement, close);
+
+  view.renderChapterFailure();
+  const second = list.children[0].children[1];
+  document.activeElement = second;
+  second.dispatchEvent(new Event("click"));
+  document.activeElement = document.body;
+  await settle();
+  assert.equal(document.activeElement, chapter);
 });
 
 test("closing a panel restores focus only while its closure remains current", () => {
@@ -325,6 +600,34 @@ test("custom selects commit a keyboard choice and restore focus on Escape", () =
   assert.equal(changes, 1);
 });
 
+test("refreshing control availability does not rebuild an open selector's options", () => {
+  const document = { createElement() {
+    return Object.assign(new Element(), { getBoundingClientRect: () => ({ top: 0, bottom: 10, height: 10 }) });
+  }, querySelector: () => null };
+  const controls = createCustomSelects(document, { innerHeight: 600 });
+  const select = Object.assign(new Element(), { id: "language", disabled: false, value: "en", selectedIndex: 0,
+    options: [{ value: "en", textContent: "English" }, { value: "da", textContent: "Dansk", disabled: true }] });
+  const wrapper = controls.selectWithArrow(select);
+  wrapper.insertBefore = (button) => wrapper.children.unshift(button);
+  select.closest = () => wrapper;
+  const { button, menu } = controls.enhanceCustomSelect(select);
+  button.dispatchEvent(new Event("click"));
+  const [english, danish] = menu.children;
+
+  controls.syncSelectionControls();
+  assert.equal(menu.children[0], english);
+  assert.equal(menu.children[1], danish);
+  assert.equal(button.getAttribute("aria-activedescendant"), english.id);
+  select.disabled = true;
+  controls.syncSelectionControls();
+  assert.equal(menu.hidden, true);
+  assert.equal(english.disabled, true);
+  select.disabled = false;
+  controls.syncSelectionControls();
+  assert.equal(english.disabled, false);
+  assert.equal(danish.disabled, true);
+});
+
 test("an open book selector keeps the active choice when the catalog changes", () => {
   const document = { createElement() {
     const element = new Element();
@@ -462,6 +765,36 @@ test("reset discards its pending position before pause, pagehide or a delayed sa
   assert.equal(page.storage.getProgress(book.id, "en"), 0);
 });
 
+test("Reset retries only the store that failed", async (t) => {
+  for (const failed of ["local", "offline"]) {
+    const reload = t.mock.fn();
+    let attempts = 0;
+    const resetOffline = t.mock.method(OfflineManager.prototype, "reset", async () => {
+      if (failed === "offline" && ++attempts === 1) throw Object.assign(new Error("Tab lock"), { code: "conflict" });
+    });
+    const page = await openPlayerPage(book, assert.fail, new Map(), {
+      location: Object.assign(new URL("https://example.test/"), { reload }),
+    });
+    const resetLocal = t.mock.method(page.storage, "reset", () => failed !== "local" || ++attempts > 1);
+    const accept = page.elements.get("resetOk");
+    const body = page.elements.get("resetBody");
+    accept.dispatchEvent(new Event("click"));
+    await settle();
+    assert.equal(accept.textContent, "Try again");
+    assert.deepEqual(body.children.map((item) => item.textContent), [failed === "local"
+      ? "Some saved settings or listening positions may remain on this device."
+      : "Another tab is updating or has changed the offline book. Check the saved book and try again."]);
+    assert.equal(reload.mock.callCount(), 0);
+
+    accept.dispatchEvent(new Event("click"));
+    await settle();
+    assert.equal(resetLocal.mock.callCount(), failed === "local" ? 2 : 1);
+    assert.equal(resetOffline.mock.callCount(), failed === "offline" ? 2 : 1);
+    assert.equal(reload.mock.callCount(), 1);
+    resetOffline.mock.restore();
+  }
+});
+
 test("late media errors and system Play are inert while reset waits for offline storage", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const offlineReset = deferred();
@@ -515,6 +848,73 @@ test("reset prevents late chapter and probe results from repopulating local stor
   assert.equal(location.reload.mock.callCount(), 1);
   assert.deepEqual([...saved.keys()], ["compactPlayer@%2F:reset"]);
   assert.deepEqual(probes, []);
+});
+
+test("Reset cancels pending title lookups and preserves the book selector until reload", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const done = deferred();
+  const fetched = deferred();
+  const late = deferred();
+  t.mock.method(OfflineManager.prototype, "reset", () => done.promise);
+  const page = await openPlayerPage(book, assert.fail, new Map(), {
+    location: Object.assign(new URL("https://example.test/"), { reload() {} }),
+    fetch: (url, { signal } = {}) => {
+      if (url.endsWith("/library.json")) return Response.json({
+        books: [{ id: book.id }, { id: "other" }], ui: { onboardingEnabled: false },
+      });
+      if (url.endsWith("/other/book.json")) {
+        fetched.resolve(signal);
+        return late.promise;
+      }
+      if (url.endsWith("/book.json")) return Response.json(book);
+      return new Response(null, { status: 200 });
+    },
+  });
+
+  page.elements.get("optionsBtn").dispatchEvent(new Event("click"));
+  const request = await fetched.promise;
+  const other = () => page.elements.get("bookSelect").children.find((option) => option.value === "other").textContent;
+  const placeholder = other();
+  page.elements.get("resetOk").dispatchEvent(new Event("click"));
+  try {
+    late.resolve(Response.json({ ...book, id: "other", title: { en: "Late title" } }));
+    await settle();
+    assert.equal(other(), placeholder);
+    assert.equal(request.aborted, true);
+  } finally { done.resolve(); }
+});
+
+test("Reset aborts a pending catalog refresh and ignores a late response", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const done = deferred();
+  const requested = deferred();
+  const catalog = deferred();
+  t.mock.method(OfflineManager.prototype, "reset", () => done.promise);
+  let catalogs = 0;
+  const page = await openPlayerPage(book, assert.fail, new Map(), {
+    location: Object.assign(new URL("https://example.test/"), { reload() {} }),
+    async fetch(url, { signal } = {}) {
+      if (!url.endsWith("/library.json")) return Response.json(book);
+      if (++catalogs === 1) return Response.json({ books: [{ id: book.id }] },
+        { headers: { "x-compact-player-offline-version": "1" } });
+      requested.resolve(signal);
+      return catalog.promise;
+    },
+  });
+  await page.ready;
+  const picker = page.elements.get("bookSelect");
+  page.window.dispatchEvent(new Event("online"));
+  try {
+    const request = await requested.promise;
+    page.elements.get("resetOk").dispatchEvent(new Event("click"));
+    catalog.resolve(Response.json({ books: [{ id: book.id }, { id: "from-stale-result" }] }));
+    await settle();
+    assert.equal(request.aborted, true);
+    assert.deepEqual(picker.children.map((option) => option.value), [book.id]);
+  } finally {
+    catalog.resolve(Response.json({ books: [] }));
+    done.resolve();
+  }
 });
 
 test("a late chapter response from an older edition preserves the newer tab's offline chapters", async (t) => {
@@ -781,6 +1181,46 @@ test("a book switch clears the old system position until the new duration is kno
   select.dispatchEvent(new Event("change"));
   await settle();
   assert.deepEqual(positions.at(-1), [{ duration: 600, position: 20, playbackRate: 1 }]);
+});
+
+test("Media Session only publishes displayed cover art and clears it during Reset", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cover = "https://cdn.example.test/cover.jpg";
+  const session = { setActionHandler() {} };
+  const pendingReset = deferred();
+  t.mock.method(OfflineManager.prototype, "reset", () => pendingReset.promise);
+  const page = await openPlayerPage({ ...book, coverSource: "file", cover }, assert.fail, new Map(), {
+    location: Object.assign(new URL("https://example.test/"), { reload() {} }),
+    navigator: { onLine: true, language: "en", mediaSession: session },
+    MediaMetadata: class { constructor(values) { Object.assign(this, values); } },
+  });
+  await page.ready;
+  const image = page.elements.get("coverImg");
+  try {
+    assert.equal(image.src, cover);
+    assert.deepEqual(session.metadata.artwork, []);
+    image.onload();
+    assert.deepEqual(session.metadata.artwork, [{ src: cover }]);
+    page.elements.get("resetOk").dispatchEvent(new Event("click"));
+    assert.deepEqual(session.metadata.artwork, []);
+  } finally { pendingReset.resolve(); }
+});
+
+test("changing speed while paused updates Media Session without waiting for playback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let position;
+  const navigator = { onLine: true, language: "en", mediaSession: {
+    setActionHandler() {}, setPositionState(value) { position = value; },
+  } };
+  const page = await openPlayerPage({ ...book, duration: 300 }, assert.fail, new Map(), { navigator });
+  await page.ready;
+  assert.equal(position.playbackRate, 1);
+  const speed = page.elements.get("speedRange");
+  speed.value = "1.5";
+  speed.dispatchEvent(new Event("input"));
+  assert.equal(position.playbackRate, 1.5);
+  assert.equal(position.duration, 300);
+  assert.ok(!page.audio.src);
 });
 
 test("a blocked Media Session leaves playback and chapter controls available", async (t) => {

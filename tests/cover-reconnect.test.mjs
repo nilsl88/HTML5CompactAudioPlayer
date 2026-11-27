@@ -2,7 +2,94 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as settle } from "node:timers/promises";
 import { deferred, Element, openPlayerPage } from "./player-page.mjs";
-import { createCoverView } from "../js/cover.js?v=22";
+import { createCoverView } from "../js/cover.js?v=25";
+
+test("a cover started online retries if reconnect arrives before its failed response", async (t) => {
+  const image = new Element();
+  const button = new Element();
+  const previous = deferred();
+  const cover = "https://example.test/cover.jpg";
+  let online = true;
+  let requests = 0;
+  const failures = [];
+  const view = createCoverView(image, button, {
+    isOnline: () => online,
+    getFileCoverUrl: () => null,
+    onShown() {},
+    onFailure: (error) => failures.push(error),
+    fetchImpl(url) {
+      assert.equal(url, cover);
+      return ++requests === 1 ? previous.promise : new Response("fixture", { headers: { "content-type": "image/jpeg" } });
+    },
+  });
+  t.after(view.clearCover);
+  view.applyCover({ id: "book", coverSource: "file", cover }, "en");
+  online = false;
+  await settle();
+  online = true;
+  view.retryCover();
+  previous.resolve(new Response(null, { status: 404 }));
+  await settle();
+  assert.equal(requests, 2);
+  assert.equal(failures.length, 0);
+  assert.match(image.src, /^blob:/);
+  image.onload();
+  view.retryCover();
+  assert.equal(requests, 2);
+});
+
+test("the page cancels an oversized cover body after the worker image route fails", async (t) => {
+  const image = new Element();
+  const button = new Element();
+  const failed = deferred();
+  const coverUrl = "https://example.test/cover.jpg";
+  let reads = 0;
+  const canceled = t.mock.fn();
+  const view = createCoverView(image, button, {
+    getFileCoverUrl: () => "https://example.test/offline-cover",
+    onShown: assert.fail,
+    onFailure: failed.resolve,
+    fetchImpl(url) {
+      assert.equal(url, coverUrl);
+      return new Response(new ReadableStream({
+        pull(controller) {
+          reads++;
+          controller.enqueue(new Uint8Array(9 * 1024 ** 2));
+        },
+        cancel: canceled,
+      }, { highWaterMark: 0 }), { headers: { "content-type": "image/jpeg" } });
+    },
+  });
+  t.after(view.clearCover);
+  view.applyCover({ id: "book", coverSource: "file", cover: coverUrl }, "en");
+  image.onerror();
+  assert.match((await failed.promise).message, /exceeds 16 MiB/);
+  assert.equal(reads, 2);
+  assert.equal(canceled.mock.callCount(), 1);
+  assert.equal(button.hidden, true);
+});
+
+test("the cover fallback rejects another book's response even when the current download matches", async () => {
+  const { versionHeader, versionHeaderValue, bookHeader, bookHeaderValue } = globalThis.CompactPlayerOfflineManifest;
+  const image = new Element();
+  const failed = deferred();
+  const view = createCoverView(image, new Element(), {
+    getBookId: () => "selected",
+    getFileCoverUrl: () => null,
+    canUseCachedCover: async () => true,
+    onShown: assert.fail,
+    onFailure: failed.resolve,
+    fetchImpl: async () => new Response("an older cached image", { headers: {
+      [versionHeader]: versionHeaderValue(1), [bookHeader]: bookHeaderValue("previous", "previous-edition"),
+    } }),
+  });
+  try {
+    view.applyCover({ id: "edition", cacheVersion: 1, coverSource: "file", cover: "https://example.test/shared.jpg" }, "en");
+    await settle();
+    assert.equal(image.src, undefined);
+    assert.match((await failed.promise).message, /different book/);
+  } finally { view.clearCover(); }
+});
 
 test("offline cover failures retry on reconnect without duplicating pending or successful loads", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
